@@ -71,7 +71,7 @@ static const char *TAG = "board";
 #define LCD_D3 GPIO_NUM_41
 #define LCD_BL GPIO_NUM_5
 #define DRAW_BUF_LINES 90          /* four bands to the screen (muse_lcd_bands.h) */
-#define LCD_CHUNK_BYTES (LCD_RES * 8 * 2)
+#define LCD_CHUNK_BYTES (LCD_RES * 4 * 2)  /* both chunks fit in V3's DMA headroom; PSRAM chunks underflow at 80MHz */
 
 #define I2C_SDA GPIO_NUM_11
 #define I2C_SCL GPIO_NUM_10
