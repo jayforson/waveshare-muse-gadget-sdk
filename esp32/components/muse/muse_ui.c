@@ -100,7 +100,7 @@ static lv_indev_t *s_indev;
 static lv_obj_t *s_tv;
 static lv_obj_t *s_face;
 static lv_obj_t *s_settings;
-static lv_obj_t *s_dots[2];
+static lv_obj_t *s_dots[3];
 static lv_obj_t *s_wifi_icon;
 static lv_obj_t *s_ble_icon;
 static lv_obj_t *s_cover;
@@ -845,6 +845,207 @@ static void on_ring_draw(lv_event_t *e)
     layer->_clip_area = clip;
 }
 
+/*
+ * Dialog tile (1,0): a scrolling history of the conversation, fed from the
+ * same caption stream the face shows. While listening the caption carries
+ * the live transcript; while speaking it carries the reply, page by page.
+ * Status captions ("LISTENING...", "NOTE SENT - ...", ...) are never stored
+ * as messages. The settings tile is untouched; only its column moves to 2.
+ */
+#define DLG_MAX_MSGS 10
+#define DLG_MSG_MAX 500
+
+static lv_obj_t *s_dialog;
+static lv_obj_t *s_dlg_list;
+static lv_obj_t *s_dlg_empty;
+static lv_obj_t *s_dlg_msgs[DLG_MAX_MSGS];
+static int s_dlg_n;
+static lv_obj_t *s_dlg_live_user;
+static lv_obj_t *s_dlg_live_muse;
+static char s_dlg_reply[DLG_MSG_MAX];
+static char s_dlg_last_page[DLG_MSG_MAX];
+static muse_mode_t s_dlg_prev_mode = MUSE_MODE_BOOT;
+
+static bool dlg_is_status(const char *s)
+{
+    if (!s || !s[0]) {
+        return true;
+    }
+    if (strncmp(s, "LISTENING", 9) == 0 || strncmp(s, "RECORDING", 9) == 0) {
+        return true;
+    }
+    if (strcmp(s, "NOTE SENT - WAITING FOR MUSE") == 0 || strcmp(s, "SENDING VOICE NOTE") == 0 ||
+        strcmp(s, "WAKING UP...") == 0 ||
+        strcmp(s, "GOODBYE!") == 0 || strcmp(s, "SPEAKER ON") == 0 || strcmp(s, "SPEAKER OFF") == 0 ||
+        strcmp(s, "HOLD TO MUTE") == 0 || strcmp(s, "HOLD TO UNMUTE") == 0 ||
+        strcmp(s, "HOLD TO POWER OFF") == 0 || strcmp(s, "RESETTING...") == 0) {
+        return true;
+    }
+    if (strncmp(s, "PHONE SETUP", 11) == 0) {
+        return true;
+    }
+    return false;
+}
+
+/* Drop a trailing character split by a cap, if the string ends mid-character. */
+static void dlg_fix_tail(char *dst)
+{
+    size_t end = strlen(dst);
+    size_t i = end;
+    while (i > 0 && (dst[i - 1] & 0xC0) == 0x80) {
+        i--;
+    }
+    if (i == 0) {
+        return;
+    }
+    unsigned char lead = (unsigned char)dst[i - 1];
+    size_t need = (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3 : (lead & 0xF8) == 0xF0 ? 4 : 1;
+    if (end - (i - 1) < need) {
+        dst[i - 1] = '\0';
+    }
+}
+
+/* strlcpy, then drop a trailing split character when the cap cut one. */
+static void dlg_copy_trunc(char *dst, size_t dst_n, const char *src)
+{
+    size_t n = strlcpy(dst, src, dst_n);
+    if (n >= dst_n) {
+        dlg_fix_tail(dst);
+    }
+}
+
+static lv_obj_t *dlg_add(const char *who, const char *text, uint32_t color)
+{
+    if (!s_dlg_list) {
+        return NULL;
+    }
+    if (s_dlg_n >= DLG_MAX_MSGS) {
+        lv_obj_del(s_dlg_msgs[0]);
+        for (int i = 1; i < s_dlg_n; i++) {
+            s_dlg_msgs[i - 1] = s_dlg_msgs[i];
+        }
+        s_dlg_n--;
+    }
+    char buf[DLG_MSG_MAX + 32];
+    snprintf(buf, sizeof(buf), "%s: %s", who, text);
+    lv_obj_t *lbl = make_label(s_dlg_list, caption_font(), color);
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_LEFT, 0);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl, s_w - 56);
+    lv_label_set_text(lbl, buf);
+    s_dlg_msgs[s_dlg_n++] = lbl;
+    if (s_dlg_empty) {
+        lv_obj_add_flag(s_dlg_empty, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_scroll_to_y(s_dlg_list, LV_COORD_MAX, LV_ANIM_OFF);
+    return lbl;
+}
+
+static void dlg_live(lv_obj_t **slot, const char *who, const char *text, uint32_t color)
+{
+    if (*slot) {
+        char buf[DLG_MSG_MAX + 32];
+        snprintf(buf, sizeof(buf), "%s: %s", who, text);
+        lv_label_set_text(*slot, buf);
+        if (s_dlg_list) {
+            lv_obj_scroll_to_y(s_dlg_list, LV_COORD_MAX, LV_ANIM_OFF);
+        }
+    } else {
+        *slot = dlg_add(who, text, color);
+    }
+}
+
+static void build_dialog_tile(lv_obj_t *tile)
+{
+    lv_obj_t *title = make_label(tile, &lv_font_montserrat_14, COLOR_DIM);
+    lv_label_set_text(title, "MUSE");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
+    s_dlg_list = lv_obj_create(tile);
+    lv_obj_remove_style_all(s_dlg_list);
+    lv_obj_set_size(s_dlg_list, s_w - 32, s_h - 84);
+    lv_obj_align(s_dlg_list, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_flex_flow(s_dlg_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(s_dlg_list, 12, 0);
+    lv_obj_set_style_pad_row(s_dlg_list, 10, 0);
+    lv_obj_add_flag(s_dlg_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(s_dlg_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_dlg_list, LV_SCROLLBAR_MODE_OFF);
+    s_dlg_empty = make_label(s_dlg_list, caption_font(), COLOR_DIM);
+    lv_obj_set_style_text_align(s_dlg_empty, LV_TEXT_ALIGN_LEFT, 0);
+    lv_label_set_long_mode(s_dlg_empty, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_dlg_empty, s_w - 56);
+    lv_label_set_text(s_dlg_empty, "No messages yet. Press BOOT to talk.");
+}
+
+static void dlg_reply_page(const char *caption)
+{
+    if (strcmp(caption, s_dlg_last_page) == 0) {
+        return;
+    }
+    /* Pages join with a space: wrapping consumes the boundary space, so
+     * re-adding one can only ever add a harmless extra space, never join
+     * words. */
+    size_t have = strlen(s_dlg_reply);
+    size_t room = sizeof(s_dlg_reply) - have - 1;
+    if (room > 0) {
+        if (have > 0) {
+            strncat(s_dlg_reply, " ", room);
+            room = sizeof(s_dlg_reply) - strlen(s_dlg_reply) - 1;
+        }
+        if (room > 0) {
+            strncat(s_dlg_reply, caption, room);
+            dlg_fix_tail(s_dlg_reply);
+        }
+    }
+    dlg_copy_trunc(s_dlg_last_page, sizeof(s_dlg_last_page), caption);
+    dlg_live(&s_dlg_live_muse, "Muse", s_dlg_reply, COLOR_CAPTION);
+}
+
+static void dialog_poll(muse_mode_t mode, const char *caption)
+{
+    if (!s_dialog) {
+        return;
+    }
+    /* A conversation starting jumps to the dialog tile. */
+    if ((mode == MUSE_MODE_LISTENING || mode == MUSE_MODE_SPEAKING) && mode != s_dlg_prev_mode &&
+        lv_tileview_get_tile_active(s_tv) != s_dialog) {
+        lv_tileview_set_tile(s_tv, s_dialog, LV_ANIM_ON);
+    }
+    if (caption && caption[0]) {
+        if (mode == MUSE_MODE_LISTENING) {
+            if (!dlg_is_status(caption)) {
+                dlg_live(&s_dlg_live_user, "You", caption, COLOR_DIM);
+            }
+        } else if (mode == MUSE_MODE_THINKING) {
+            size_t n = strlen(caption);
+            if (n > 2 && caption[0] == '"' && caption[n - 1] == '"') {
+                /* Final transcript, quoted: refresh the user turn. */
+                char tmp[DLG_MSG_MAX];
+                size_t inner = n - 2 < sizeof(tmp) - 1 ? n - 2 : sizeof(tmp) - 1;
+                memcpy(tmp, caption + 1, inner);
+                tmp[inner] = '\0';
+                dlg_live(&s_dlg_live_user, "You", tmp, COLOR_DIM);
+            } else if (!dlg_is_status(caption)) {
+                /* A reply shown before playback (speaker off, or text
+                 * arriving early): same stream as the speaking pages. */
+                dlg_reply_page(caption);
+            }
+        } else if (mode == MUSE_MODE_SPEAKING) {
+            dlg_reply_page(caption);
+        }
+    }
+    /* A live entry survives only while its turn runs; the label stays. */
+    if (s_dlg_live_user && mode != MUSE_MODE_LISTENING && mode != MUSE_MODE_THINKING) {
+        s_dlg_live_user = NULL;
+    }
+    if (s_dlg_live_muse && mode != MUSE_MODE_SPEAKING && mode != MUSE_MODE_THINKING) {
+        s_dlg_live_muse = NULL;
+        s_dlg_reply[0] = '\0';
+        s_dlg_last_page[0] = '\0';
+    }
+    s_dlg_prev_mode = mode;
+}
+
 static void build_screen(void)
 {
     lv_obj_t *scr = lv_screen_active();
@@ -854,7 +1055,7 @@ static void build_screen(void)
 
     lv_obj_t *face = scr;
     if (muse_board->touch) {
-        /* Swipe left from Muse for settings. */
+        /* Swipe left from Muse for the dialog, again for settings. */
         s_tv = lv_tileview_create(scr);
         lv_obj_set_style_bg_color(s_tv, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_tv, LV_OPA_COVER, 0);
@@ -867,7 +1068,12 @@ static void build_screen(void)
          * shows as a different-coloured square around the character. */
         lv_obj_set_style_bg_color(s_face, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_face, LV_OPA_COVER, 0);
-        s_settings = lv_tileview_add_tile(s_tv, 1, 0, LV_DIR_LEFT);
+        s_dialog = lv_tileview_add_tile(s_tv, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT);
+        lv_obj_set_style_bg_color(s_dialog, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(s_dialog, LV_OPA_COVER, 0);
+        lv_obj_set_scrollbar_mode(s_dialog, LV_SCROLLBAR_MODE_OFF);
+        build_dialog_tile(s_dialog);
+        s_settings = lv_tileview_add_tile(s_tv, 2, 0, LV_DIR_LEFT);
         face = s_face;
     }
 
@@ -1359,7 +1565,7 @@ static void build_overlays(void)
     lv_obj_t *scr = lv_screen_active();
 
     /* Page dots. */
-    for (int i = 0; i < 2 && s_tv; i++) {
+    for (int i = 0; i < 3 && s_tv; i++) {
         lv_obj_t *d = lv_obj_create(scr);
         lv_obj_remove_style_all(d);
         lv_obj_set_size(d, 8, 8);
@@ -1367,7 +1573,7 @@ static void build_overlays(void)
         lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
         lv_obj_set_style_bg_color(d, lv_color_hex(COLOR_DOT_OFF), 0);
         lv_obj_remove_flag(d, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_align(d, LV_ALIGN_BOTTOM_MID, i ? 8 : -8, -14);
+        lv_obj_align(d, LV_ALIGN_BOTTOM_MID, (i - 1) * 16, -14);
         s_dots[i] = d;
     }
 
@@ -1513,21 +1719,23 @@ static void update_chrome(float now)
     s_next_settings_tick = now + SETTINGS_TICK_S;
 
     if (s_tv) {
-        int page = lv_tileview_get_tile_active(s_tv) == s_settings;
+        lv_obj_t *active = lv_tileview_get_tile_active(s_tv);
+        bool on_settings = (active == s_settings);
         bool subpage = muse_settings_ui_in_subpage();
-        bool swipe = !page || !subpage;
+        bool swipe = !on_settings || !subpage;
         if (swipe != lv_obj_has_flag(s_tv, LV_OBJ_FLAG_SCROLLABLE)) {
             lv_obj_set_flag(s_tv, LV_OBJ_FLAG_SCROLLABLE, swipe);
         }
-        int shown = page * 2 + subpage;
+        int page = (active == s_face) ? 0 : (active == s_dialog) ? 1 : 2;
+        int shown = page * 2 + (subpage ? 1 : 0);
         if (shown != s_shown_page) {
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < 3; i++) {
                 lv_obj_set_style_bg_color(s_dots[i], lv_color_hex(i == page ? COLOR_ACCENT : COLOR_DOT_OFF), 0);
-                lv_obj_set_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN, page && subpage);
+                lv_obj_set_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN, on_settings && subpage);
             }
             s_shown_page = shown;
         }
-        muse_settings_ui_tick(lv_obj_get_scroll_x(s_tv) > 0);
+        muse_settings_ui_tick(on_settings);
     }
 
     /* Joining, the icon blinks: the compact layout has no state label. */
@@ -1763,6 +1971,7 @@ static void update_status(muse_mode_t mode, float now)
             lv_obj_add_flag(answer >= 0 ? s_caption_lbl : s_reply_lbl, LV_OBJ_FLAG_HIDDEN);
         }
     }
+    dialog_poll(mode, fresh ? caption : NULL);
     update_power(now);
 }
 
