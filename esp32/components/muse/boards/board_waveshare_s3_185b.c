@@ -730,6 +730,9 @@ static lv_display_t *display_start(lv_indev_t **touch)
     esp_lv_adapter_config_t adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG();
     adapter_cfg.task_core_id = MUSE_UI_CORE;
     adapter_cfg.task_priority = MUSE_UI_PRIORITY;
+    /* LVGL task stack (8KB) in PSRAM: after WiFi/BLE init the internal heap
+       is too tight to create the task (V3 + ESP-SR), PSRAM has room. */
+    adapter_cfg.stack_in_psram = true;
     if (esp_lv_adapter_init(&adapter_cfg) != ESP_OK) {
         return NULL;
     }
