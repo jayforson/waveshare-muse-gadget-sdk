@@ -35,7 +35,11 @@ if(CONFIG_MUSE_ENABLED)
         "muse_imu.c"
         "muse_menu.c"
         "muse_voice.c"
-        "muse_adpcm.c"
+        "muse_adpcm.c")
+    if(CONFIG_MUSE_WAKE)
+        list(APPEND srcs "muse_wake.c")
+    endif()
+    list(APPEND srcs
         "muse_settings.c"
         "muse_settings_ui.c"
         "muse_text.c"

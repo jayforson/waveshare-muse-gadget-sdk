@@ -167,6 +167,20 @@ menu "Muse"
             Without it those characters show as boxes. Hangul isn't
             included.
 
+    config MUSE_WAKE
+        bool "Local wake word and voice barge-in (ESP-SR)"
+        depends on MUSE_ENABLED
+        default n
+        help
+            Wake-word calls on boards with a microphone: while idle and
+            plugged in, ESP-SR WakeNet listens for the wake word, then a
+            call runs until 30 s of silence or a short BOOT press ends
+            it. During replies, ESP-SR echo cancellation lets speech
+            barge in. The wake word model itself is picked in menuconfig
+            under ESP Speech Recognition (Jarvis first); with no model
+            picked, waking never fires and BOOT still works. Only enabled
+            where the board overlay turns it on.
+
     config MUSE_JC3248W535_MIC_GPIO
         int "JC3248W535: GPIO for an external I2S mic's data (SD) line"
         depends on MUSE_BOARD_GUITION_JC3248W535

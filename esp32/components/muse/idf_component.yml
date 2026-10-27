@@ -66,6 +66,13 @@ dependencies:
     version: "^2.0.2"
     rules:
       - if: "$CONFIG{MUSE_BOARD_ID} in [\"waveshare_s3_185c\", \"waveshare_s3_185b\"]"
+  # Wake-word calls (ESP-SR AFE v2 API), s185b only. The Mac's first build
+  # must check the resolver accepts this range under IDF 6.0.1; a refusal
+  # fails loudly at dependency resolution, not silently.
+  espressif/esp-sr:
+    version: "^2.0.0"
+    rules:
+      - if: "$CONFIG{MUSE_BOARD_ID} == \"waveshare_s3_185b\""
   espressif/esp_lcd_sh8601:
     version: "^2.0.1"
     rules:

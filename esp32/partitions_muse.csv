@@ -25,3 +25,7 @@ ota_0,     app,  ota_0,   0x20000,  4M,
 ota_1,     app,  ota_1,   0x420000, 4M,
 prod_data, data, 0x40,    0x820000, 0x1000,
 prod_bak,  data, 0x41,    0x821000, 0x1000,
+# WakeNet models (esp_srmodel_init("model") needs this fixed label).
+# 2M is headroom: the Jarvis single-model size is unconfirmed, so bump
+# this if the build reports the models do not fit. Existing rows untouched.
+model,     data, 0x42,    0x822000, 2M,

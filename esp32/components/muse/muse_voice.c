@@ -36,11 +36,12 @@
 #include "muse_mem.h"
 #include "muse_settings.h"
 #include "muse_state.h"
+#include "muse_wake.h"
 #include "muse_wifi.h"
 
 static const char *TAG = "muse_voice";
 
-#define MAX_SECS 15
+#define MAX_SECS 30
 #define TAIL_FRAMES (MUSE_AUDIO_RATE * 12 / 100)   /* capture lag + poll interval, stops before the release click */
 #define MAX_FRAMES (MUSE_AUDIO_RATE * MAX_SECS)
 #define MIN_HELD_FRAMES (MUSE_AUDIO_RATE * 3 / 10)   /* shorter presses are taps, not speech */
@@ -77,6 +78,38 @@ static volatile bool s_loopback;
 static volatile bool s_mp3test;
 static volatile bool s_cancel_requested;   /* red cancel button: drop the note in progress */
 static volatile uint32_t s_snore_ms;   /* when a snore was asked for (ms since boot), 0 for none */
+
+/*
+ * Wake-word calls. The voice task arms waking only while idle, plugged
+ * in and within reach of Muse; idle_capture feeds the wake-word engine
+ * and sets s_wake_fired. A call is the same turn machinery as a
+ * push-to-talk note, looped: listen (voice activity ends the utterance),
+ * send, play the reply, listen again, until 30 s of silence or a
+ * hangup. s_call is also read by the input task (BOOT short press
+ * during a call hangs up instead of sleeping).
+ */
+static bool s_call;
+static volatile bool s_hangup_requested;
+static volatile bool s_wake_armed;
+static volatile bool s_wake_fired;
+
+/* Call listening, in dBFS per 20 ms chunk. Starting points to tune on
+ * the device: a quiet room sits well below these, normal speech well
+ * above. Voice activity, not the cloud transcript, drives them, so a
+ * loud room can hold a call open; the BOOT short press hangs up. */
+#define CALL_SPEECH_DB (-45.0f)    /* speech starts above this */
+#define CALL_SILENCE_DB (-50.0f)   /* an utterance ends below this */
+#define CALL_GAP_CHUNKS 75         /* 1.5 s of silence ends an utterance */
+#define CALL_SILENCE_US (30LL * 1000000)   /* no speech this long hangs up */
+#define CALL_BARGE_DB (-45.0f)     /* echo-cancelled speech above this */
+#define CALL_BARGE_MS 100          /* ... for this long barges in */
+
+/* Call capture outcomes. */
+typedef enum {
+    CALL_UTTERANCE,   /* a note to send */
+    CALL_CANCELLED,   /* dropped; the call keeps listening */
+    CALL_HANGUP,      /* silence timeout, hangup request, or no memory */
+} call_outcome_t;
 
 /*
  * Pre-roll: while idle the mic keeps running into this ring, so a recording
@@ -167,6 +200,12 @@ static void idle_capture(void)
 #endif
     s_pre_next = (s_pre_next + 1) % PRE_CHUNKS;
     s_pre_fill = s_pre_fill < PRE_CHUNKS ? s_pre_fill + 1 : PRE_CHUNKS;
+    /* Wake-word engine, only while the voice task armed it (idle, plugged
+     * in, within reach). The settle skip above already kept Muse's own
+     * tail out of this chunk. */
+    if (s_wake_armed && muse_wake_feed(s_chunk, MUSE_AUDIO_CHUNK)) {
+        s_wake_fired = true;
+    }
 }
 
 /* Non-blocking: returns true if an event of `type` arrived (others dropped). */
@@ -363,6 +402,42 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
 
 static void go_idle(const char *caption);
 
+static int64_t s_barge_loud_us;   /* cleaned speech above threshold, continuous */
+
+/*
+ * One playback step through the echo canceller, only in a call: reads a
+ * mic chunk against `ref` (the audio just written, or silence when
+ * nothing plays) and reports true once the user has talked over the
+ * reply long enough to barge in. The caller then takes the same path as
+ * a BOOT press: cancel the turn, record a new utterance.
+ */
+static bool aec_barge_check(const int16_t *ref)
+{
+    static int16_t mic[MUSE_AUDIO_CHUNK];
+    static int16_t cleaned[MUSE_AUDIO_CHUNK + 1024];
+    if (!s_call || muse_wake_aec_frame_size() == 0) {
+        return false;
+    }
+    if (muse_audio_read(mic, MUSE_AUDIO_CHUNK) != ESP_OK) {
+        return false;
+    }
+    size_t out_n = 0;
+    if (!muse_wake_aec_feed(mic, ref, MUSE_AUDIO_CHUNK, cleaned,
+                            sizeof(cleaned) / sizeof(cleaned[0]), &out_n) || !out_n) {
+        return false;
+    }
+    if (muse_audio_dbfs(cleaned, out_n) > CALL_BARGE_DB) {
+        s_barge_loud_us += (int64_t)out_n * 1000000 / MUSE_AUDIO_RATE;
+        if (s_barge_loud_us >= CALL_BARGE_MS * 1000) {
+            s_barge_loud_us = 0;
+            return true;
+        }
+    } else {
+        s_barge_loud_us = 0;
+    }
+    return false;
+}
+
 /*
  * Plays Hatch's reply as it arrives, with its text as the caption. Returns
  * true if interrupted by a new press. *delivered: the VM has the note.
@@ -380,6 +455,7 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
     size_t played = 0;
     int64_t t0 = esp_timer_get_time();
     *delivered = false;
+    s_barge_loud_us = 0;
     for (;;) {
         muse_hatch_ev_t ev;
         while ((ev = muse_hatch_turn_event(text, sizeof(text))) != MUSE_HATCH_EV_NONE) {
@@ -415,6 +491,12 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
                 break;
             }
         }
+        if (s_hangup_requested) {
+            ESP_LOGI(TAG, "reply hung up");
+            muse_hatch_turn_cancel();
+            muse_state_set_level(0);
+            return true;
+        }
         if (got_event(MUSE_PTT_DOWN)) {
             ESP_LOGI(TAG, "reply interrupted");
             muse_hatch_turn_cancel();
@@ -437,6 +519,26 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
             /* Between messages: keep the speaker fed so it doesn't replay stale DMA. */
             muse_state_set_level(0);
             muse_audio_write(silence, MUSE_AUDIO_CHUNK);
+        }
+        /* In a call, listen over the reply: the reference is what actually
+         * reached the speaker (silence when muted, when gap silence was
+         * written, or while still waiting). A partial reply chunk has no
+         * matching full mic chunk, so that step is skipped; a barge-in
+         * then takes the same path as a press. Without echo
+         * cancellation there is no voice barge-in, only BOOT. */
+        if (s_call) {
+            const int16_t *ref = NULL;
+            if (n == MUSE_AUDIO_CHUNK) {
+                ref = muse_settings_speaker_on() ? buf : silence;
+            } else if (n == 0) {
+                ref = silence;
+            }
+            if (ref && aec_barge_check(ref)) {
+                ESP_LOGI(TAG, "reply interrupted by voice");
+                muse_hatch_turn_cancel();
+                muse_state_set_level(0);
+                return true;
+            }
         }
         /* The page being said, or before the speech the reply's opening page. */
         if ((speaking || replied) && muse_hatch_turn_caption(played, page, sizeof(page))) {
@@ -752,9 +854,11 @@ static bool held_due(void)
 /*
  * After the release: the rest of the note goes to Hatch and the reply plays,
  * or if it can't go now it's saved to send later. Returns true if a press
- * interrupted the reply.
+ * interrupted the reply. In a call (`in_call`) there is no end chirp
+ * after every utterance: only waking chirps up and hanging up chirps
+ * down, and the caller puts the face back to listening instead of idle.
  */
-static bool finish_note(void)
+static bool finish_note(bool in_call)
 {
     bool delivered;
 #if HOLD_NOTES
@@ -765,7 +869,9 @@ static bool finish_note(void)
             muse_hatch_turn_end();   /* before the chirp, which takes ~90 ms */
             fed = true;
         }
-        muse_audio_chirp(0);
+        if (!in_call) {
+            muse_audio_chirp(0);
+        }
         if (s_live && !fed) {
             /* Hatch is behind (still connecting, say): the rest from the kept note. */
             muse_state_set_mode(MUSE_MODE_THINKING);
@@ -787,8 +893,260 @@ static bool finish_note(void)
     }
 #endif
     muse_hatch_turn_end();   /* before the chirp, which takes ~90 ms */
-    muse_audio_chirp(0);
+    if (!in_call) {
+        muse_audio_chirp(0);
+    }
     return hatch_reply(&delivered);
+}
+
+static bool can_record(void);
+
+/* Drains the input queue once, reporting whether a BOOT press or release
+ * arrived (others dropped). Like got_event, any event pokes the state,
+ * which keeps the screen awake through an active call. */
+static void drain_ptt(bool *down, bool *up)
+{
+    muse_input_event_t ev;
+    *down = *up = false;
+    while (xQueueReceive(s_queue, &ev, 0) == pdTRUE) {
+        muse_state_poke();
+        if (ev.type == MUSE_PTT_DOWN) {
+            *down = true;
+        } else if (ev.type == MUSE_PTT_UP) {
+            *up = true;
+        }
+    }
+}
+
+/*
+ * One call utterance: the same kept-note and live-stream machinery as
+ * record(), but the end is voice activity, not a release. No pre-roll
+ * seeding: the ring still holds the wake word itself, which must not go
+ * as content. `barge_in` skips the speaker tail after an interrupted
+ * reply, as record() does. A BOOT hold during capture disables the
+ * silence-gap end (release ends it instead); a BOOT release with speech
+ * ends it at once. The silence watchdog (`*silence_deadline`) is reset
+ * on speech and checked while waiting for it; the caller owns it.
+ */
+static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_deadline)
+{
+    muse_state_set_mode(MUSE_MODE_LISTENING);
+    muse_state_set_progress(0);
+    s_rec_n = s_sent = 0;
+    s_cancel_requested = false;
+    s_live = s_tried = false;
+    if (!s_rec) {
+        s_rec = heap_caps_malloc(MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_rec) {
+            ESP_LOGE(TAG, "no memory to keep a note");
+            muse_state_set_caption("NO MEMORY FOR NOTE");
+            return CALL_HANGUP;
+        }
+    }
+    if (muse_hatch_ready() && !s_held_count) {
+        go_live();
+    }
+    muse_state_set_caption(s_live ? "LISTENING..." : "RECORDING...");
+    bool heard = false, ok = true;
+    bool gave_up = false;
+    char text[96];
+    rec_stats_t st = { 0 };
+
+    size_t n = 0;
+    if (barge_in) {
+        for (int i = 0; i < SETTLE_CHUNKS; i++) {
+            muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK);
+        }
+    }
+    bool speech = false, manual = muse_input_talk_down();
+    size_t gap = 0;
+    bool released = false;
+    size_t stop_at = MAX_FRAMES;
+    while (n + MUSE_AUDIO_CHUNK <= stop_at) {
+        if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
+            /* A dead mic must not spin: the silence watchdog hangs up. */
+            vTaskDelay(pdMS_TO_TICKS(20));
+            if (esp_timer_get_time() > *silence_deadline) {
+                muse_hatch_turn_cancel();
+                drop_rec();
+                muse_state_set_level(0);
+                return CALL_HANGUP;
+            }
+            continue;
+        }
+        float db = muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK);
+        muse_state_set_level(muse_audio_level(s_chunk, MUSE_AUDIO_CHUNK));
+        take(&st, s_chunk);
+        muse_hatch_ev_t ev;
+        while (s_live && (ev = muse_hatch_turn_event(text, sizeof(text))) != MUSE_HATCH_EV_NONE) {
+            if (ev == MUSE_HATCH_EV_HEARD && text[0]) {
+                heard = true;
+                muse_state_set_caption("%s", text);
+            } else if (ev == MUSE_HATCH_EV_ERROR) {
+                ESP_LOGW(TAG, "muse: %s", text);
+                muse_hatch_turn_cancel();
+                s_live = false;
+                gave_up = true;
+                if (!s_rec) {
+                    ok = false;
+                    muse_state_set_caption("%s", text);
+                }
+            }
+        }
+        n += MUSE_AUDIO_CHUNK;
+        bool tick = n % (MUSE_AUDIO_CHUNK * 5) == 0;
+        if (tick && s_rec && !s_live && !gave_up && !s_held_count && muse_hatch_ready()) {
+            ESP_LOGI(TAG, "Muse in reach: streaming the note so far");
+            go_live();
+        }
+        muse_state_set_progress((float)n / MAX_FRAMES);
+        if (!heard && ok && tick) {
+            muse_state_set_caption("%s %.1fs", s_live ? "LISTENING" : "RECORDING", (double)n / MUSE_AUDIO_RATE);
+        }
+        bool down, up;
+        drain_ptt(&down, &up);
+        if (down) {
+            manual = true;
+        }
+        if (s_hangup_requested) {
+            muse_hatch_turn_cancel();
+            drop_rec();
+            muse_state_set_level(0);
+            return CALL_HANGUP;
+        }
+        if (s_cancel_requested) {
+            s_cancel_requested = false;
+            muse_hatch_turn_cancel();
+            drop_rec();
+            muse_state_set_level(0);
+            return CALL_CANCELLED;
+        }
+        if (!speech) {
+            if (db > CALL_SPEECH_DB) {
+                speech = true;
+                gap = 0;
+                muse_state_poke();
+                *silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
+            } else if (esp_timer_get_time() > *silence_deadline) {
+                muse_hatch_turn_cancel();
+                drop_rec();
+                muse_state_set_level(0);
+                return CALL_HANGUP;
+            } else if (up) {
+                /* A BOOT hold released without speech: the user is
+                 * there, so the watchdog starts over. */
+                manual = false;
+                *silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
+            }
+            continue;
+        }
+        /* Speech heard: any loud chunk pushes the watchdog out. */
+        if (db > CALL_SILENCE_DB) {
+            gap = 0;
+            *silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
+        } else if (!manual) {
+            gap++;
+        }
+        if (up && !released) {
+            /* BOOT let go: keep going briefly, as after a release. */
+            released = true;
+            stop_at = n + TAIL_FRAMES < MAX_FRAMES ? n + TAIL_FRAMES : MAX_FRAMES;
+        }
+        if (!manual && gap >= CALL_GAP_CHUNKS) {
+            break;
+        }
+        if (n + MUSE_AUDIO_CHUNK > stop_at) {
+            break;
+        }
+    }
+    muse_state_set_level(0);
+    if (!ok) {
+        drop_rec();
+        return CALL_CANCELLED;
+    }
+    if (!speech || n < MIN_HELD_FRAMES) {
+        /* A cough, not an utterance: drop it, stay in the call. */
+        muse_hatch_turn_cancel();
+        drop_rec();
+        return CALL_CANCELLED;
+    }
+    char tail[160];
+    int tl = 0;
+    size_t shown = st.chunks < 25 ? st.chunks : 25;
+    for (size_t i = st.chunks - shown; i < st.chunks; i++) {
+        tl += snprintf(tail + tl, sizeof(tail) - tl, " %.0f", st.tail_db[i % 25]);
+    }
+    ESP_LOGI(TAG, "end levels:%s", tail);
+    float rms_db = st.frames ? 10.0f * log10f((float)(st.acc / st.frames / (32768.0 * 32768.0)) + 1e-10f) : -100.0f;
+    ESP_LOGI(TAG, "call utterance %.2fs: rms %.1f dBFS, peak %.1f dBFS, floor %.1f dBFS, %d clipped",
+             (double)n / MUSE_AUDIO_RATE, rms_db < -100.0f ? -100.0f : rms_db,
+             20.0 * log10((st.peak + 1) / 32768.0), st.floor_db, st.clipped);
+    return CALL_UTTERANCE;
+}
+
+/*
+ * A wake-word call, entered from the voice task's idle branch. Loops
+ * utterances until the silence watchdog fires or a hangup is requested,
+ * then chirps down and goes back to listening for the wake word. A
+ * reply interrupted by BOOT or by voice starts the next utterance at
+ * once (barge-in settle skips the speaker tail).
+ */
+static void call_run(void)
+{
+    s_call = true;
+    s_hangup_requested = false;
+    s_wake_armed = false;
+    if (!can_record()) {
+        /* can_record already said why; no chirp, no call. */
+        s_call = false;
+        return;
+    }
+    muse_state_set_asleep(false);
+    muse_state_poke();
+    muse_wifi_power(MUSE_WIFI_FULL);
+    muse_audio_chirp(1);
+    pre_reset();
+    ESP_LOGI(TAG, "call started");
+    int64_t silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
+    bool barge_in = false;
+    for (;;) {
+        call_outcome_t u = capture_call_utterance(barge_in, &silence_deadline);
+        barge_in = false;
+        if (u == CALL_HANGUP) {
+            break;
+        }
+        if (u == CALL_CANCELLED) {
+            /* Dropped utterance (or a tap on cancel): the user is there,
+             * so the silence watchdog starts over. */
+            silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
+            pre_reset();
+            continue;
+        }
+        bool interrupted = finish_note(true);
+        if (s_hangup_requested) {
+            break;
+        }
+        if (interrupted) {
+            /* BOOT or voice barge-in: listen again at once. */
+            barge_in = true;
+            silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
+            pre_reset();
+            continue;
+        }
+        /* Reply done (or the note saved offline): back to listening with
+         * a fresh silence window, happy as after any turn. */
+        muse_state_make_happy();
+        muse_state_set_mode(MUSE_MODE_LISTENING);
+        muse_state_poke();
+        silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
+        pre_reset();
+    }
+    s_call = false;
+    s_hangup_requested = false;
+    muse_audio_chirp(0);
+    go_idle("");
+    pre_reset();
+    ESP_LOGI(TAG, "call ended");
 }
 
 /*
@@ -818,6 +1176,16 @@ static bool can_record(void)
     s_rec = heap_caps_malloc(MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_rec) {
         ESP_LOGE(TAG, "no memory to keep a note");
+    } else {
+        /* Once: the 30 s note buffer plus wake/AFE against free heap. */
+        static bool logged;
+        if (!logged) {
+            logged = true;
+            ESP_LOGI(TAG, "note buffer %u KB: free internal %u, psram %u",
+                     (unsigned)(MAX_FRAMES * sizeof(int16_t) / 1024),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        }
     }
 #endif
     if (!ready && !s_rec) {
@@ -943,9 +1311,21 @@ static void voice_task(void *arg)
                 muse_audio_loopback_test(muse_settings_volume());
                 pre_reset();
             }
+            /* Wake-word arming: idle, plugged in, within reach. The
+             * screen may be dark on USB; on battery this never arms,
+             * and resting (battery asleep) never reaches this read. */
+            s_wake_armed = !muse_state_on_battery() && muse_hatch_ready()
+                && muse_state_mode(NULL) == MUSE_MODE_IDLE;
             /* The 20 ms read paces this loop. */
             idle_capture();
             if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
+                if (s_wake_fired) {
+                    s_wake_fired = false;
+                    muse_hatch_push_drop();   /* the call replaces the push */
+                    call_run();
+                    pre_reset();
+                    continue;
+                }
                 if (muse_hatch_push_take()) {
                     pending_down = play_push();
                     pre_reset();
@@ -956,6 +1336,10 @@ static void voice_task(void *arg)
                 }
                 continue;
             }
+            /* A press wins over a wake word in the same instant, and the
+             * armed flag must not leak into the waking-press path. */
+            s_wake_fired = false;
+            s_wake_armed = false;
             muse_hatch_push_drop();   /* a press goes first; its turn replaces the push's */
             muse_state_poke();
             if (ev.type != MUSE_PTT_DOWN) {
@@ -987,7 +1371,7 @@ static void voice_task(void *arg)
             go_idle(why);   /* Hatch failed it while recording */
             continue;
         }
-        pending_down = finish_note();
+        pending_down = finish_note(false);
         pre_reset();
         if (!pending_down && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
             muse_state_make_happy();
@@ -1005,6 +1389,9 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
         muse_state_set_caption("AUDIO INIT FAILED");
         return ESP_FAIL;
     }
+    /* Waking is optional: without it (no model picked, no partition, or
+     * the feature off) BOOT still works, so its failure never fails boot. */
+    (void)muse_wake_init();
     /* Stack in PSRAM if there is any (this task never writes flash) to spare internal RAM for Wi-Fi/BLE. */
     if (xTaskCreatePinnedToCoreWithCaps(voice_task, "muse_voice", 6144, NULL, 6, NULL, MUSE_AUDIO_CORE,
                                         MUSE_BIG_CAPS) != pdPASS) {
@@ -1051,6 +1438,16 @@ void muse_voice_request_mp3test(void)
 void muse_voice_request_cancel(void)
 {
     s_cancel_requested = true;
+}
+
+bool muse_voice_in_call(void)
+{
+    return s_call;
+}
+
+void muse_voice_request_hangup(void)
+{
+    s_hangup_requested = true;
 }
 
 /* Seconds recorded so far in the current note (0 when idle), for the

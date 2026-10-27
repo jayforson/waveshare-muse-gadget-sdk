@@ -53,8 +53,17 @@ void muse_voice_request_loopback(void);
 void muse_voice_request_mp3test(void);
 
 /* Cancels the recording in progress (red cancel button on the face):
- * the note is dropped, nothing is sent. */
+ * the note is dropped, nothing is sent. In a wake-word call it drops
+ * only the utterance in progress; the call itself keeps listening. */
 void muse_voice_request_cancel(void);
+
+/* True while a wake-word call is running (voice task). The input task
+ * reads this to turn a short BOOT press into a hangup during a call. */
+bool muse_voice_in_call(void);
+
+/* Ends the running call (BOOT short press during a call): the hangup
+ * chirp plays and listening for the wake word resumes. */
+void muse_voice_request_hangup(void);
 
 /* Asleep with nothing to play: codecs off, Wi-Fi dozing. */
 bool muse_voice_resting(void);

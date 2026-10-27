@@ -124,7 +124,7 @@ static const char *TAG = "muse_chat_session";
  * server transcribes it. Set to 0 to stream to /api/voice/dictation instead.
  */
 #define VOICE_NOTE 1
-#define NOTE_MAX_BYTES (MIC_RATE * 2 * 20) /* 20 s of 16 kHz PCM; Muse stops at 15 */
+#define NOTE_MAX_BYTES (MIC_RATE * 2 * 32) /* 32 s of 16 kHz PCM; device stops at 30 */
 #define NOTE_PART_BYTES (DICT_CHUNK_BYTES / 4 * 3)   /* staged PCM that base64s to one body chunk */
 
 #define MAX_MSGS 8

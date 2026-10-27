@@ -77,6 +77,11 @@ static bool s_cpu_low;      /* display stopped and the CPU allowed to sleep */
 static volatile bool s_power_off_requested;
 static volatile bool s_nap_now;   /* ">nap": asleep, as if on battery, nap without waiting WIFI_NAP_MS */
 
+bool muse_input_talk_down(void)
+{
+    return s_talk_down;
+}
+
 static void post(muse_ptt_t type, bool wake)
 {
     muse_input_event_t ev = { .type = type, .wake = wake };
@@ -258,7 +263,13 @@ static void talk_button(unsigned ev)
             if (s_talk_recording) {
                 post(MUSE_PTT_UP, false);
             } else if (!s_talk_woke) {
-                set_asleep(true, "talk tap");
+                /* A short press during a call hangs up; otherwise it
+                 * only sleeps the screen, as before. */
+                if (muse_voice_in_call()) {
+                    muse_voice_request_hangup();
+                } else {
+                    set_asleep(true, "talk tap");
+                }
             }
             s_talk_recording = false;
         }
@@ -293,7 +304,13 @@ static void talk_button(unsigned ev)
             if (s_talk_recording) {
                 post(MUSE_PTT_UP, false);
             } else if (!s_talk_woke) {
-                set_asleep(true, "talk tap");
+                /* A short press during a call hangs up; otherwise it
+                 * only sleeps the screen, as before. */
+                if (muse_voice_in_call()) {
+                    muse_voice_request_hangup();
+                } else {
+                    set_asleep(true, "talk tap");
+                }
             }
             s_talk_recording = false;
         }

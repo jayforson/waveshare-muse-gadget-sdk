@@ -62,3 +62,11 @@ CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
 
 CONFIG_MUSE_CJK_FONT=y
+
+# Wake-word calls: ESP-SR WakeNet + echo cancellation. The wake word model
+# is NOT picked here (its Kconfig symbol is unconfirmed): pick it on the
+# first build in menuconfig under ESP Speech Recognition (Jarvis first);
+# the choice persists in build-muse-waveshare-s3-185b/sdkconfig across
+# rebuilds, and a fresh build directory must pick it again. Without a
+# model picked, waking never fires and BOOT still works.
+CONFIG_MUSE_WAKE=y
