@@ -75,6 +75,10 @@ menu "Muse"
             bool "Waveshare ESP32-S3-Touch-LCD-1.85C (round 360x360 touch LCD, one button)"
             depends on IDF_TARGET_ESP32S3
 
+        config MUSE_BOARD_WAVESHARE_S3_185B
+            bool "Waveshare ESP32-S3-Touch-LCD-1.85B (round 360x360 touch LCD, one button)"
+            depends on IDF_TARGET_ESP32S3
+
         config MUSE_BOARD_WAVESHARE_S3_143C
             bool "Waveshare ESP32-S3-Touch-AMOLED-1.43C (round 466x466 touch AMOLED, one button)"
             depends on IDF_TARGET_ESP32S3
@@ -118,6 +122,7 @@ menu "Muse"
         default "m5stack_stopwatch" if MUSE_BOARD_M5STACK_STOPWATCH
         default "m5stack_cores3" if MUSE_BOARD_M5STACK_CORES3
         default "waveshare_s3_185c" if MUSE_BOARD_WAVESHARE_S3_185C
+        default "waveshare_s3_185b" if MUSE_BOARD_WAVESHARE_S3_185B
         default "waveshare_s3_143c" if MUSE_BOARD_WAVESHARE_S3_143C
         default "waveshare_s3_18" if MUSE_BOARD_WAVESHARE_S3_18
         default "m5stack_core2" if MUSE_BOARD_M5STACK_CORE2

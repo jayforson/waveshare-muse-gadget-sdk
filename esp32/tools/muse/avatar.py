@@ -69,6 +69,7 @@ BOARDS = {
     "M5Stack StickC Plus2": "plus2",
     "M5Stack StopWatch": "stopwatch",
     "Waveshare ESP32-S3-Touch-LCD-1.85C": "s185c",
+    "Waveshare ESP32-S3-Touch-LCD-1.85B": "s185b",
     "Waveshare ESP32-S3-Touch-AMOLED-1.43C": "s143c",
     "Waveshare ESP32-S3-Touch-AMOLED-1.8": "s18",
     "M5Stack CoreS3": "cores3",
@@ -77,7 +78,7 @@ BOARDS = {
     "Guition JC3248W535": "jc3248w535",
     "Waveshare ESP32-S3-Touch-LCD-7": "lcd7",
 }
-CHAT_BOARDS = ("s3", "s3n", "aipi", "box3", "sticks3", "watcher", "stopwatch", "cores3", "core2", "fnk0104b", "jc3248w535", "lcd7", "s185c", "s143c", "s18")
+CHAT_BOARDS = ("s3", "s3n", "aipi", "box3", "sticks3", "watcher", "stopwatch", "cores3", "core2", "fnk0104b", "jc3248w535", "lcd7", "s185c", "s185b", "s143c", "s18")
 
 
 class Stop(Exception):
