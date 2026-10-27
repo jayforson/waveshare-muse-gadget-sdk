@@ -71,7 +71,7 @@ static const char *TAG = "board";
 #define LCD_D3 GPIO_NUM_41
 #define LCD_BL GPIO_NUM_5
 #define DRAW_BUF_LINES 90          /* four bands to the screen (muse_lcd_bands.h) */
-#define LCD_CHUNK_BYTES (LCD_RES * 4 * 2)  /* both chunks fit in V3's DMA headroom; PSRAM chunks underflow at 80MHz */
+#define LCD_CHUNK_BYTES (LCD_RES * 2 * 2)  /* 2 lines: frees DMA for I2S; PSRAM chunks underflow at 80MHz */
 
 #define I2C_SDA GPIO_NUM_11
 #define I2C_SCL GPIO_NUM_10
@@ -796,6 +796,11 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
     i2s_chan_handle_t tx, rx;
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
+    /* Voice-sized I2S DMA: 3x120 frames stereo 16-bit = 1440 bytes/channel.
+       Defaults (6x240) need 5760/channel, 11520 total, which V3's DMA
+       headroom (~1K free) cannot provide. */
+    chan_cfg.dma_desc_num = 3;
+    chan_cfg.dma_frame_num = 120;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &tx, &rx), TAG, "i2s channel");
     const i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MUSE_AUDIO_RATE),
