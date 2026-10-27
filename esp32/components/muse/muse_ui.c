@@ -1028,10 +1028,11 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
     if (!s_dialog) {
         return;
     }
-    /* A conversation starting jumps to the dialog tile. */
+    /* A conversation starting jumps to the avatar tile, not the dialog:
+     * talking is watched on the face; history is read by swiping. */
     if ((mode == MUSE_MODE_LISTENING || mode == MUSE_MODE_SPEAKING) && mode != s_dlg_prev_mode &&
-        lv_tileview_get_tile_active(s_tv) != s_dialog) {
-        lv_tileview_set_tile(s_tv, s_dialog, LV_ANIM_ON);
+        lv_tileview_get_tile_active(s_tv) != s_face) {
+        lv_tileview_set_tile(s_tv, s_face, LV_ANIM_ON);
     }
     if (caption && caption[0]) {
         if (mode == MUSE_MODE_LISTENING) {
