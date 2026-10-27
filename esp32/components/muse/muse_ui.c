@@ -112,6 +112,8 @@ static lv_obj_t *s_pair_hint;
 static lv_obj_t *s_canvas;
 static lv_obj_t *s_mic_icon;
 static lv_obj_t *s_cancel_btn;
+static lv_obj_t *s_cancel_time_lbl;
+static int s_cancel_tenths = -1;
 static lv_obj_t *s_ring;
 static lv_obj_t *s_bar;     /* compact layout's stand-in for the ring */
 static lv_obj_t *s_state_lbl;
@@ -2030,20 +2032,26 @@ static void build_screen(void)
 
     build_answer(face, ring_in);
 
-    /* Cancel button, only while recording: above the mic icon, red. */
+    /* Cancel button, only while recording: a red circle above the mic
+     * icon, timer on top, Cancel below. */
     s_cancel_btn = lv_btn_create(face);
-    lv_obj_set_size(s_cancel_btn, 96, 26);
+    lv_obj_set_size(s_cancel_btn, 64, 64);
     lv_obj_set_style_bg_color(s_cancel_btn, lv_color_hex(0xFF3B30), 0);
     lv_obj_set_style_bg_opa(s_cancel_btn, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_cancel_btn, 12, 0);
-    lv_obj_set_style_pad_ver(s_cancel_btn, 2, 0);
-    lv_obj_set_style_pad_hor(s_cancel_btn, 8, 0);
+    lv_obj_set_style_radius(s_cancel_btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_all(s_cancel_btn, 0, 0);
     lv_obj_set_style_border_width(s_cancel_btn, 0, 0);
     lv_obj_align_to(s_cancel_btn, s_mic_icon, LV_ALIGN_OUT_TOP_MID, 0, -2);
+    s_cancel_time_lbl = lv_label_create(s_cancel_btn);
+    lv_label_set_text(s_cancel_time_lbl, "0.0s");
+    lv_obj_set_style_text_color(s_cancel_time_lbl, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(s_cancel_time_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(s_cancel_time_lbl, LV_ALIGN_CENTER, 0, -11);
     lv_obj_t *cancel_lbl = lv_label_create(s_cancel_btn);
-    lv_label_set_text(cancel_lbl, "cancel");
+    lv_label_set_text(cancel_lbl, "Cancel");
     lv_obj_set_style_text_color(cancel_lbl, lv_color_hex(0xffffff), 0);
-    lv_obj_center(cancel_lbl);
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(cancel_lbl, LV_ALIGN_CENTER, 0, 11);
     lv_obj_add_flag(s_cancel_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_cancel_btn, on_cancel_clicked, LV_EVENT_CLICKED, NULL);
 }
@@ -2733,6 +2741,9 @@ static void update_status(muse_mode_t mode, float now)
         s_shown_state = (int)mode;
         s_shown_lit = -1;
     }
+    /* While recording, the circular cancel button carries the timer, so the
+     * old LISTENING state label stays out of the way. */
+    lv_obj_set_flag(s_state_lbl, LV_OBJ_FLAG_HIDDEN, mode == MUSE_MODE_LISTENING || (s_small && !s_tall && s_h < 200));
 
     /* Ring: phase progress while listening/speaking, a spinner while thinking. */
     int ring = 0;
@@ -2769,9 +2780,21 @@ static void update_status(muse_mode_t mode, float now)
     /* The mic's meter; a reply's page has the room while answering. */
     bool meter = mode == MUSE_MODE_LISTENING;
     set_meter_visible(meter);
-    /* Cancel button, only while recording. */
+    /* Cancel button, only while recording, with its timer kept fresh. */
     if (s_cancel_btn) {
-        lv_obj_set_flag(s_cancel_btn, LV_OBJ_FLAG_HIDDEN, mode != MUSE_MODE_LISTENING);
+        bool listening = mode == MUSE_MODE_LISTENING;
+        lv_obj_set_flag(s_cancel_btn, LV_OBJ_FLAG_HIDDEN, !listening);
+        if (listening && s_cancel_time_lbl) {
+            int tenths = (int)(muse_voice_record_secs() * 10.0f + 0.5f);
+            if (tenths != s_cancel_tenths) {
+                s_cancel_tenths = tenths;
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%.1fs", tenths / 10.0f);
+                lv_label_set_text(s_cancel_time_lbl, buf);
+            }
+        } else {
+            s_cancel_tenths = -1;
+        }
     }
     if (meter && !s_small) {
         int lit = (int)lroundf(s_level * METER_SEGS);
@@ -2818,6 +2841,11 @@ static void update_status(muse_mode_t mode, float now)
         if (s_reply_lbl) {
             lv_obj_add_flag(answer >= 0 ? s_caption_lbl : s_reply_lbl, LV_OBJ_FLAG_HIDDEN);
         }
+    }
+    /* While recording, the circular cancel button carries the timer, so the
+     * old LISTENING caption stays out of its way. */
+    if (mode == MUSE_MODE_LISTENING && s_caption_lbl) {
+        lv_obj_add_flag(s_caption_lbl, LV_OBJ_FLAG_HIDDEN);
     }
     dialog_poll(mode, fresh ? caption : NULL);
     update_power(now);

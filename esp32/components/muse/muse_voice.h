@@ -35,6 +35,9 @@ void muse_voice_set_monitor(bool on);
 /* Smoothed mic level in dBFS (fast attack, slow release). */
 float muse_voice_monitor_db(void);
 
+/* Seconds recorded so far in the current note (0 when idle). */
+float muse_voice_record_secs(void);
+
 /* Plays a short chirp at the current volume (when idle). */
 void muse_voice_request_chirp(void);
 

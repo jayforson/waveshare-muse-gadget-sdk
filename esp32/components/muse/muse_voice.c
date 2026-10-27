@@ -1053,6 +1053,14 @@ void muse_voice_request_cancel(void)
     s_cancel_requested = true;
 }
 
+/* Seconds recorded so far in the current note (0 when idle), for the
+ * cancel button's timer. MAX_SECS lives here, so the UI does not
+ * duplicate it. */
+float muse_voice_record_secs(void)
+{
+    return muse_state_progress() * MAX_SECS;
+}
+
 bool muse_voice_resting(void)
 {
     return s_resting;
