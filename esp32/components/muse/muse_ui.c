@@ -931,7 +931,7 @@ static lv_obj_t *dlg_add(const char *who, const char *text, uint32_t color)
     lv_obj_t *lbl = make_label(s_dlg_list, caption_font(), color);
     lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_LEFT, 0);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(lbl, s_w - 56);
+    lv_obj_set_width(lbl, s_w - 104);
     lv_label_set_text(lbl, buf);
     s_dlg_msgs[s_dlg_n++] = lbl;
     if (s_dlg_empty) {
@@ -941,13 +941,30 @@ static lv_obj_t *dlg_add(const char *who, const char *text, uint32_t color)
     return lbl;
 }
 
+/* True when the list is already showing its bottom (or fits entirely):
+ * live updates then follow new text, but a user who scrolled up to read
+ * history is never yanked back down. Checked before the text grows, so a
+ * user sitting at the bottom still follows the next page. */
+static bool dlg_near_bottom(void)
+{
+    if (!s_dlg_list) {
+        return true;
+    }
+    int max_scroll = lv_obj_get_content_height(s_dlg_list) - lv_obj_get_height(s_dlg_list);
+    if (max_scroll <= 0) {
+        return true;
+    }
+    return lv_obj_get_scroll_y(s_dlg_list) >= max_scroll - 20;
+}
+
 static void dlg_live(lv_obj_t **slot, const char *who, const char *text, uint32_t color)
 {
     if (*slot) {
+        bool follow = dlg_near_bottom();
         char buf[DLG_MSG_MAX + 32];
         snprintf(buf, sizeof(buf), "%s: %s", who, text);
         lv_label_set_text(*slot, buf);
-        if (s_dlg_list) {
+        if (s_dlg_list && follow) {
             lv_obj_scroll_to_y(s_dlg_list, LV_COORD_MAX, LV_ANIM_OFF);
         }
     } else {
@@ -962,10 +979,15 @@ static void build_dialog_tile(lv_obj_t *tile)
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
     s_dlg_list = lv_obj_create(tile);
     lv_obj_remove_style_all(s_dlg_list);
-    lv_obj_set_size(s_dlg_list, s_w - 32, s_h - 84);
-    lv_obj_align(s_dlg_list, LV_ALIGN_TOP_MID, 0, 40);
+    /* Round screen: a full-width column runs past the circle at the top
+     * and bottom, so the list is inset to a column that fits the circle,
+     * with top/bottom padding keeping the first/last rows inside it. */
+    lv_obj_set_size(s_dlg_list, s_w - 80, s_h - 84);
+    lv_obj_align(s_dlg_list, LV_ALIGN_TOP_MID, 0, 44);
     lv_obj_set_flex_flow(s_dlg_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(s_dlg_list, 12, 0);
+    lv_obj_set_style_pad_top(s_dlg_list, 28, 0);
+    lv_obj_set_style_pad_bottom(s_dlg_list, 36, 0);
     lv_obj_set_style_pad_row(s_dlg_list, 10, 0);
     lv_obj_add_flag(s_dlg_list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(s_dlg_list, LV_DIR_VER);
@@ -973,7 +995,7 @@ static void build_dialog_tile(lv_obj_t *tile)
     s_dlg_empty = make_label(s_dlg_list, caption_font(), COLOR_DIM);
     lv_obj_set_style_text_align(s_dlg_empty, LV_TEXT_ALIGN_LEFT, 0);
     lv_label_set_long_mode(s_dlg_empty, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_dlg_empty, s_w - 56);
+    lv_obj_set_width(s_dlg_empty, s_w - 104);
     lv_label_set_text(s_dlg_empty, "No messages yet. Press BOOT to talk.");
 }
 
