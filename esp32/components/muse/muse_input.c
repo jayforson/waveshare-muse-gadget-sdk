@@ -209,6 +209,26 @@ static void aux_key(bool pressed, bool edge)
 /* Talk button: push-to-talk, or Select while the menu is open. Asleep, the
  * press wakes and is posted as a waking one: muse_voice records only if it's
  * still held once awake. */
+/* Tap-to-sleep: a talk-button press released within TAP_SLEEP_MS sleeps
+ * instead of talking. The tap's note is under the 0.3 s discard line, so
+ * nothing is lost; holds talk exactly as before. Armed only for a normal
+ * idle talk press: not for wake presses (asleep press wakes), pairing
+ * confirms, menu selects, or presses during a reply. */
+#define TAP_SLEEP_MS 250
+static TickType_t s_tap_press_at;
+static bool s_tap_armed;
+
+static void tap_sleep_maybe(void)
+{
+    if (!s_tap_armed) {
+        return;
+    }
+    s_tap_armed = false;
+    if (xTaskGetTickCount() - s_tap_press_at <= pdMS_TO_TICKS(TAP_SLEEP_MS)) {
+        set_asleep(true, "talk tap");
+    }
+}
+
 static void talk_button(unsigned ev)
 {
     bool talk_down = s_talk_down;
@@ -235,6 +255,7 @@ static void talk_button(unsigned ev)
     if ((talk_down || swallow) && released) {
         if (talk_down) {
             post(MUSE_PTT_UP, false);
+            tap_sleep_maybe();
         }
         talk_down = swallow = false;
         released = false;
@@ -255,11 +276,17 @@ static void talk_button(unsigned ev)
         } else {
             post(MUSE_PTT_DOWN, false);
             talk_down = true;
+            float mode_t;
+            if (muse_state_mode(&mode_t) == MUSE_MODE_IDLE) {
+                s_tap_armed = true;
+                s_tap_press_at = xTaskGetTickCount();
+            }
         }
     }
     if ((talk_down || swallow) && released) {
         if (talk_down) {
             post(MUSE_PTT_UP, false);
+            tap_sleep_maybe();
         }
         talk_down = swallow = false;
     }
