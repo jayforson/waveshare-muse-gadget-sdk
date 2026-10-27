@@ -111,6 +111,7 @@ static lv_obj_t *s_pair_title;
 static lv_obj_t *s_pair_hint;
 static lv_obj_t *s_canvas;
 static lv_obj_t *s_mic_icon;
+static lv_obj_t *s_cancel_btn;
 static lv_obj_t *s_ring;
 static lv_obj_t *s_bar;     /* compact layout's stand-in for the ring */
 static lv_obj_t *s_state_lbl;
@@ -497,6 +498,18 @@ static void on_canvas_clicked(lv_event_t *e)
         return;   /* a tap that keeps the tickling going, not a pet */
     }
     muse_state_make_happy();
+}
+
+/* Red cancel button, only while recording: drop the note, send nothing.
+ * Hiding it here (as well as in update_status) makes it vanish the
+ * moment it is tapped. */
+static void on_cancel_clicked(lv_event_t *e)
+{
+    lv_event_stop_bubbling(e);
+    if (s_cancel_btn) {
+        lv_obj_add_flag(s_cancel_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    muse_voice_request_cancel();
 }
 
 static const lv_font_t *font_pick(const lv_font_t *full, const lv_font_t *compact)
@@ -2016,6 +2029,23 @@ static void build_screen(void)
     }
 
     build_answer(face, ring_in);
+
+    /* Cancel button, only while recording: above the mic icon, red. */
+    s_cancel_btn = lv_btn_create(face);
+    lv_obj_set_size(s_cancel_btn, 96, 26);
+    lv_obj_set_style_bg_color(s_cancel_btn, lv_color_hex(0xFF3B30), 0);
+    lv_obj_set_style_bg_opa(s_cancel_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_cancel_btn, 12, 0);
+    lv_obj_set_style_pad_ver(s_cancel_btn, 2, 0);
+    lv_obj_set_style_pad_hor(s_cancel_btn, 8, 0);
+    lv_obj_set_style_border_width(s_cancel_btn, 0, 0);
+    lv_obj_align_to(s_cancel_btn, s_mic_icon, LV_ALIGN_OUT_TOP_MID, 0, -2);
+    lv_obj_t *cancel_lbl = lv_label_create(s_cancel_btn);
+    lv_label_set_text(cancel_lbl, "cancel");
+    lv_obj_set_style_text_color(cancel_lbl, lv_color_hex(0xffffff), 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_flag(s_cancel_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_cancel_btn, on_cancel_clicked, LV_EVENT_CLICKED, NULL);
 }
 
 /* Cyan over a dim track, from 12 o'clock clockwise (from the bottom on a bar). */
@@ -2739,6 +2769,10 @@ static void update_status(muse_mode_t mode, float now)
     /* The mic's meter; a reply's page has the room while answering. */
     bool meter = mode == MUSE_MODE_LISTENING;
     set_meter_visible(meter);
+    /* Cancel button, only while recording. */
+    if (s_cancel_btn) {
+        lv_obj_set_flag(s_cancel_btn, LV_OBJ_FLAG_HIDDEN, mode != MUSE_MODE_LISTENING);
+    }
     if (meter && !s_small) {
         int lit = (int)lroundf(s_level * METER_SEGS);
         if (lit != s_shown_lit || accent != s_shown_accent) {

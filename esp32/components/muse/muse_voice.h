@@ -49,6 +49,10 @@ void muse_voice_request_loopback(void);
 /* Bench test: decodes and plays a built-in MP3 reply. */
 void muse_voice_request_mp3test(void);
 
+/* Cancels the recording in progress (red cancel button on the face):
+ * the note is dropped, nothing is sent. */
+void muse_voice_request_cancel(void);
+
 /* Asleep with nothing to play: codecs off, Wi-Fi dozing. */
 bool muse_voice_resting(void);
 

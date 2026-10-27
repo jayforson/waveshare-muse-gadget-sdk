@@ -75,6 +75,7 @@ static volatile float s_monitor_db = -100.0f;
 static volatile bool s_chirp;
 static volatile bool s_loopback;
 static volatile bool s_mp3test;
+static volatile bool s_cancel_requested;   /* red cancel button: drop the note in progress */
 static volatile uint32_t s_snore_ms;   /* when a snore was asked for (ms since boot), 0 for none */
 
 /*
@@ -241,6 +242,8 @@ static void take(rec_stats_t *st, const int16_t *pcm)
     feed_live();
 }
 
+static void drop_rec(void);
+
 /*
  * Records speech until release or MAX_SECS, starting with the pre-roll; *held
  * gets the part after the press. It streams to Hatch as it goes if it can.
@@ -254,6 +257,7 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
     muse_state_set_mode(MUSE_MODE_LISTENING);
     muse_state_set_progress(0);
     s_rec_n = s_sent = 0;
+    s_cancel_requested = false;   /* a stale tap must not kill this note */
     s_live = s_tried = false;
     if (!s_rec || (muse_hatch_ready() && !s_held_count)) {
         go_live();
@@ -279,6 +283,7 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
     }
     size_t pre = n;
     bool released = false;
+    bool cancelled = false;
     size_t stop_at = MAX_FRAMES;
     while (n + MUSE_AUDIO_CHUNK <= stop_at) {
         if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
@@ -323,6 +328,21 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
             released = true;
             stop_at = n + TAIL_FRAMES < MAX_FRAMES ? n + TAIL_FRAMES : MAX_FRAMES;
         }
+        if (s_cancel_requested) {
+            s_cancel_requested = false;
+            cancelled = true;
+            break;
+        }
+    }
+    if (cancelled) {
+        muse_hatch_turn_cancel();
+        drop_rec();
+        *held = 0;
+        if (cap > 0) {
+            why[0] = '\0';
+        }
+        muse_state_set_level(0);
+        return false;
     }
     muse_state_set_level(0);
     *held = n - pre;
@@ -1026,6 +1046,11 @@ void muse_voice_request_mp3test(void)
 {
     s_mp3test = true;
     muse_state_nudge();
+}
+
+void muse_voice_request_cancel(void)
+{
+    s_cancel_requested = true;
 }
 
 bool muse_voice_resting(void)
