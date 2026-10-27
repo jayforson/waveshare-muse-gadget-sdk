@@ -21,11 +21,13 @@
 nvs,       data, nvs,     0x11000,  0xC000,
 otadata,   data, ota,     0x1D000,  0x2000,
 phy_init,  data, phy,     0x1F000,  0x1000,
-ota_0,     app,  ota_0,   0x20000,  4M,
-ota_1,     app,  ota_1,   0x420000, 4M,
-prod_data, data, 0x40,    0x820000, 0x1000,
-prod_bak,  data, 0x41,    0x821000, 0x1000,
+# V3 (ESP-SR) app is ~4.7 MB, so the OTA slots are 6M (was 4M);
+# prod_data/prod_bak/model follow the app slots, as this table designs.
+ota_0,     app,  ota_0,   0x20000,  6M,
+ota_1,     app,  ota_1,   0x620000, 6M,
+prod_data, data, 0x40,    0xC20000, 0x1000,
+prod_bak,  data, 0x41,    0xC21000, 0x1000,
 # WakeNet models (esp_srmodel_init("model") needs this fixed label).
 # 2M is headroom: the Jarvis single-model size is unconfirmed, so bump
 # this if the build reports the models do not fit. Existing rows untouched.
-model,     data, 0x42,    0x822000, 2M,
+model,     data, 0x42,    0xC22000, 2M,
