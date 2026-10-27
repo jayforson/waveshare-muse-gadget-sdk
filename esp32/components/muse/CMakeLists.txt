@@ -51,7 +51,9 @@ if(CONFIG_MUSE_ENABLED)
     endif()
     list(APPEND srcs "muse_chat_text.c")
     if(CONFIG_MUSE_CJK_FONT)
-        list(APPEND srcs "fonts/muse_font_cjk_16.c")   # captions' CJK fallback
+        list(APPEND srcs "fonts/muse_font_noto_sc_16.c")   # captions: Noto Sans SC (common chars)
+        list(APPEND srcs "fonts/muse_font_noto_sc_16_bold.c")   # captions: Noto Sans SC Bold (headings)
+        list(APPEND srcs "fonts/muse_font_cjk_16.c")   # captions' CJK fallback (rare chars)
     endif()
     # Your own character (tools/muse/AVATAR_RECIPE.md) stands in for the default
     # avatar when avatar/muse_pixel.c exists here; this avatar/ is gitignored. The

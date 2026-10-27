@@ -23,6 +23,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -57,7 +58,7 @@ static const char *TAG = "muse_ui";
 #define METER_GAP_PX 4
 #define RING_RANGE 1000
 #define CAPTION_W 256           /* 16 columns of unscii_16, the width reply captions wrap to */
-#define CAPTION_LINE_SPACE 2
+#define CAPTION_LINE_SPACE 0
 #define ART_BLANK_ROWS 3        /* Muse's art never reaches the grid's bottom rows */
 #define MINI_CELL_PX 2          /* Muse's grid cells over a reply that's read */
 #define ANSWER_MS 300           /* Muse making room for a reply, and back */
@@ -505,17 +506,46 @@ static const lv_font_t *font_pick(const lv_font_t *full, const lv_font_t *compac
 
 #if CONFIG_MUSE_CJK_FONT
 LV_FONT_DECLARE(muse_font_cjk_16)
+LV_FONT_DECLARE(muse_font_noto_sc_16)
+LV_FONT_DECLARE(muse_font_noto_sc_16_bold)
 #endif
 
-/* unscii-16 for captions and replies; with CONFIG_MUSE_CJK_FONT, a copy that
- * falls back to Unifont's 16x16 CJK, the same cell, for what unscii lacks. */
+/* Noto Sans SC 16 for captions and replies; with CONFIG_MUSE_CJK_FONT, a copy
+ * that falls back to Unifont's 16x16 CJK for the rare characters the Noto
+ * subset (most common Simplified chars) does not cover. Without it, unscii-16
+ * with the same Unifont fallback. */
+/* Noto Sans SC 16 ships line_height 31 / base_line 9, but its glyphs only
+ * span hhea ascent 18.6 + descent 4.6 = 23.2 px at 16 px, so every line
+ * carries ~8 px of dead air no line_space tweak can remove. Tighten to the
+ * minimum that still fits common glyphs: line_height 24, baseline 5 px
+ * from the bottom (0.4 px clearance top and bottom). Rare extra-tall
+ * symbols may touch neighbouring lines; that is the minimum's tradeoff. */
 static const lv_font_t *caption_font(void)
 {
 #if CONFIG_MUSE_CJK_FONT
     static lv_font_t font;
     if (!font.get_glyph_dsc) {
-        font = lv_font_unscii_16;
+        font = muse_font_noto_sc_16;
         font.fallback = &muse_font_cjk_16;
+        font.line_height = 24;
+        font.base_line = 5;
+    }
+    return &font;
+#else
+    return &lv_font_unscii_16;
+#endif
+}
+
+/* Bold companion of caption_font, for dialog headings. */
+static const lv_font_t *caption_font_bold(void)
+{
+#if CONFIG_MUSE_CJK_FONT
+    static lv_font_t font;
+    if (!font.get_glyph_dsc) {
+        font = muse_font_noto_sc_16_bold;
+        font.fallback = &muse_font_cjk_16;
+        font.line_height = 24;
+        font.base_line = 5;
     }
     return &font;
 #else
@@ -850,10 +880,13 @@ static void on_ring_draw(lv_event_t *e)
  * same caption stream the face shows. While listening the caption carries
  * the live transcript; while speaking it carries the reply, page by page.
  * Status captions ("LISTENING...", "NOTE SENT - ...", ...) are never stored
- * as messages. The settings tile is untouched; only its column moves to 2.
+ * as messages. Each message is a container of rich blocks (headings, lists,
+ * quotes, code, paragraphs) with a divider line below it and no speaker
+ * prefix; speakers differ by brightness. Live messages rebuild their blocks
+ * on each update. The settings tile is untouched; only its column moves to 2.
  */
 #define DLG_MAX_MSGS 10
-#define DLG_MSG_MAX 500
+#define DLG_MSG_MAX 2000
 
 static lv_obj_t *s_dialog;
 static lv_obj_t *s_dlg_list;
@@ -914,7 +947,620 @@ static void dlg_copy_trunc(char *dst, size_t dst_n, const char *src)
     }
 }
 
-static lv_obj_t *dlg_add(const char *who, const char *text, uint32_t color)
+/* Scratch buffers for dialog formatting. Static, not stack: a 2000-char
+ * message plus its prefix does not belong in a UI-task stack frame, and
+ * LVGL calls here all run on the one UI task. */
+static char s_dlg_stripped[DLG_MSG_MAX];
+static char s_dlg_tmp[DLG_MSG_MAX];
+static char s_dlg_raw[DLG_MSG_MAX];
+static char s_dlg_line[DLG_MSG_MAX];
+static char s_dlg_block[DLG_MSG_MAX];
+
+/* Strip Markdown to plain text for the small dialog screen: the backend
+ * replies in Markdown, but LVGL labels render it verbatim, so "**bold**"
+ * and "# headings" showed up literally. Only ASCII bytes are treated
+ * specially, so UTF-8 (including CJK) passes through untouched; a trailing
+ * split character from the cap is dropped by dlg_fix_tail. */
+static void dlg_strip_markdown(char *dst, size_t dst_n, const char *src)
+{
+    size_t o = 0;
+    size_t i = 0;
+    bool line_start = true;
+    bool prev_nl = false;
+    if (dst_n == 0) {
+        return;
+    }
+    while (src[i] != '\0') {
+        char c = src[i];
+        if (c == '\n') {
+            /* Collapse blank lines: paragraphs stay separated by one break. */
+            if (!prev_nl && o + 1 < dst_n) {
+                dst[o++] = '\n';
+            }
+            prev_nl = true;
+            line_start = true;
+            i++;
+            continue;
+        }
+        prev_nl = false;
+        if (line_start) {
+            size_t j = i;
+            while (src[j] == ' ' || src[j] == '\t') {
+                j++;
+            }
+            /* Fence: drop the whole line. */
+            if (strncmp(&src[j], "```", 3) == 0) {
+                while (src[i] != '\0' && src[i] != '\n') {
+                    i++;
+                }
+                continue;
+            }
+            /* Rule (---, ***, ___) or table separator (| --- | --- |):
+             * a line of only spaces, |, :, *, _, - with 3+ markers. */
+            {
+                size_t k = j;
+                size_t markers = 0;
+                bool only_rule = true;
+                while (src[k] != '\0' && src[k] != '\n') {
+                    char t = src[k];
+                    if (t == '*' || t == '_' || t == '-') {
+                        markers++;
+                    } else if (t != ' ' && t != '\t' && t != '|' && t != ':') {
+                        only_rule = false;
+                        break;
+                    }
+                    k++;
+                }
+                if (only_rule && markers >= 3 && k > j) {
+                    i = k;
+                    continue;
+                }
+            }
+            if (src[j] == '#') {
+                size_t k = j;
+                while (src[k] == '#') {
+                    k++;
+                }
+                if (src[k] == ' ' || src[k] == '\t' || src[k] == '\0' || src[k] == '\n') {
+                    i = k;
+                    while (src[i] == ' ' || src[i] == '\t') {
+                        i++;
+                    }
+                    line_start = false;
+                    continue;
+                }
+            }
+            if (src[j] == '>') {
+                i = j + 1;
+                while (src[i] == ' ' || src[i] == '\t') {
+                    i++;
+                }
+                line_start = false;
+                continue;
+            }
+            if ((src[j] == '-' || src[j] == '*' || src[j] == '+') &&
+                (src[j + 1] == ' ' || src[j + 1] == '\t')) {
+                i = j + 2;
+                while (src[i] == ' ' || src[i] == '\t') {
+                    i++;
+                }
+                line_start = false;
+                continue;
+            }
+            if (src[j] >= '0' && src[j] <= '9') {
+                size_t k = j;
+                while (src[k] >= '0' && src[k] <= '9') {
+                    k++;
+                }
+                if (src[k] == '.' && (src[k + 1] == ' ' || src[k + 1] == '\t')) {
+                    i = k + 2;
+                    while (src[i] == ' ' || src[i] == '\t') {
+                        i++;
+                    }
+                    line_start = false;
+                    continue;
+                }
+            }
+            /* No marker: fall through with leading spaces already skipped. */
+            i = j;
+            line_start = false;
+        }
+        /* Inline markup. */
+        if (c == '\\' && src[i + 1] != '\0') {
+            char n = src[i + 1];
+            if (n == '*' || n == '_' || n == '`' || n == '#' || n == '\\' || n == '[' || n == ']') {
+                if (o + 1 < dst_n) {
+                    dst[o++] = n;
+                }
+                i += 2;
+                continue;
+            }
+        }
+        if (c == '`') {
+            i++;
+            continue;
+        }
+        if (c == '~' && src[i + 1] == '~') {
+            i += 2;
+            continue;
+        }
+        if (c == '*' && src[i + 1] == '*') {
+            i += 2;
+            continue;
+        }
+        if (c == '_' && src[i + 1] == '_') {
+            i += 2;
+            continue;
+        }
+        if (c == '*' || c == '_') {
+            /* Single emphasis marker, unless inside a word (my_var, 3*4). */
+            unsigned char prev = i > 0 ? (unsigned char)src[i - 1] : 0;
+            unsigned char next = (unsigned char)src[i + 1];
+            bool prev_alnum = (prev >= '0' && prev <= '9') || (prev >= 'A' && prev <= 'Z') ||
+                (prev >= 'a' && prev <= 'z');
+            bool next_alnum = (next >= '0' && next <= '9') || (next >= 'A' && next <= 'Z') ||
+                (next >= 'a' && next <= 'z');
+            if (!(prev_alnum && next_alnum)) {
+                i++;
+                continue;
+            }
+        }
+        if (c == '!' && src[i + 1] == '[') {
+            /* Image: keep only the alt text (may be empty). */
+            size_t close = i + 2;
+            while (src[close] != '\0' && src[close] != ']' && src[close] != '\n') {
+                close++;
+            }
+            if (src[close] == ']' && src[close + 1] == '(') {
+                size_t end = close + 2;
+                while (src[end] != '\0' && src[end] != ')' && src[end] != '\n') {
+                    end++;
+                }
+                if (src[end] == ')') {
+                    for (size_t k = i + 2; k < close && o + 1 < dst_n; k++) {
+                        dst[o++] = src[k];
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        if (c == '[') {
+            /* Link: keep the text, drop the URL. */
+            size_t close = i + 1;
+            while (src[close] != '\0' && src[close] != ']' && src[close] != '\n') {
+                close++;
+            }
+            if (src[close] == ']' && src[close + 1] == '(') {
+                size_t end = close + 2;
+                while (src[end] != '\0' && src[end] != ')' && src[end] != '\n') {
+                    end++;
+                }
+                if (src[end] == ')') {
+                    for (size_t k = i + 1; k < close && o + 1 < dst_n; k++) {
+                        dst[o++] = src[k];
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        if (c == '<') {
+            /* HTML tag: skip <name ...> when it closes on the same line. */
+            char n = src[i + 1];
+            if ((n >= 'A' && n <= 'Z') || (n >= 'a' && n <= 'z') || n == '/') {
+                size_t end = i + 1;
+                while (src[end] != '\0' && src[end] != '>' && src[end] != '\n' && end - i < 32) {
+                    end++;
+                }
+                if (src[end] == '>') {
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        if (c == '|') {
+            /* Table column separator becomes a space. */
+            if (o + 1 < dst_n) {
+                dst[o++] = ' ';
+            }
+            i++;
+            continue;
+        }
+        if (o + 1 < dst_n) {
+            dst[o++] = c;
+        }
+        i++;
+    }
+    dst[o] = '\0';
+    dlg_fix_tail(dst);
+}
+
+/* Inline Markdown only (no block structure): bold/italic/code markers,
+ * links to their text, HTML tags, table separators to spaces. Used on one
+ * line of a block; the block parser handles headings, lists, quotes and
+ * fences. Only ASCII bytes are special, so UTF-8 passes through untouched. */
+static void dlg_strip_inline(char *dst, size_t dst_n, const char *src)
+{
+    size_t o = 0;
+    size_t i = 0;
+    if (dst_n == 0) {
+        return;
+    }
+    while (src[i] != '\0') {
+        char c = src[i];
+        if (c == '\n') {
+            if (o + 1 < dst_n) {
+                dst[o++] = ' ';
+            }
+            i++;
+            continue;
+        }
+        if (c == '\\' && src[i + 1] != '\0') {
+            char n = src[i + 1];
+            if (n == '*' || n == '_' || n == '`' || n == '#' || n == '\\' || n == '[' || n == ']') {
+                if (o + 1 < dst_n) {
+                    dst[o++] = n;
+                }
+                i += 2;
+                continue;
+            }
+        }
+        if (c == '`') {
+            i++;
+            continue;
+        }
+        if (c == '~' && src[i + 1] == '~') {
+            i += 2;
+            continue;
+        }
+        if (c == '*' && src[i + 1] == '*') {
+            i += 2;
+            continue;
+        }
+        if (c == '_' && src[i + 1] == '_') {
+            i += 2;
+            continue;
+        }
+        if (c == '*' || c == '_') {
+            /* Single emphasis marker, unless inside a word (my_var, 3*4). */
+            unsigned char prev = i > 0 ? (unsigned char)src[i - 1] : 0;
+            unsigned char next = (unsigned char)src[i + 1];
+            bool prev_alnum = (prev >= '0' && prev <= '9') || (prev >= 'A' && prev <= 'Z') ||
+                (prev >= 'a' && prev <= 'z');
+            bool next_alnum = (next >= '0' && next <= '9') || (next >= 'A' && next <= 'Z') ||
+                (next >= 'a' && next <= 'z');
+            if (!(prev_alnum && next_alnum)) {
+                i++;
+                continue;
+            }
+        }
+        if (c == '!' && src[i + 1] == '[') {
+            size_t close = i + 2;
+            while (src[close] != '\0' && src[close] != ']' && src[close] != '\n') {
+                close++;
+            }
+            if (src[close] == ']' && src[close + 1] == '(') {
+                size_t end = close + 2;
+                while (src[end] != '\0' && src[end] != ')' && src[end] != '\n') {
+                    end++;
+                }
+                if (src[end] == ')') {
+                    for (size_t k = i + 2; k < close && o + 1 < dst_n; k++) {
+                        dst[o++] = src[k];
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        if (c == '[') {
+            size_t close = i + 1;
+            while (src[close] != '\0' && src[close] != ']' && src[close] != '\n') {
+                close++;
+            }
+            if (src[close] == ']' && src[close + 1] == '(') {
+                size_t end = close + 2;
+                while (src[end] != '\0' && src[end] != ')' && src[end] != '\n') {
+                    end++;
+                }
+                if (src[end] == ')') {
+                    for (size_t k = i + 1; k < close && o + 1 < dst_n; k++) {
+                        dst[o++] = src[k];
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        if (c == '<') {
+            char n = src[i + 1];
+            if ((n >= 'A' && n <= 'Z') || (n >= 'a' && n <= 'z') || n == '/') {
+                size_t end = i + 1;
+                while (src[end] != '\0' && src[end] != '>' && src[end] != '\n' && end - i < 32) {
+                    end++;
+                }
+                if (src[end] == '>') {
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        if (c == '|') {
+            if (o + 1 < dst_n) {
+                dst[o++] = ' ';
+            }
+            i++;
+            continue;
+        }
+        if (o + 1 < dst_n) {
+            dst[o++] = c;
+        }
+        i++;
+    }
+    dst[o] = '\0';
+    dlg_fix_tail(dst);
+}
+
+#define DLG_KIND_PARA 1
+#define DLG_KIND_LIST 2
+#define DLG_KIND_QUOTE 3
+#define DLG_KIND_CODE 4
+
+static int s_dlg_kind;
+static int s_dlg_blocks;
+
+static void dlg_block_label(lv_obj_t *container, const char *text, const lv_font_t *font, uint32_t color)
+{
+    lv_obj_t *lbl = make_label(container, font, color);
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_style_text_line_space(lbl, 0, 0);
+    lv_obj_set_style_text_letter_space(lbl, 1, 0);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl, s_w - 104);
+    lv_label_set_text(lbl, text);
+}
+
+static void dlg_block_spacer(lv_obj_t *container, int h)
+{
+    lv_obj_t *sp = lv_obj_create(container);
+    lv_obj_remove_style_all(sp);
+    lv_obj_set_size(sp, s_w - 104, h);
+}
+
+static void dlg_copy_span(char *dst, size_t dst_n, const char *src, size_t len)
+{
+    if (dst_n == 0) {
+        return;
+    }
+    if (len >= dst_n) {
+        len = dst_n - 1;
+    }
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+/* Append add[0..add_n) to the block buffer, with sep before it when the
+ * buffer already holds text (sep '\0' means no separator). Truncates. */
+static void dlg_block_append(const char *add, size_t add_n, char sep)
+{
+    size_t have = strlen(s_dlg_block);
+    size_t room = sizeof(s_dlg_block) - have - 1;
+    if (room == 0) {
+        return;
+    }
+    if (have > 0 && sep != '\0') {
+        s_dlg_block[have++] = sep;
+        s_dlg_block[have] = '\0';
+        room--;
+        if (room == 0) {
+            return;
+        }
+    }
+    size_t n = add_n < room ? add_n : room;
+    memcpy(&s_dlg_block[have], add, n);
+    s_dlg_block[have + n] = '\0';
+}
+
+static void dlg_flush_block(lv_obj_t *container, uint32_t color)
+{
+    if (s_dlg_kind == 0 || s_dlg_block[0] == '\0') {
+        s_dlg_kind = 0;
+        s_dlg_block[0] = '\0';
+        return;
+    }
+    dlg_fix_tail(s_dlg_block);
+    const lv_font_t *font = caption_font();
+    uint32_t c = color;
+    if (s_dlg_kind == DLG_KIND_QUOTE || s_dlg_kind == DLG_KIND_CODE) {
+        c = COLOR_DIM;
+    }
+    dlg_block_label(container, s_dlg_block, font, c);
+    s_dlg_blocks++;
+    s_dlg_kind = 0;
+    s_dlg_block[0] = '\0';
+}
+
+/* Render one message as rich blocks inside its container: headings in
+ * bold, lists with bullets, quotes dimmed and indented, fenced code
+ * verbatim and dimmed, paragraphs joined. A divider line closes every
+ * message; there is no speaker prefix, speakers differ by brightness. */
+static void dlg_render_blocks(lv_obj_t *container, const char *text, uint32_t color)
+{
+    s_dlg_kind = 0;
+    s_dlg_block[0] = '\0';
+    s_dlg_blocks = 0;
+    bool in_fence = false;
+    size_t pos = 0;
+    while (text[pos] != '\0') {
+        size_t ls = pos;
+        while (text[pos] != '\0' && text[pos] != '\n') {
+            pos++;
+        }
+        size_t le = pos;
+        if (text[pos] == '\n') {
+            pos++;
+        }
+        size_t s = ls;
+        while (s < le && (text[s] == ' ' || text[s] == '\t')) {
+            s++;
+        }
+        if (s >= le) {
+            dlg_flush_block(container, color);
+            continue;
+        }
+        if (in_fence) {
+            if (le - s >= 3 && strncmp(&text[s], "```", 3) == 0) {
+                dlg_flush_block(container, color);
+                in_fence = false;
+            } else {
+                if (s_dlg_kind != DLG_KIND_CODE) {
+                    dlg_flush_block(container, color);
+                    s_dlg_kind = DLG_KIND_CODE;
+                    s_dlg_block[0] = '\0';
+                }
+                dlg_block_append(&text[s], le - s, '\n');
+            }
+            continue;
+        }
+        if (le - s >= 3 && strncmp(&text[s], "```", 3) == 0) {
+            dlg_flush_block(container, color);
+            in_fence = true;
+            s_dlg_kind = DLG_KIND_CODE;
+            s_dlg_block[0] = '\0';
+            continue;
+        }
+        {
+            size_t k = s;
+            size_t markers = 0;
+            bool only = true;
+            while (k < le) {
+                char t = text[k];
+                if (t == '*' || t == '_' || t == '-') {
+                    markers++;
+                } else if (t != ' ' && t != '\t' && t != '|' && t != ':') {
+                    only = false;
+                    break;
+                }
+                k++;
+            }
+            if (only && markers >= 3) {
+                dlg_flush_block(container, color);
+                continue;
+            }
+        }
+        if (text[s] == '#') {
+            size_t k = s;
+            while (k < le && text[k] == '#') {
+                k++;
+            }
+            if (k >= le || text[k] == ' ' || text[k] == '\t') {
+                while (k < le && (text[k] == ' ' || text[k] == '\t')) {
+                    k++;
+                }
+                dlg_flush_block(container, color);
+                dlg_copy_span(s_dlg_raw, sizeof(s_dlg_raw), &text[k], le - k);
+                dlg_strip_inline(s_dlg_line, sizeof(s_dlg_line), s_dlg_raw);
+                if (s_dlg_line[0] != '\0') {
+                    if (s_dlg_blocks > 0) {
+                        dlg_block_spacer(container, 8);
+                    }
+                    dlg_block_label(container, s_dlg_line, caption_font_bold(), color);
+                    s_dlg_blocks++;
+                }
+                continue;
+            }
+        }
+        if (text[s] == '>') {
+            size_t k = s + 1;
+            while (k < le && (text[k] == ' ' || text[k] == '\t')) {
+                k++;
+            }
+            if (s_dlg_kind != DLG_KIND_QUOTE) {
+                dlg_flush_block(container, color);
+                s_dlg_kind = DLG_KIND_QUOTE;
+                s_dlg_block[0] = '\0';
+            }
+            dlg_copy_span(s_dlg_raw, sizeof(s_dlg_raw), &text[k], le - k);
+            dlg_strip_inline(s_dlg_line, sizeof(s_dlg_line), s_dlg_raw);
+            dlg_block_append("  ", 2, s_dlg_block[0] != '\0' ? '\n' : '\0');
+            dlg_block_append(s_dlg_line, strlen(s_dlg_line), '\0');
+            continue;
+        }
+        if ((text[s] == '-' || text[s] == '*' || text[s] == '+') && s + 1 < le &&
+            (text[s + 1] == ' ' || text[s + 1] == '\t')) {
+            size_t k = s + 2;
+            while (k < le && (text[k] == ' ' || text[k] == '\t')) {
+                k++;
+            }
+            if (s_dlg_kind != DLG_KIND_LIST) {
+                dlg_flush_block(container, color);
+                s_dlg_kind = DLG_KIND_LIST;
+                s_dlg_block[0] = '\0';
+            }
+            dlg_copy_span(s_dlg_raw, sizeof(s_dlg_raw), &text[k], le - k);
+            dlg_strip_inline(s_dlg_line, sizeof(s_dlg_line), s_dlg_raw);
+            dlg_block_append("• ", 4, s_dlg_block[0] != '\0' ? '\n' : '\0');
+            dlg_block_append(s_dlg_line, strlen(s_dlg_line), '\0');
+            continue;
+        }
+        if (text[s] >= '0' && text[s] <= '9') {
+            size_t k = s;
+            while (k < le && text[k] >= '0' && text[k] <= '9') {
+                k++;
+            }
+            if (k < le && text[k] == '.' && k + 1 < le && (text[k + 1] == ' ' || text[k + 1] == '\t')) {
+                size_t num_end = k + 1;
+                size_t c = num_end + 1;
+                while (c < le && (text[c] == ' ' || text[c] == '\t')) {
+                    c++;
+                }
+                if (s_dlg_kind != DLG_KIND_LIST) {
+                    dlg_flush_block(container, color);
+                    s_dlg_kind = DLG_KIND_LIST;
+                    s_dlg_block[0] = '\0';
+                }
+                dlg_copy_span(s_dlg_raw, sizeof(s_dlg_raw), &text[c], le - c);
+                dlg_strip_inline(s_dlg_line, sizeof(s_dlg_line), s_dlg_raw);
+                char pfx[16];
+                size_t plen = num_end - s;
+                if (plen >= sizeof(pfx) - 1) {
+                    plen = sizeof(pfx) - 2;
+                }
+                memcpy(pfx, &text[s], plen);
+                pfx[plen] = ' ';
+                pfx[plen + 1] = '\0';
+                dlg_block_append(pfx, strlen(pfx), s_dlg_block[0] != '\0' ? '\n' : '\0');
+                dlg_block_append(s_dlg_line, strlen(s_dlg_line), '\0');
+                continue;
+            }
+        }
+        if (s_dlg_kind != DLG_KIND_PARA) {
+            dlg_flush_block(container, color);
+            s_dlg_kind = DLG_KIND_PARA;
+            s_dlg_block[0] = '\0';
+        }
+        dlg_copy_span(s_dlg_raw, sizeof(s_dlg_raw), &text[s], le - s);
+        dlg_strip_inline(s_dlg_line, sizeof(s_dlg_line), s_dlg_raw);
+        dlg_block_append(s_dlg_line, strlen(s_dlg_line), ' ');
+    }
+    dlg_flush_block(container, color);
+    if (s_dlg_blocks == 0) {
+        dlg_strip_markdown(s_dlg_stripped, sizeof(s_dlg_stripped), text);
+        if (s_dlg_stripped[0] != '\0') {
+            dlg_block_label(container, s_dlg_stripped, caption_font(), color);
+            s_dlg_blocks++;
+        }
+    }
+    dlg_block_spacer(container, 2);
+    lv_obj_t *div = lv_obj_create(container);
+    lv_obj_remove_style_all(div);
+    lv_obj_set_size(div, s_w - 104, 1);
+    lv_obj_set_style_bg_color(div, lv_color_hex(COLOR_DIM), 0);
+    lv_obj_set_style_bg_opa(div, LV_OPA_COVER, 0);
+}
+
+static lv_obj_t *dlg_add(const char *text, uint32_t color)
 {
     if (!s_dlg_list) {
         return NULL;
@@ -926,19 +1572,20 @@ static lv_obj_t *dlg_add(const char *who, const char *text, uint32_t color)
         }
         s_dlg_n--;
     }
-    char buf[DLG_MSG_MAX + 32];
-    snprintf(buf, sizeof(buf), "%s: %s", who, text);
-    lv_obj_t *lbl = make_label(s_dlg_list, caption_font(), color);
-    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_LEFT, 0);
-    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(lbl, s_w - 104);
-    lv_label_set_text(lbl, buf);
-    s_dlg_msgs[s_dlg_n++] = lbl;
+    lv_obj_t *cont = lv_obj_create(s_dlg_list);
+    lv_obj_remove_style_all(cont);
+    lv_obj_set_width(cont, s_w - 104);
+    lv_obj_set_height(cont, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(cont, 0, 0);
+    lv_obj_set_style_pad_row(cont, 4, 0);
+    dlg_render_blocks(cont, text, color);
+    s_dlg_msgs[s_dlg_n++] = cont;
     if (s_dlg_empty) {
         lv_obj_add_flag(s_dlg_empty, LV_OBJ_FLAG_HIDDEN);
     }
     lv_obj_scroll_to_y(s_dlg_list, LV_COORD_MAX, LV_ANIM_OFF);
-    return lbl;
+    return cont;
 }
 
 /* True when the list is already showing its bottom (or fits entirely):
@@ -957,19 +1604,152 @@ static bool dlg_near_bottom(void)
     return lv_obj_get_scroll_y(s_dlg_list) >= max_scroll - 20;
 }
 
-static void dlg_live(lv_obj_t **slot, const char *who, const char *text, uint32_t color)
+static void dlg_live(lv_obj_t **slot, const char *text, uint32_t color)
 {
     if (*slot) {
         bool follow = dlg_near_bottom();
-        char buf[DLG_MSG_MAX + 32];
-        snprintf(buf, sizeof(buf), "%s: %s", who, text);
-        lv_label_set_text(*slot, buf);
+        lv_obj_clean(*slot);
+        dlg_render_blocks(*slot, text, color);
         if (s_dlg_list && follow) {
             lv_obj_scroll_to_y(s_dlg_list, LV_COORD_MAX, LV_ANIM_OFF);
         }
     } else {
-        *slot = dlg_add(who, text, color);
+        *slot = dlg_add(text, color);
     }
+}
+
+/* ---- Dialog text history on NVS (voice waits for an SD card) ----
+ * Finalized messages only: the user turn is saved when Muse starts
+ * speaking, the Muse turn when it ends; a live message lost to a restart
+ * mid-turn is not saved. Stored as "<seq>|M|<text>" / "<seq>|U|<text>",
+ * newest 10, ~8 KB total, each text cut to 1500 bytes (the NVS per-value
+ * limit is ~1984). The seq counter is shared with the future voice store
+ * so text and voice interleave in order on restore. A missing or corrupt
+ * store restores as empty, never a crash. */
+#define DLG_STORE_NS "dlg"
+#define DLG_STORE_MAX_BYTES 8192
+#define DLG_STORE_TEXT_MAX 1500
+static char s_dlg_save_user[DLG_MSG_MAX];
+static bool s_dlg_restored;
+static char s_dlg_store_read[2048];
+static char s_dlg_store_write[1536];
+
+static bool dlg_store_blank(const char *s)
+{
+    while (*s == ' ' || *s == '\n' || *s == '\r' || *s == '\t') {
+        s++;
+    }
+    return *s == '\0';
+}
+
+static void dlg_store_save(bool is_muse, const char *text)
+{
+    if (!text || dlg_store_blank(text)) {
+        return;
+    }
+    nvs_handle_t h;
+    if (nvs_open(DLG_STORE_NS, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "dlg store: nvs_open failed, message not saved");
+        return;
+    }
+    uint8_t n = 0;
+    nvs_get_u8(h, "dlg_n", &n); /* missing -> 0 */
+    if (n > DLG_MAX_MSGS) {
+        n = DLG_MAX_MSGS;
+    }
+    uint32_t seq = 0;
+    nvs_get_u32(h, "dlg_seq", &seq); /* missing -> 0 */
+    /* %.1500s cuts the text, then the tail fix drops a split character. */
+    snprintf(s_dlg_store_write, sizeof(s_dlg_store_write), "%u|%c|%.1500s", (unsigned)seq,
+             is_muse ? 'M' : 'U', text);
+    dlg_fix_tail(s_dlg_store_write);
+    size_t new_len = strlen(s_dlg_store_write);
+    /* Drop oldest entries until the new one fits count and byte caps. */
+    while (1) {
+        size_t total = new_len;
+        for (int i = 0; i < n; i++) {
+            char key[16];
+            snprintf(key, sizeof(key), "dlg_%d", i);
+            size_t len = 0;
+            if (nvs_get_str(h, key, NULL, &len) == ESP_OK && len > 0 &&
+                len <= sizeof(s_dlg_store_read)) {
+                total += len - 1; /* len includes NUL */
+            }
+        }
+        if ((n < DLG_MAX_MSGS && total <= DLG_STORE_MAX_BYTES) || n == 0) {
+            break;
+        }
+        for (int i = 1; i < n; i++) {
+            char src[16], dst[16];
+            snprintf(src, sizeof(src), "dlg_%d", i);
+            snprintf(dst, sizeof(dst), "dlg_%d", i - 1);
+            size_t len = sizeof(s_dlg_store_read);
+            if (nvs_get_str(h, src, s_dlg_store_read, &len) == ESP_OK) {
+                nvs_set_str(h, dst, s_dlg_store_read);
+            } else {
+                nvs_set_str(h, dst, "");
+            }
+        }
+        n--;
+    }
+    {
+        char key[16];
+        snprintf(key, sizeof(key), "dlg_%d", n);
+        nvs_set_str(h, key, s_dlg_store_write);
+        n++;
+    }
+    nvs_set_u8(h, "dlg_n", n);
+    nvs_set_u32(h, "dlg_seq", seq + 1);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void dlg_restore(void)
+{
+    if (s_dlg_restored || !s_dlg_list) {
+        return;
+    }
+    s_dlg_restored = true;
+    nvs_handle_t h;
+    if (nvs_open(DLG_STORE_NS, NVS_READONLY, &h) != ESP_OK) {
+        return; /* first boot: no store yet, start empty */
+    }
+    uint8_t n = 0;
+    if (nvs_get_u8(h, "dlg_n", &n) != ESP_OK) {
+        nvs_close(h);
+        return;
+    }
+    if (n > DLG_MAX_MSGS) {
+        n = DLG_MAX_MSGS;
+    }
+    for (int i = 0; i < n; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "dlg_%d", i);
+        size_t len = 0;
+        if (nvs_get_str(h, key, NULL, &len) != ESP_OK || len == 0 ||
+            len > sizeof(s_dlg_store_read)) {
+            continue;
+        }
+        len = sizeof(s_dlg_store_read);
+        if (nvs_get_str(h, key, s_dlg_store_read, &len) != ESP_OK) {
+            continue;
+        }
+        /* Only the first two separators are structure; the text may
+         * contain '|' itself. */
+        char *p1 = strchr(s_dlg_store_read, '|');
+        if (!p1) {
+            continue;
+        }
+        char *p2 = strchr(p1 + 1, '|');
+        if (!p2 || p2[1] == '\0') {
+            continue;
+        }
+        if (p1[1] != 'M' && p1[1] != 'U') {
+            continue;
+        }
+        dlg_add(p2 + 1, p1[1] == 'M' ? COLOR_CAPTION : COLOR_DIM);
+    }
+    nvs_close(h);
 }
 
 static void build_dialog_tile(lv_obj_t *tile)
@@ -994,9 +1774,12 @@ static void build_dialog_tile(lv_obj_t *tile)
     lv_obj_set_scrollbar_mode(s_dlg_list, LV_SCROLLBAR_MODE_OFF);
     s_dlg_empty = make_label(s_dlg_list, caption_font(), COLOR_DIM);
     lv_obj_set_style_text_align(s_dlg_empty, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_style_text_line_space(s_dlg_empty, 0, 0);
+    lv_obj_set_style_text_letter_space(s_dlg_empty, 1, 0);
     lv_label_set_long_mode(s_dlg_empty, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(s_dlg_empty, s_w - 104);
     lv_label_set_text(s_dlg_empty, "No messages yet. Press BOOT to talk.");
+    dlg_restore();
 }
 
 static void dlg_reply_page(const char *caption)
@@ -1020,7 +1803,7 @@ static void dlg_reply_page(const char *caption)
         }
     }
     dlg_copy_trunc(s_dlg_last_page, sizeof(s_dlg_last_page), caption);
-    dlg_live(&s_dlg_live_muse, "Muse", s_dlg_reply, COLOR_CAPTION);
+    dlg_live(&s_dlg_live_muse, s_dlg_reply, COLOR_CAPTION);
 }
 
 static void dialog_poll(muse_mode_t mode, const char *caption)
@@ -1037,17 +1820,18 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
     if (caption && caption[0]) {
         if (mode == MUSE_MODE_LISTENING) {
             if (!dlg_is_status(caption)) {
-                dlg_live(&s_dlg_live_user, "You", caption, COLOR_DIM);
+                dlg_live(&s_dlg_live_user, caption, COLOR_DIM);
+                dlg_copy_trunc(s_dlg_save_user, sizeof(s_dlg_save_user), caption);
             }
         } else if (mode == MUSE_MODE_THINKING) {
             size_t n = strlen(caption);
             if (n > 2 && caption[0] == '"' && caption[n - 1] == '"') {
                 /* Final transcript, quoted: refresh the user turn. */
-                char tmp[DLG_MSG_MAX];
-                size_t inner = n - 2 < sizeof(tmp) - 1 ? n - 2 : sizeof(tmp) - 1;
-                memcpy(tmp, caption + 1, inner);
-                tmp[inner] = '\0';
-                dlg_live(&s_dlg_live_user, "You", tmp, COLOR_DIM);
+                size_t inner = n - 2 < sizeof(s_dlg_tmp) - 1 ? n - 2 : sizeof(s_dlg_tmp) - 1;
+                memcpy(s_dlg_tmp, caption + 1, inner);
+                s_dlg_tmp[inner] = '\0';
+                dlg_live(&s_dlg_live_user, s_dlg_tmp, COLOR_DIM);
+                dlg_copy_trunc(s_dlg_save_user, sizeof(s_dlg_save_user), s_dlg_tmp);
             } else if (!dlg_is_status(caption)) {
                 /* A reply shown before playback (speaker off, or text
                  * arriving early): same stream as the speaking pages. */
@@ -1059,9 +1843,16 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
     }
     /* A live entry survives only while its turn runs; the label stays. */
     if (s_dlg_live_user && mode != MUSE_MODE_LISTENING && mode != MUSE_MODE_THINKING) {
+        if (s_dlg_save_user[0]) {
+            dlg_store_save(false, s_dlg_save_user);
+            s_dlg_save_user[0] = '\0';
+        }
         s_dlg_live_user = NULL;
     }
     if (s_dlg_live_muse && mode != MUSE_MODE_SPEAKING && mode != MUSE_MODE_THINKING) {
+        if (s_dlg_reply[0]) {
+            dlg_store_save(true, s_dlg_reply);
+        }
         s_dlg_live_muse = NULL;
         s_dlg_reply[0] = '\0';
         s_dlg_last_page[0] = '\0';
@@ -1185,7 +1976,7 @@ static void build_screen(void)
          * legible. A tall screen has room to keep them above the mic icon. */
         lv_obj_set_size(s_caption_lbl, s_w, 2 * 8 + 2 + 4);
         lv_obj_set_style_pad_ver(s_caption_lbl, 2, 0);
-        lv_obj_set_style_text_line_space(s_caption_lbl, 2, 0);
+        lv_obj_set_style_text_line_space(s_caption_lbl, 0, 0);
         lv_obj_set_style_bg_color(s_caption_lbl, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_caption_lbl, LV_OPA_70, 0);
         lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_DOTS);
