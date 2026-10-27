@@ -45,9 +45,9 @@ CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
 # bundle. This verifies the chain up to the GTS root the bundle does have.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
 
-# Spoken replies use Eleven v4 (the website model): richer than the Flash
-# default, slower to start, full per-character rate.
-CONFIG_MUSE_ELEVENLABS_MODEL="eleven_v4"
+# Spoken replies use Eleven v4 Turbo: v4 quality for real-time use,
+# about 100 ms latency, half per-character rate.
+CONFIG_MUSE_ELEVENLABS_MODEL="eleven_v4_turbo"
 
 # Watchdogs back on (sdkconfig.defaults turns them off): a stuck task or
 # interrupt panics with a backtrace on the console and reboots, instead of
