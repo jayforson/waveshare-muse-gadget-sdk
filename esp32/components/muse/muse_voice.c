@@ -553,7 +553,7 @@ static void hold_rec(bool tried)
     }
     if (!s_rec_n) {   /* nothing captured: realloc to 0 would free s_rec and return NULL */
         drop_rec();
-        go_idle("HOLD LONGER TO TALK");
+        go_idle("");
         return;
     }
     int16_t *pcm = heap_caps_realloc(s_rec, s_rec_n * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -959,7 +959,7 @@ static void voice_task(void *arg)
             muse_hatch_turn_cancel();
             drop_rec();
             pre_reset();
-            go_idle("HOLD LONGER TO TALK");
+            go_idle("");
             continue;
         }
         if (!ok) {
