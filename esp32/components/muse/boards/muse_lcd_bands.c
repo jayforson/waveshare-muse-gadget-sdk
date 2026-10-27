@@ -161,7 +161,19 @@ lv_display_t *muse_lcd_bands_register(esp_lv_adapter_display_config_t cfg, int l
     s_chunk_free = xSemaphoreCreateCounting(2, 2);
     s_band_done = xSemaphoreCreateBinary();
     s_chunk[0] = heap_caps_malloc(chunk_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!s_chunk[0]) {
+        s_chunk[0] = heap_caps_malloc(chunk_bytes, MALLOC_CAP_SPIRAM);
+        if (s_chunk[0]) {
+            ESP_LOGW(TAG, "chunk 0 in PSRAM (DMA heap full)");
+        }
+    }
     s_chunk[1] = heap_caps_malloc(chunk_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!s_chunk[1]) {
+        s_chunk[1] = heap_caps_malloc(chunk_bytes, MALLOC_CAP_SPIRAM);
+        if (s_chunk[1]) {
+            ESP_LOGW(TAG, "chunk 1 in PSRAM (DMA heap full)");
+        }
+    }
     if (!s_bands || !s_call_lock || !s_call_done || !s_chunk_free || !s_band_done || !s_chunk[0] || !s_chunk[1] ||
         xTaskCreatePinnedToCore(send_bands, "lcd_send", 2560, NULL, MUSE_UI_PRIORITY + 1, NULL, MUSE_UI_CORE) != pdPASS) {
         return NULL;
