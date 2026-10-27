@@ -214,7 +214,7 @@ static void aux_key(bool pressed, bool edge)
  * PTT_DOWN is only posted once the hold passes, so the recording animation
  * only appears once recording starts. Pairing confirms and menu selects
  * still take a plain tap: they never reach this gate. */
-#define HOLD_TALK_MS 1000
+#define HOLD_TALK_MS 800
 static TickType_t s_talk_press_at;
 static bool s_talk_recording;
 static bool s_talk_woke;
