@@ -825,11 +825,14 @@ static void serial_task(void *arg)
 esp_err_t muse_input_start(QueueHandle_t queue)
 {
     s_queue = queue;
-    if (xTaskCreate(input_task, "muse_input", 4096, NULL, 6, &s_input) != pdPASS) {
+    /* Task stacks in PSRAM: by UI-built time the internal heap is down
+       to ~5K, too tight/fragmented for 4096+3584-byte stacks. */
+    if (xTaskCreatePinnedToCoreWithCaps(input_task, "muse_input", 4096, NULL, 6, &s_input, tskNO_AFFINITY,
+                                        MUSE_BIG_CAPS) != pdPASS) {
         return ESP_FAIL;
     }
     /* Bench-test and setup console; the input still works if it can't start. */
-    xTaskCreate(serial_task, "muse_serial", 3584, NULL, 5, NULL);
+    xTaskCreatePinnedToCoreWithCaps(serial_task, "muse_serial", 3584, NULL, 5, NULL, tskNO_AFFINITY, MUSE_BIG_CAPS);
     return ESP_OK;
 }
 
