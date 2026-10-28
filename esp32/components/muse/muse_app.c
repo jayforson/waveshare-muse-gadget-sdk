@@ -84,6 +84,11 @@ void muse_app_run(const muse_board_t *board)
         muse_state_set_caption("%s", "");
     } else if (muse_voice_start(q) != ESP_OK) {
         ESP_LOGE(TAG, "voice pipeline unavailable");
+        /* Never leave the screen stuck at WAKING UP: show the face
+         * and clock, with a brief VOICE UNAVAILABLE note (a state
+         * caption, not a dialog message, so it is not saved). */
+        muse_state_set_mode(MUSE_MODE_IDLE);
+        muse_state_set_caption("%s", "VOICE UNAVAILABLE");
     } else {
         muse_state_set_mode(MUSE_MODE_IDLE);
         muse_state_set_caption("%s", "");   /* the button icons say how to talk */

@@ -79,10 +79,12 @@ bool muse_wake_init(void)
         heap_log("wake init done");
         return false;
     }
-    /* The speech-recognition pipeline: echo cancellation, voice activity,
-     * wake word. No blind source separation (single mic) and no neural
-     * noise suppression. */
-    cfg->aec_init = 1;
+    /* The speech-recognition pipeline: voice activity, wake word. No
+     * echo cancellation, no blind source separation (single mic) and
+     * no neural noise suppression. Wake is armed only when idle, when
+     * the speaker is silent, so AEC has no echo to cancel; leaving
+     * it off also saves internal RAM for the voice task. */
+    cfg->aec_init = 0;
     cfg->vad_init = 1;
     cfg->wakenet_init = 1;
     cfg->se_init = 0;

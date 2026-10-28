@@ -1370,14 +1370,21 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
         muse_state_set_caption("AUDIO INIT FAILED");
         return ESP_FAIL;
     }
-    /* Waking is optional: without it (no model picked, no partition, or
-     * the feature off) BOOT still works, so its failure never fails boot. */
-    (void)muse_wake_init();
-    /* Stack in PSRAM if there is any (this task never writes flash) to spare internal RAM for Wi-Fi/BLE. */
+    /* Create the task FIRST, while internal heap is still ~10K (before
+     * wake init consumes it): the task's TCB needs internal RAM and
+     * would not fit after wake init leaves only ~100-200 bytes free.
+     * Stack in PSRAM if there is any (this task never writes flash)
+     * to spare internal RAM for Wi-Fi/BLE. */
     if (xTaskCreatePinnedToCoreWithCaps(voice_task, "muse_voice", 6144, NULL, 6, NULL, MUSE_AUDIO_CORE,
                                         MUSE_BIG_CAPS) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
+    /* Waking is optional: without it (no model picked, no partition, or
+     * the feature off) BOOT still works, so its failure never fails boot.
+     * It runs after task creation, so its heap use never blocks the
+     * task; a task already running feeds the AFE only once it is
+     * ready (feed returns false until then). */
+    (void)muse_wake_init();
     return ESP_OK;
 }
 
