@@ -103,8 +103,6 @@ static volatile bool s_wake_fired;
 #define CALL_SILENCE_DB (-50.0f)   /* an utterance ends below this */
 #define CALL_GAP_CHUNKS 75         /* 1.5 s of silence ends an utterance */
 #define CALL_SILENCE_US (30LL * 1000000)   /* no speech this long hangs up */
-#define CALL_BARGE_DB (-45.0f)     /* echo-cancelled speech above this */
-#define CALL_BARGE_MS 100          /* ... for this long barges in */
 
 /* Call capture outcomes. */
 typedef enum {
@@ -404,42 +402,6 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
 
 static void go_idle(const char *caption);
 
-static int64_t s_barge_loud_us;   /* cleaned speech above threshold, continuous */
-
-/*
- * One playback step through the echo canceller, only in a call: reads a
- * mic chunk against `ref` (the audio just written, or silence when
- * nothing plays) and reports true once the user has talked over the
- * reply long enough to barge in. The caller then takes the same path as
- * a BOOT press: cancel the turn, record a new utterance.
- */
-static bool aec_barge_check(const int16_t *ref)
-{
-    static int16_t mic[MUSE_AUDIO_CHUNK];
-    static int16_t cleaned[MUSE_AUDIO_CHUNK + 1024] __attribute__((aligned(16)));
-    if (!s_call || muse_wake_aec_frame_size() == 0) {
-        return false;
-    }
-    if (muse_audio_read(mic, MUSE_AUDIO_CHUNK) != ESP_OK) {
-        return false;
-    }
-    size_t out_n = 0;
-    if (!muse_wake_aec_feed(mic, ref, MUSE_AUDIO_CHUNK, cleaned,
-                            sizeof(cleaned) / sizeof(cleaned[0]), &out_n) || !out_n) {
-        return false;
-    }
-    if (muse_audio_dbfs(cleaned, out_n) > CALL_BARGE_DB) {
-        s_barge_loud_us += (int64_t)out_n * 1000000 / MUSE_AUDIO_RATE;
-        if (s_barge_loud_us >= CALL_BARGE_MS * 1000) {
-            s_barge_loud_us = 0;
-            return true;
-        }
-    } else {
-        s_barge_loud_us = 0;
-    }
-    return false;
-}
-
 /*
  * Plays Hatch's reply as it arrives, with its text as the caption. Returns
  * true if interrupted by a new press. *delivered: the VM has the note.
@@ -458,7 +420,6 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
     int64_t t0 = esp_timer_get_time();
     *delivered = false;
     s_reply_failed = false;
-    s_barge_loud_us = 0;
     for (;;) {
         muse_hatch_ev_t ev;
         while ((ev = muse_hatch_turn_event(text, sizeof(text))) != MUSE_HATCH_EV_NONE) {
@@ -525,26 +486,9 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
             muse_state_set_level(0);
             muse_audio_write(silence, MUSE_AUDIO_CHUNK);
         }
-        /* In a call, listen over the reply: the reference is what actually
-         * reached the speaker (silence when muted, when gap silence was
-         * written, or while still waiting). A partial reply chunk has no
-         * matching full mic chunk, so that step is skipped; a barge-in
-         * then takes the same path as a press. Without echo
-         * cancellation there is no voice barge-in, only BOOT. */
-        if (s_call) {
-            const int16_t *ref = NULL;
-            if (n == MUSE_AUDIO_CHUNK) {
-                ref = muse_settings_speaker_on() ? buf : silence;
-            } else if (n == 0) {
-                ref = silence;
-            }
-            if (ref && aec_barge_check(ref)) {
-                ESP_LOGI(TAG, "reply interrupted by voice");
-                muse_hatch_turn_cancel();
-                muse_state_set_level(0);
-                return true;
-            }
-        }
+        /* No voice barge-in: only a BOOT hold (PTT_DOWN, checked above)
+         * interrupts a reply. The mic is not read during playback, so
+         * there is no voice-vs-speaker judgment to run. */
         /* The page being said, or before the speech the reply's opening page. */
         if ((speaking || replied) && muse_hatch_turn_caption(played, page, sizeof(page))) {
             muse_state_set_caption("%s", page);
@@ -1106,7 +1050,7 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
  * can't reach, error, or dropped before any reply) ends the call
  * instead of looping back to listening, so recording never switches
  * on/off repeatedly on a dead connection. A reply interrupted by
- * BOOT or by voice still starts the next utterance at once.
+ * BOOT still starts the next utterance at once.
  */
 static void call_run(void)
 {
@@ -1152,7 +1096,7 @@ static void call_run(void)
             break;
         }
         if (interrupted) {
-            /* BOOT or voice barge-in: the user is speaking, so listen
+            /* BOOT barge-in: the user is speaking, so listen
              * again at once. */
             barge_in = true;
             silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;

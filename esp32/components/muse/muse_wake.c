@@ -15,18 +15,20 @@
  */
 
 /*
- * Local wake word and voice barge-in, both from ESP-SR (see muse_wake.h).
- * Symbols used here are the ones ESP-SR's own AFE documentation and its
- * test_apps/esp-sr-afe test show: the AFE interface (esp_afe_sr_iface.h,
- * esp_afe_config.h) and the AFE echo canceller (esp_afe_aec.h). No
- * standalone WakeNet interface is used: in current ESP-SR, WakeNet runs
- * inside the AFE and reports through its fetch interface.
+ * Local wake word, from ESP-SR WakeNet through the AFE (see
+ * muse_wake.h). Symbols used here are the ones ESP-SR's own AFE
+ * documentation and its test_apps/esp-sr-afe test show: the AFE
+ * interface (esp_afe_sr_iface.h, esp_afe_config.h). No standalone
+ * WakeNet interface is used: in current ESP-SR, WakeNet runs inside
+ * the AFE and reports through its fetch interface.
  *
  * Only the voice task calls into this file. The wake-word AFE is fed
- * only while idle (the voice task arms it); during a call or a reply it
- * gets nothing, so it cannot fire on Muse's own voice. The echo
- * canceller is fed only while a reply plays, with the audio actually
- * written to the speaker as its reference.
+ * only while idle (the voice task arms it); during a call or a reply
+ * it gets nothing, so it cannot fire on Muse's own voice. There is
+ * no voice barge-in: only a BOOT hold interrupts a reply, so no
+ * standalone echo canceller and no voice-vs-speaker judgment exist
+ * in this file. (The wake AFE's own internal AEC, cfg->aec_init,
+ * belongs to WakeNet's idle pipeline and is untouched.)
  */
 
 #include "muse_wake.h"
@@ -34,7 +36,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "esp_afe_aec.h"
 #include "esp_afe_config.h"
 #include "esp_afe_sr_iface.h"
 #include "esp_afe_sr_models.h"
@@ -53,16 +54,6 @@ static int16_t *s_feed_buff;   /* one interleaved AFE frame */
 static int16_t *s_feed_acc;    /* mic samples waiting for a full AFE frame */
 static size_t s_feed_acc_len;
 
-/* Echo canceller (same "MNR" layout, filter length 4). */
-static afe_aec_handle_t *s_aec;
-static int s_aec_frame;        /* samples per canceller frame */
-static int s_aec_nch;
-static int s_aec_mic_idx;
-static int s_aec_ref_idx;
-static int16_t *s_aec_indata;  /* one interleaved canceller frame */
-static int16_t *s_aec_mic_acc; /* mic samples waiting for a full frame */
-static int16_t *s_aec_ref_acc; /* reference samples waiting for a full frame */
-static size_t s_aec_acc_len;
 
 static void heap_log(const char *what)
 {
@@ -73,31 +64,6 @@ static void heap_log(const char *what)
 
 bool muse_wake_init(void)
 {
-    /* Echo cancellation first: it needs no model, so barge-in stays
-     * available even when no wake word model is picked. */
-    s_aec = afe_aec_create("MNR", 4, AFE_TYPE_SR, AFE_MODE_LOW_COST);
-    if (s_aec) {
-        s_aec_frame = s_aec->frame_size;
-        s_aec_nch = s_aec->pcm_config.total_ch_num;
-        s_aec_mic_idx = s_aec->pcm_config.mic_ids[0];
-        s_aec_ref_idx = s_aec->pcm_config.ref_ids[0];
-        size_t frame_bytes = (size_t)s_aec_frame * sizeof(int16_t);
-        s_aec_indata = heap_caps_aligned_calloc(16, 1, frame_bytes * (size_t)s_aec_nch, MALLOC_CAP_SPIRAM);
-        /* Room for a leftover partial frame plus one voice-task chunk. */
-        size_t acc_bytes = ((size_t)s_aec_frame + 320) * sizeof(int16_t);
-        s_aec_mic_acc = heap_caps_aligned_calloc(16, 1, acc_bytes, MALLOC_CAP_SPIRAM);
-        s_aec_ref_acc = heap_caps_aligned_calloc(16, 1, acc_bytes, MALLOC_CAP_SPIRAM);
-        if (!s_aec_indata || !s_aec_mic_acc || !s_aec_ref_acc) {
-            ESP_LOGW(TAG, "echo canceller buffers failed; barge-in off");
-            s_aec_frame = 0;
-        } else {
-            ESP_LOGI(TAG, "echo canceller: frame %d, channels %d (mic %d, ref %d)",
-                     s_aec_frame, s_aec_nch, s_aec_mic_idx, s_aec_ref_idx);
-        }
-    } else {
-        ESP_LOGW(TAG, "echo canceller create failed; barge-in off");
-    }
-
     /* Wake word: models come from the "model" flash partition, picked in
      * menuconfig under ESP Speech Recognition. */
     srmodel_list_t *models = esp_srmodel_init("model");
@@ -191,44 +157,4 @@ bool muse_wake_feed(const int16_t *pcm, size_t frames)
     return false;
 }
 
-size_t muse_wake_aec_frame_size(void)
-{
-    return s_aec_frame > 0 ? (size_t)s_aec_frame : 0;
-}
 
-bool muse_wake_aec_feed(const int16_t *mic, const int16_t *ref, size_t frames,
-                        int16_t *cleaned, size_t cleaned_cap, size_t *cleaned_frames)
-{
-    *cleaned_frames = 0;
-    if (!s_aec || s_aec_frame <= 0 || !s_aec_indata || !s_aec_mic_acc || !s_aec_ref_acc) {
-        return false;
-    }
-    size_t in = 0;
-    size_t out = 0;
-    while (in < frames) {
-        size_t room = (size_t)s_aec_frame - s_aec_acc_len;
-        size_t take = frames - in < room ? frames - in : room;
-        memcpy(s_aec_mic_acc + s_aec_acc_len, mic + in, take * sizeof(int16_t));
-        memcpy(s_aec_ref_acc + s_aec_acc_len, ref + in, take * sizeof(int16_t));
-        s_aec_acc_len += take;
-        in += take;
-        if (s_aec_acc_len < (size_t)s_aec_frame) {
-            break;
-        }
-        if (out + (size_t)s_aec_frame > cleaned_cap) {
-            break;   /* caller buffer full; the rest waits for the next call */
-        }
-        for (int i = 0; i < s_aec_frame; i++) {
-            s_aec_indata[i * s_aec_nch + s_aec_mic_idx] = s_aec_mic_acc[i];
-            s_aec_indata[i * s_aec_nch + s_aec_ref_idx] = s_aec_ref_acc[i];
-        }
-        afe_aec_process(s_aec, s_aec_indata, cleaned + out);
-        out += (size_t)s_aec_frame;
-        /* `take` was capped to exactly fill the frame, so nothing is
-         * left over; a partial frame stays in the accumulators for the
-         * next call. */
-        s_aec_acc_len = 0;
-    }
-    *cleaned_frames = out;
-    return out > 0;
-}
