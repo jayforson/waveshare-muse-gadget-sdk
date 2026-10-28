@@ -965,7 +965,7 @@ static void drain_ptt(bool *down, bool *up)
  * record(), but the end is voice activity, not a release. No pre-roll
  * seeding: the ring still holds the wake word itself, which must not go
  * as content. `barge_in` skips the speaker tail after an interrupted
- * reply, as record() does. A BOOT hold during capture disables the
+ * reply, or the wake chirp on the first capture, as record() does. A BOOT hold during capture disables the
  * silence-gap end (release ends it instead); a BOOT release with speech
  * ends it at once. The silence watchdog (`*silence_deadline`) is reset
  * on speech and checked while waiting for it; the caller owns it.
@@ -1162,7 +1162,12 @@ static void call_run(void)
     pre_reset();
     ESP_LOGI(TAG, "call started");
     int64_t silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
-    bool barge_in = false;
+    /* First capture follows the rising chirp: skip its 200 ms tail
+     * the same way a capture after an interrupted reply does, so
+     * the chirp cannot false-trigger speech and cut a silent first
+     * utterance short after the 1.5 s gap. Reset to false after
+     * the first capture, so follow-up captures are unaffected. */
+    bool barge_in = true;
     bool got_reply = false;
     const char *end_caption = "";
     for (;;) {
