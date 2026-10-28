@@ -796,10 +796,13 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
     i2s_chan_handle_t tx, rx;
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
-    /* Voice-sized I2S DMA: 3x120 frames stereo 16-bit = 1440 bytes/channel.
-       Defaults (6x240) need 5760/channel, 11520 total, which V3's DMA
-       headroom (~1K free) cannot provide. */
-    chan_cfg.dma_desc_num = 3;
+    /* Voice-sized I2S DMA: 2x120 frames stereo 16-bit = 960 bytes/channel.
+       Defaults (6x240) need 5760/channel, 11520 total; 3x120 (1440/channel)
+       still lost RX to DMA fragmentation (largest block ~1K at boot), so
+       2x120. Cushion 22.5 ms -> 15 ms: if playback stutter appears later,
+       suspect this first. LCD chunks stay at 2 lines: muse_lcd_bands
+       rounds rows to even, so 1 line would divide by zero. */
+    chan_cfg.dma_desc_num = 2;
     chan_cfg.dma_frame_num = 120;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &tx, &rx), TAG, "i2s channel");
     const i2s_std_config_t std_cfg = {
