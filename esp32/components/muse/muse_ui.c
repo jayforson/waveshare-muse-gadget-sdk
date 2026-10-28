@@ -47,6 +47,11 @@
 #include "muse_text.h"
 #include "muse_voice.h"
 #include "muse_wifi.h"
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_185B
+#include "esp_netif_sntp.h"
+#include <sys/time.h>
+#include <time.h>
+#endif
 #if CONFIG_MUSE_WATCHER_CAMERA
 #include "boards/watcher_camera.h"
 #endif
@@ -110,6 +115,21 @@ static lv_obj_t *s_pair_code;
 static lv_obj_t *s_pair_title;
 static lv_obj_t *s_pair_hint;
 static lv_obj_t *s_canvas;
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_185B
+/* Full-screen moon background (1.85B face tile only) and the clock that lives
+ * in the caption band. The moon data is flash (rodata); the moon decoder
+ * serves it strip by strip, like the avatar decoder, so no RAM copy. */
+extern const uint16_t moon_bg_data[];
+extern const lv_font_t moon_clock_font_32;
+static lv_image_dsc_t s_moon_src;
+static lv_draw_buf_t *s_moon_strips[STRIPS];
+static uint8_t s_moon_strip_busy[STRIPS];
+static lv_obj_t *s_moon_img;
+static lv_obj_t *s_clock_time, *s_clock_time_sh, *s_clock_date, *s_clock_date_sh;
+static bool s_sntp_started, s_time_synced, s_tz_set;
+static int64_t s_clock_hold_until_us;
+static char s_last_time[8], s_last_date[32];
+#endif
 static lv_obj_t *s_mic_icon;
 static lv_obj_t *s_cancel_btn;
 static lv_obj_t *s_cancel_time_lbl;
@@ -294,6 +314,32 @@ static lv_result_t muse_dec_get_area(lv_image_decoder_t *dec, lv_image_decoder_d
         return LV_RESULT_INVALID;
     }
     muse_pixel_scale((uint16_t *)buf->data, buf->header.stride / sizeof(uint16_t), full->x1, full->x2, y1, y2);
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_185B
+    /* WALL-E's background pixels are 0x0000; replace them with the moon pixel
+     * at the same face-tile position, so the moon shows through behind him.
+     * Face-tile-relative (not screen-absolute), so a mid-swipe frame has no
+     * seam: the avatar and the moon image move together with the tile. The
+     * moon asset is 360x360, so its bounds are 360, not s_w/s_h. */
+    if (s_moon_img) {
+        int stride = (int)buf->header.stride / (int)sizeof(uint16_t);
+        int ax = (s_w - s_canvas_px) / 2;
+        int ay = s_h / 2 + s_big_y - s_canvas_px / 2;
+        for (int32_t r = 0; r <= y2 - y1; r++) {
+            int my = ay + (int)y1 + (int)r;
+            if (my < 0 || my >= 360) {
+                continue;
+            }
+            uint16_t *row = (uint16_t *)buf->data + (size_t)r * stride;
+            for (int32_t c = 0; c <= full->x2 - full->x1; c++) {
+                if (row[c] != 0x0000) {
+                    continue;
+                }
+                int mx = ax + (int)full->x1 + (int)c;
+                row[c] = (mx < 0 || mx >= 360) ? 0x0000 : moon_bg_data[(size_t)my * 360 + mx];
+            }
+        }
+    }
+#endif
     area->x1 = full->x1;
     area->x2 = full->x2;
     area->y1 = y1;
@@ -342,6 +388,105 @@ static void muse_image_init(void)
         s_cells = s_cell_row = NULL;   /* redraw all of Muse every frame */
     }
 }
+
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_185B
+/* Moon background decoder: mirrors the avatar decoder exactly (same header
+ * pattern, same strip handling), but serves rows from the flash moon array
+ * instead of scaling the pixel grid. */
+static lv_result_t moon_dec_info(lv_image_decoder_t *dec, lv_image_decoder_dsc_t *dsc, lv_image_header_t *header)
+{
+    (void)dec;
+    if (dsc->src != &s_moon_src) {
+        return LV_RESULT_INVALID;
+    }
+    *header = s_moon_src.header;
+    return LV_RESULT_OK;
+}
+
+static lv_result_t moon_dec_open(lv_image_decoder_t *dec, lv_image_decoder_dsc_t *dsc)
+{
+    (void)dec;
+    if (dsc->src_type != LV_IMAGE_SRC_VARIABLE || dsc->src != &s_moon_src) {
+        return LV_RESULT_INVALID;
+    }
+    for (int i = 0; i < STRIPS; i++) {
+        if (!s_moon_strip_busy[i]) {
+            s_moon_strip_busy[i] = true;
+            dsc->user_data = s_moon_strips[i];
+            return LV_RESULT_OK;
+        }
+    }
+    return LV_RESULT_INVALID;
+}
+
+static lv_result_t moon_dec_get_area(lv_image_decoder_t *dec, lv_image_decoder_dsc_t *dsc,
+                                     const lv_area_t *full, lv_area_t *area)
+{
+    (void)dec;
+    int32_t y1 = area->y1 == LV_COORD_MIN ? full->y1 : area->y2 + 1;
+    if (y1 > full->y2) {
+        return LV_RESULT_INVALID;
+    }
+    int32_t y2 = LV_MIN(y1 + STRIP_ROWS - 1, full->y2);
+    int32_t w = lv_area_get_width(full);
+    lv_draw_buf_t *buf = lv_draw_buf_reshape(dsc->user_data, LV_COLOR_FORMAT_RGB565, w, y2 - y1 + 1,
+                                             LV_STRIDE_AUTO);
+    if (!buf) {
+        return LV_RESULT_INVALID;
+    }
+    for (int32_t r = 0; r <= y2 - y1; r++) {
+        int32_t y = y1 + r;
+        const uint16_t *src_row = moon_bg_data + (size_t)y * 360;
+        uint16_t *dst_row = (uint16_t *)buf->data + (size_t)r * (buf->header.stride / sizeof(uint16_t));
+        for (int32_t x = 0; x < w; x++) {
+            dst_row[x] = src_row[x];
+        }
+    }
+    area->x1 = full->x1;
+    area->x2 = full->x2;
+    area->y1 = y1;
+    area->y2 = y2;
+    dsc->decoded = buf;
+    return LV_RESULT_OK;
+}
+
+static void moon_dec_close(lv_image_decoder_t *dec, lv_image_decoder_dsc_t *dsc)
+{
+    (void)dec;
+    for (int i = 0; i < STRIPS; i++) {
+        if (s_moon_strips[i] == dsc->user_data) {
+            s_moon_strip_busy[i] = false;
+        }
+    }
+}
+
+static void moon_image_init(void)
+{
+    s_moon_src.header.magic = LV_IMAGE_HEADER_MAGIC;
+    s_moon_src.header.cf = LV_COLOR_FORMAT_RGB565;
+    s_moon_src.header.w = 360;
+    s_moon_src.header.h = 360;
+    s_moon_src.header.stride = 360 * sizeof(uint16_t);
+    s_moon_src.data = (const uint8_t *)&s_moon_src;   /* LVGL skips sources without data */
+    for (int i = 0; i < STRIPS; i++) {
+        s_moon_strips[i] = lv_draw_buf_create(360, STRIP_ROWS, LV_COLOR_FORMAT_RGB565, LV_STRIDE_AUTO);
+        assert(s_moon_strips[i]);
+    }
+    lv_image_decoder_t *dec = lv_image_decoder_create();
+    assert(dec);
+    lv_image_decoder_set_info_cb(dec, moon_dec_info);
+    lv_image_decoder_set_open_cb(dec, moon_dec_open);
+    lv_image_decoder_set_get_area_cb(dec, moon_dec_get_area);
+    lv_image_decoder_set_close_cb(dec, moon_dec_close);
+    dec->name = "moon";
+}
+
+static void sntp_sync_cb(struct timeval *tv)
+{
+    (void)tv;
+    s_time_synced = true;
+}
+#endif
 
 /*
  * Most frames change only a few of Muse's cells, so only those are redrawn.
@@ -1943,6 +2088,14 @@ static void build_screen(void)
 
     /* The character. */
     muse_image_init();
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_185B
+    /* Moon first, so WALL-E draws on top of it. The moon image is 360x360,
+     * exactly the face tile, so centre alignment covers the tile. */
+    moon_image_init();
+    s_moon_img = lv_image_create(face);
+    lv_image_set_src(s_moon_img, &s_moon_src);
+    lv_obj_align(s_moon_img, LV_ALIGN_CENTER, 0, 0);
+#endif
     s_canvas = lv_image_create(face);
     lv_image_set_src(s_canvas, &s_muse_src);
     lv_obj_align(s_canvas, LV_ALIGN_CENTER, 0, s_big_y);
@@ -2015,6 +2168,31 @@ static void build_screen(void)
     lv_obj_set_style_text_line_space(s_caption_lbl, CAPTION_LINE_SPACE, 0);
     lv_label_set_long_mode(s_caption_lbl, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_align(s_caption_lbl, LV_ALIGN_CENTER, 0, cap_top + cap_h / 2);
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_185B
+    /* Clock in the caption band: time (32 px digits) over date (16 px Noto),
+     * each with a black shadow label for contrast on the moon. Text only, no
+     * box. Fixed width (full screen) with centred text, and fixed height (the
+     * font's line height), so a text change never shifts the position.
+     * Shadow created first so the white text draws on top of it. Hidden
+     * until update_status shows them (idle + synced + hold expired). */
+    int clock_cy = cap_top + cap_h / 2;
+    s_clock_time_sh = make_label(face, &moon_clock_font_32, 0x000000);
+    lv_obj_set_size(s_clock_time_sh, s_w, lv_font_get_line_height(&moon_clock_font_32));
+    lv_obj_align(s_clock_time_sh, LV_ALIGN_CENTER, 2, clock_cy - 12 + 2);
+    s_clock_time = make_label(face, &moon_clock_font_32, 0xffffff);
+    lv_obj_set_size(s_clock_time, s_w, lv_font_get_line_height(&moon_clock_font_32));
+    lv_obj_align(s_clock_time, LV_ALIGN_CENTER, 0, clock_cy - 12);
+    s_clock_date_sh = make_label(face, caption_font(), 0x000000);
+    lv_obj_set_size(s_clock_date_sh, s_w, lv_font_get_line_height(caption_font()));
+    lv_obj_align(s_clock_date_sh, LV_ALIGN_CENTER, 1, clock_cy + 14 + 1);
+    s_clock_date = make_label(face, caption_font(), 0xffffff);
+    lv_obj_set_size(s_clock_date, s_w, lv_font_get_line_height(caption_font()));
+    lv_obj_align(s_clock_date, LV_ALIGN_CENTER, 0, clock_cy + 14);
+    lv_obj_add_flag(s_clock_time, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_clock_time_sh, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_clock_date, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_clock_date_sh, LV_OBJ_FLAG_HIDDEN);
+#endif
 
     /* Chunky level meter. */
     int span = METER_SEGS * (METER_SEG_PX + METER_GAP_PX) - METER_GAP_PX;
@@ -2847,6 +3025,83 @@ static void update_status(muse_mode_t mode, float now)
     if (mode == MUSE_MODE_LISTENING && s_caption_lbl) {
         lv_obj_add_flag(s_caption_lbl, LV_OBJ_FLAG_HIDDEN);
     }
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_185B
+    /* Clock in the caption band (1.85B face tile only). Start SNTP once Wi-Fi
+     * is up (starting it at boot would burn the first request offline); the
+     * system clock then runs off the crystal while powered, re-synced by
+     * SNTP in the background. Timezone is Los Angeles (DST handled by the
+     * POSIX TZ rule). */
+    if (!s_sntp_started && s_clock_time && muse_wifi_connected()) {
+        if (!s_tz_set) {
+            setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
+            tzset();
+            s_tz_set = true;
+        }
+        esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        sntp_cfg.sync_cb = sntp_sync_cb;
+        if (esp_netif_sntp_init(&sntp_cfg) != ESP_OK) {
+            ESP_LOGW(TAG, "sntp init failed");
+        }
+        s_sntp_started = true;
+    }
+    if (s_clock_time) {
+        /* A fresh caption holds the band: real messages 5 s, status captions
+         * (SPEAKER ON/OFF and friends) 2 s, then the clock returns. */
+        if (fresh && caption && caption[0]) {
+            s_clock_hold_until_us =
+                esp_timer_get_time() + (dlg_is_status(caption) ? 2000000 : 5000000);
+        }
+        bool show_clock = (mode == MUSE_MODE_IDLE && s_time_synced &&
+                           esp_timer_get_time() >= s_clock_hold_until_us);
+        if (show_clock) {
+            time_t t = time(NULL);
+            struct tm tmv;
+            localtime_r(&t, &tmv);
+            char tb[8], db[32];
+            snprintf(tb, sizeof(tb), "%02d:%02d", tmv.tm_hour, tmv.tm_min);
+            static const char *wdays[] = {"\u65e5", "\u4e00", "\u4e8c", "\u4e09",
+                                          "\u56db", "\u4e94", "\u516d"};
+            snprintf(db, sizeof(db), "%d\u6708%d\u65e5 \u661f\u671f%s", tmv.tm_mon + 1,
+                     tmv.tm_mday, wdays[tmv.tm_wday]);
+            if (strcmp(tb, s_last_time) != 0) {
+                lv_label_set_text(s_clock_time, tb);
+                lv_label_set_text(s_clock_time_sh, tb);
+                snprintf(s_last_time, sizeof(s_last_time), "%s", tb);
+            }
+            if (strcmp(db, s_last_date) != 0) {
+                lv_label_set_text(s_clock_date, db);
+                lv_label_set_text(s_clock_date_sh, db);
+                snprintf(s_last_date, sizeof(s_last_date), "%s", db);
+            }
+            lv_obj_clear_flag(s_clock_time, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(s_clock_time_sh, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(s_clock_date, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(s_clock_date_sh, LV_OBJ_FLAG_HIDDEN);
+            if (s_caption_lbl) {
+                lv_obj_add_flag(s_caption_lbl, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (s_reply_lbl) {
+                lv_obj_add_flag(s_reply_lbl, LV_OBJ_FLAG_HIDDEN);
+            }
+        } else {
+            lv_obj_add_flag(s_clock_time, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_clock_time_sh, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_clock_date, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_clock_date_sh, LV_OBJ_FLAG_HIDDEN);
+            /* Before the first NTP sync: "--:--" in place of the time, date
+             * hidden, so the band never shows a wrong time. */
+            if (!s_time_synced && mode == MUSE_MODE_IDLE) {
+                if (strcmp("--:--", s_last_time) != 0) {
+                    lv_label_set_text(s_clock_time, "--:--");
+                    lv_label_set_text(s_clock_time_sh, "--:--");
+                    snprintf(s_last_time, sizeof(s_last_time), "--:--");
+                }
+                lv_obj_clear_flag(s_clock_time, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(s_clock_time_sh, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
+#endif
     dialog_poll(mode, fresh ? caption : NULL);
     update_power(now);
 }

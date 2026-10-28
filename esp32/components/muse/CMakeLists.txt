@@ -59,6 +59,9 @@ if(CONFIG_MUSE_ENABLED)
         list(APPEND srcs "fonts/muse_font_noto_sc_16_bold.c")   # captions: Noto Sans SC Bold (headings)
         list(APPEND srcs "fonts/muse_font_cjk_16.c")   # captions' CJK fallback (rare chars)
     endif()
+    if(CONFIG_MUSE_BOARD_WAVESHARE_S3_185B)
+        list(APPEND srcs "moon_bg.c" "fonts/moon_clock_font_32.c")   # face tile: moon background + clock digits
+    endif()
     # Your own character (tools/muse/AVATAR_RECIPE.md) stands in for the default
     # avatar when avatar/muse_pixel.c exists here; this avatar/ is gitignored. The
     # default is in avatar/ at the top of the project.
@@ -123,6 +126,9 @@ set(muse_priv_requires
     noise_core minimp3
     esp_lcd esp_adc esp_driver_i2s esp_driver_ledc esp_driver_spi esp_driver_uart esp_wifi
     esp_driver_pcnt)
+if(CONFIG_MUSE_BOARD_WAVESHARE_S3_185B)
+    list(APPEND muse_priv_requires esp_netif)   # face-tile clock: esp_netif_sntp
+endif()
 list(APPEND muse_priv_requires camera)
 
 idf_component_register(
