@@ -230,6 +230,21 @@ static void pre_reset(void)
     s_settle = SETTLE_CHUNKS;
 }
 
+/* Software gain on top of the 36 dB hardware PGA, which is already
+ * maxed out: every captured chunk is amplified 4x (+12 dB) at capture
+ * time, so the speech gate, the stats, the note buffer, the pre-roll
+ * ring and the live stream all hear the louder signal. Saturates
+ * instead of wrapping, so over-gain shows up as clipped samples in
+ * the record log. Applied at capture only, never at pre-roll replay,
+ * so no chunk is ever gained twice. */
+static void sw_gain(int16_t *pcm, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        int x = (int)pcm[i] * 4;
+        pcm[i] = x > 32767 ? 32767 : x < -32768 ? -32768 : (int16_t)x;
+    }
+}
+
 /* One 20 ms idle read: feeds the pre-roll ring and the settings mic meter. */
 static void idle_capture(void)
 {
@@ -237,6 +252,7 @@ static void idle_capture(void)
         vTaskDelay(pdMS_TO_TICKS(20));
         return;
     }
+    sw_gain(s_chunk, MUSE_AUDIO_CHUNK);
     if (s_monitor) {
         float db = muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK);
         s_monitor_db = db > s_monitor_db ? db : s_monitor_db * 0.9f + db * 0.1f;
@@ -386,6 +402,7 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
         if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
             break;
         }
+        sw_gain(s_chunk, MUSE_AUDIO_CHUNK);
         muse_state_set_level(muse_audio_level(s_chunk, MUSE_AUDIO_CHUNK));
         take(&st, s_chunk);
         if (muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK) > CALL_SPEECH_DB) {
@@ -1030,6 +1047,7 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
             }
             continue;
         }
+        sw_gain(s_chunk, MUSE_AUDIO_CHUNK);
         float db = muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK);
         if (db > CALL_SPEECH_DB) {
             speech_chunks++;
