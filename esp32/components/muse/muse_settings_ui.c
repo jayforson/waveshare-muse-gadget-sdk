@@ -1151,7 +1151,13 @@ static void tick_battery(void)
         set_text(s_batt_left, "-");
         return;
     }
-    snprintf(buf, sizeof(buf), "%s%d%%", p.charging ? LV_SYMBOL_CHARGE " " : "", p.battery_pct);
+    if (p.charging) {
+        snprintf(buf, sizeof(buf), "%s%d%%", LV_SYMBOL_CHARGE " ", p.battery_pct);
+    } else if (!muse_state_on_battery()) {
+        snprintf(buf, sizeof(buf), "%d%% USB", p.battery_pct);
+    } else {
+        snprintf(buf, sizeof(buf), "%d%%", p.battery_pct);
+    }
     set_text(s_batt_level, buf);
 
     muse_battery_t b;
@@ -1268,8 +1274,15 @@ static void tick_home(void)
     char buf[96];
     if (p.battery_pct < 0) {
         strlcpy(buf, "USB", sizeof(buf));
+    } else if (p.charging) {
+        snprintf(buf, sizeof(buf), "%s%d%%", LV_SYMBOL_CHARGE " ", p.battery_pct);
+    } else if (!muse_state_on_battery()) {
+        /* Plugged in but full: the charger has stopped, so there is
+         * no charge bolt, but the USB suffix still shows it is on
+         * USB power rather than on battery. */
+        snprintf(buf, sizeof(buf), "%d%% USB", p.battery_pct);
     } else {
-        snprintf(buf, sizeof(buf), "%s%d%%", p.charging ? LV_SYMBOL_CHARGE " " : "", p.battery_pct);
+        snprintf(buf, sizeof(buf), "%d%%", p.battery_pct);
     }
     set_text(s_home_battery, buf);
 

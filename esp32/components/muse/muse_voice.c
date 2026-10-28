@@ -84,7 +84,7 @@ static volatile uint32_t s_snore_ms;   /* when a snore was asked for (ms since b
  * in and within reach of Muse; idle_capture feeds the wake-word engine
  * and sets s_wake_fired. A call is the same turn machinery as a
  * push-to-talk note, looped: listen (voice activity ends the utterance),
- * send, play the reply, listen again, until 30 s of silence or a
+ * send, play the reply, listen again, until 15 s of silence or a
  * hangup. s_call is also read by the input task (BOOT short press
  * during a call hangs up instead of sleeping).
  */
@@ -102,7 +102,7 @@ static volatile bool s_wake_fired;
 #define CALL_SPEECH_DB (-45.0f)    /* speech starts above this */
 #define CALL_SILENCE_DB (-50.0f)   /* an utterance ends below this */
 #define CALL_GAP_CHUNKS 75         /* 1.5 s of silence ends an utterance */
-#define CALL_SILENCE_US (30LL * 1000000)   /* no speech this long hangs up */
+#define CALL_SILENCE_US (15LL * 1000000)   /* no speech this long hangs up */
 
 /* Call capture outcomes. */
 typedef enum {
@@ -498,6 +498,9 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
     muse_state_set_level(0);
     ESP_LOGI(TAG, "muse reply: %.2fs of audio, %.2fs total", (double)played / MUSE_AUDIO_RATE,
              (esp_timer_get_time() - t0) / 1e6);
+    /* `page` is static and now holds the final page; the closing
+     * check in call_run reads it from here. */
+    strlcpy(s_last_reply, page, sizeof(s_last_reply));
     if (!played) {
         /* No speech (TTS unavailable): leave the reply text up for a moment. */
         vTaskDelay(pdMS_TO_TICKS(2500));
@@ -812,6 +815,7 @@ static bool finish_note(bool in_call, bool *replied_out)
 {
     bool delivered;
     s_reply_failed = false;
+    s_last_reply[0] = '\0';
 #if HOLD_NOTES
     if (s_rec) {
         bool fed = false, interrupted = false;
@@ -879,6 +883,58 @@ static void drain_ptt(bool *down, bool *up)
 }
 
 /*
+static char s_last_reply[128];   /* final page of the last reply, for closing detection */
+static char s_last_heard[96];    /* transcript of the utterance in progress */
+
+/* True when a (short) text is a closing exchange: it ends with a
+ * closing phrase and is short enough that the phrase is the point,
+ * not a passing word in a long reply. "Thanks for your support" does
+ * not match (it ends with "support"); a long reply ending in "thanks"
+ * is filtered out by the length cap. Bare acknowledgements like a
+ * lone "好的" are deliberately NOT closings: they are too ambiguous
+ * (they also answer commands), so those calls still open follow-up,
+ * now only for 15 s of silence instead of 30 s. */
+static bool reply_is_closing(const char *text)
+{
+    if (!text || !text[0]) {
+        return false;
+    }
+    size_t len = strlen(text);
+    while (len > 0) {
+        unsigned char c = (unsigned char)text[len - 1];
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == '.' || c == '!' || c == '?' || c == ',') {
+            len--;
+            continue;
+        }
+        /* Trailing CJK punctuation is 3 bytes (E3 80 xx, EF BC xx,
+         * EF BD xx); Chinese characters start at E4, so stripping
+         * these cannot eat a character. */
+        if (len >= 3 && ((unsigned char)text[len - 3] == 0xE3 && (unsigned char)text[len - 2] == 0x80) ||
+            (len >= 3 && (unsigned char)text[len - 3] == 0xEF && (unsigned char)text[len - 2] == 0xBC) ||
+            (len >= 3 && (unsigned char)text[len - 3] == 0xEF && (unsigned char)text[len - 2] == 0xBD)) {
+            len -= 3;
+            continue;
+        }
+        break;
+    }
+    if (len == 0 || len > 36) {
+        return false;
+    }
+    static const char *const CLOSINGS[] = {
+        "再见", "拜拜", "晚安", "好梦", "不客气", "谢谢",
+        "就这样", "就这样吧", "先这样", "先这样吧", "没事了",
+        "下次见", "下次再聊", "回头见", "明天见",
+        "Good night", "Goodbye", "Bye", "bye", "See you",
+    };
+    for (size_t i = 0; i < sizeof(CLOSINGS) / sizeof(*CLOSINGS); i++) {
+        size_t cl = strlen(CLOSINGS[i]);
+        if (len >= cl && memcmp(text + len - cl, CLOSINGS[i], cl) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
  * One call utterance: the same kept-note and live-stream machinery as
  * record(), but the end is voice activity, not a release. No pre-roll
  * seeding: the ring still holds the wake word itself, which must not go
@@ -894,6 +950,7 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
     muse_state_set_progress(0);
     s_rec_n = s_sent = 0;
     s_cancel_requested = false;
+    s_last_heard[0] = '\0';
     s_live = s_tried = false;
     if (!s_rec) {
         s_rec = heap_caps_malloc(MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -941,6 +998,7 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
         while (s_live && (ev = muse_hatch_turn_event(text, sizeof(text))) != MUSE_HATCH_EV_NONE) {
             if (ev == MUSE_HATCH_EV_HEARD && text[0]) {
                 heard = true;
+                strlcpy(s_last_heard, text, sizeof(s_last_heard));
                 muse_state_set_caption("%s", text);
             } else if (ev == MUSE_HATCH_EV_ERROR) {
                 ESP_LOGW(TAG, "muse: %s", text);
@@ -1118,6 +1176,13 @@ static void call_run(void)
             if (s_reply_failed) {
                 end_caption = s_last_error;
             }
+            break;
+        }
+        if (reply_is_closing(s_last_reply) || reply_is_closing(s_last_heard)) {
+            /* A closing exchange: the user said goodbye, or Muse
+             * answered with one. End the call instead of opening
+             * follow-up listening; saying Jarvis again, or BOOT,
+             * starts a new turn if the user wants to continue. */
             break;
         }
         /* Reply delivered: follow-up listening is enabled from here.
