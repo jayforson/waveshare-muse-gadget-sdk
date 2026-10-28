@@ -60,3 +60,7 @@ float muse_audio_level(const int16_t *mono, size_t frames);
 
 /* Short UI chirp: rising for "go", falling for "done". */
 void muse_audio_chirp(int rising);
+
+/* Sent chirp: two beeps (low, then high) when a note actually reaches
+ * the cloud. Held notes get none. */
+void muse_audio_chirp_sent(void);

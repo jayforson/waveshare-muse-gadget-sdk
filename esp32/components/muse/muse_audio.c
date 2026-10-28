@@ -326,3 +326,35 @@ void muse_audio_chirp(int rising)
     }
     muse_audio_write(buf, N);
 }
+
+/* One tone of a UI sound, written in 20 ms pieces so no large buffer
+ * is needed on the voice task's stack. */
+static void play_tone(float freq, int ms)
+{
+    int total = MUSE_AUDIO_RATE * ms / 1000;
+    int16_t buf[MUSE_AUDIO_CHUNK];
+    float phase = 0;
+    for (int base = 0; base < total; base += MUSE_AUDIO_CHUNK) {
+        int n = total - base < MUSE_AUDIO_CHUNK ? total - base : MUSE_AUDIO_CHUNK;
+        for (int i = 0; i < n; i++) {
+            float x = (float)(base + i) / total;
+            float env = (x < 0.1f ? x / 0.1f : 1.0f) * (1.0f - x) * (1.0f - x);
+            phase += 2.0f * (float)M_PI * freq / MUSE_AUDIO_RATE;
+            buf[i] = (int16_t)(sinf(phase) * env * 7000.0f);
+        }
+        muse_audio_write(buf, n);
+    }
+}
+
+/* Sent chirp: two beeps, low then high, with a gap between them. It
+ * sounds nothing like the rising wake sweep or the falling hangup
+ * sweep: rhythm (two notes) sets it apart, not just pitch. */
+void muse_audio_chirp_sent(void)
+{
+    static const int16_t silence[MUSE_AUDIO_CHUNK];
+    play_tone(880.0f, 70);
+    for (int i = 0; i < 3; i++) {
+        muse_audio_write(silence, MUSE_AUDIO_CHUNK);   /* 60 ms gap */
+    }
+    play_tone(1320.0f, 100);
+}

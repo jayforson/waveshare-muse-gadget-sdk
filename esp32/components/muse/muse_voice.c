@@ -885,9 +885,10 @@ static bool held_due(void)
 /*
  * After the release: the rest of the note goes to Hatch and the reply plays,
  * or if it can't go now it's saved to send later. Returns true if a press
- * interrupted the reply. In a call (`in_call`) there is no end chirp
- * after every utterance: only waking chirps up and hanging up chirps
- * down, and the caller puts the face back to listening instead of idle.
+ * interrupted the reply. Every utterance that actually reaches the
+ * cloud gets the two-beep sent chirp before the reply plays; a note
+ * held for later gets none. Waking chirps up, hanging up chirps down,
+ * and the caller puts the face back to listening instead of idle.
  */
 static bool finish_note(bool in_call, bool *replied_out)
 {
@@ -899,11 +900,8 @@ static bool finish_note(bool in_call, bool *replied_out)
         bool fed = false, interrupted = false;
         delivered = false;
         if (s_live && s_sent == s_rec_n) {
-            muse_hatch_turn_end();   /* before the chirp, which takes ~90 ms */
+            muse_hatch_turn_end();   /* finalized first; the sent chirp plays only if fed */
             fed = true;
-        }
-        if (!in_call) {
-            muse_audio_chirp(0);
         }
         if (s_live && !fed) {
             /* Hatch is behind (still connecting, say): the rest from the kept note. */
@@ -915,6 +913,7 @@ static bool finish_note(bool in_call, bool *replied_out)
             }
         }
         if (fed) {
+            muse_audio_chirp_sent();   /* reached the cloud; held notes get none */
             interrupted = hatch_reply(&delivered);
         }
         if (delivered || interrupted) {
@@ -928,10 +927,8 @@ static bool finish_note(bool in_call, bool *replied_out)
         return interrupted;
     }
 #endif
-    muse_hatch_turn_end();   /* before the chirp, which takes ~90 ms */
-    if (!in_call) {
-        muse_audio_chirp(0);
-    }
+    muse_hatch_turn_end();   /* before the sent chirp, which takes ~230 ms */
+    muse_audio_chirp_sent();
     {
         bool interrupted = hatch_reply(&delivered);
         if (replied_out) {
