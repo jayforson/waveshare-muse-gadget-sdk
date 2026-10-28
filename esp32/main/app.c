@@ -2268,7 +2268,11 @@ static const vm_info_t *find_vm_by_id(const vm_info_t *vms, int count, const cha
 // and (on token refresh) writes NVS.
 static void hatch_vm_task(void *arg) {
     hatch_vm_request_t *req = arg;
-    if (config_is_provisioned() && operation_gate_take(pdMS_TO_TICKS(15000), "Muse VM lookup")) {
+    /* DIAG: a gate/provisioned skip was silent; log it so a failed
+     * lookup shows whether it ever reached fetch. */
+    bool diag_prov = config_is_provisioned();
+    bool diag_gate = diag_prov && operation_gate_take(pdMS_TO_TICKS(15000), "Muse VM lookup");
+    if (diag_gate) {
         vm_info_t vms[VM_API_MAX_VMS];
         int count = fetch_vms_with_refresh_with_gate_held(vms, VM_API_MAX_VMS);
         if (count > 0) {
@@ -2291,6 +2295,9 @@ static void hatch_vm_task(void *arg) {
             vm_list_free(vms, count);
         }
         operation_gate_give();
+    } else {
+        ESP_LOGW(TAG, "diag: muse_vm lookup skipped: provisioned=%d gate=%d",
+                 (int)diag_prov, (int)diag_gate);
     }
     xTaskNotifyGive(req->waiter);
     stack_monitor_record(NULL);
@@ -2305,6 +2312,13 @@ bool app_hatch_vm_credentials(const char *want_vm, char *vm_id, size_t id_cap,
         .waiter = xTaskGetCurrentTaskHandle(),
     };
     if (xTaskCreate(hatch_vm_task, "muse_vm", 8192, &req, 4, NULL) != pdPASS) {
+        /* DIAG: this silent failure is the prime suspect for
+         * "Can't reach Muse's server" (resolve_vm fails before any
+         * network use). Log heap so one boot settles spawn vs gate
+         * vs fetch. */
+        ESP_LOGE(TAG, "diag: muse_vm task create failed: free internal %u, largest %u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         return false;
     }
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
