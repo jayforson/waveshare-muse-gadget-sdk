@@ -46,6 +46,7 @@ typedef enum {
     MUSE_SETTING_BLE,
     MUSE_SETTING_HATCH,
     MUSE_SETTING_PUSHES,
+    MUSE_SETTING_PUSH_ANNOUNCE,
     MUSE_SETTING_WAKE_BATTERY,
 } muse_setting_t;
 
@@ -57,6 +58,7 @@ void muse_settings_set_listener(muse_setting_cb_t cb);
 int muse_settings_volume(void);         /* 0..100 */
 bool muse_settings_speaker_on(void);    /* off: replies are shown, not played */
 bool muse_settings_pushes_on(void);     /* on: messages Muse sends unasked are shown and played */
+bool muse_settings_push_announce(void);  /* on (default): pushed messages are spoken; off: received silently, calls unaffected */
 bool muse_settings_wake_on_battery(void);  /* on: Jarvis wake arms even when the board reports battery */
 int muse_settings_mic_gain(void);       /* dB, 0..MUSE_MIC_GAIN_MAX */
 int muse_settings_brightness(void);     /* 10..100 */
@@ -73,6 +75,7 @@ size_t muse_settings_hatch_token_len(void);
 void muse_settings_set_volume(int pct);
 void muse_settings_set_speaker_on(bool on);
 void muse_settings_set_pushes_on(bool on);
+void muse_settings_set_push_announce(bool on);
 void muse_settings_set_wake_on_battery(bool on);
 void muse_settings_set_mic_gain(int db);
 void muse_settings_set_brightness(int pct);

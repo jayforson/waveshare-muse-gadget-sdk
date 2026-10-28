@@ -35,6 +35,7 @@ static struct {
     uint8_t volume;
     bool speaker_on;
     bool pushes_on;
+    bool push_announce;
     bool wake_on_battery;
     uint8_t mic_gain;
     uint8_t brightness;
@@ -49,6 +50,7 @@ static struct {
 } s = {
     .volume = CONFIG_MUSE_DEFAULT_VOLUME,
     .speaker_on = true,
+    .push_announce = true,
     .mic_gain = 30,
     .brightness = 100,
     .sleep_s = 120,
@@ -123,6 +125,9 @@ esp_err_t muse_settings_init(void)
     if (nvs_get_u8(s_nvs, "pushes", &b) == ESP_OK) {
         s.pushes_on = b;
     }
+    if (nvs_get_u8(s_nvs, "push_ann", &b) == ESP_OK) {
+        s.push_announce = b;
+    }
     if (nvs_get_u8(s_nvs, "wake_batt", &b) == ESP_OK) {
         s.wake_on_battery = b;
     }
@@ -145,6 +150,7 @@ esp_err_t muse_settings_init(void)
     s.mic_gain = clampi(s.mic_gain, 0, MUSE_MIC_GAIN_MAX);
     s.brightness = clampi(s.brightness, 10, 100);
     ESP_LOGI(TAG, "all messages %s", s.pushes_on ? "on" : "off");
+    ESP_LOGI(TAG, "push announcements %s", s.push_announce ? "on" : "off");
     ESP_LOGI(TAG, "vol %d%s, mic %d dB, bright %d, sleep %ds, wifi %s (%s), ble %s, muse %s",
              s.volume, s.speaker_on ? "" : " (speaker off)", s.mic_gain, s.brightness, s.sleep_s, s.wifi_on ? "on" : "off",
              "network saved by Link", s.ble_on ? "on" : "off", s.token[0] ? "token set" : "no token");
@@ -159,6 +165,7 @@ void muse_settings_set_listener(muse_setting_cb_t cb)
 int muse_settings_volume(void) { return s.volume; }
 bool muse_settings_speaker_on(void) { return s.speaker_on; }
 bool muse_settings_pushes_on(void) { return s.pushes_on; }
+bool muse_settings_push_announce(void) { return s.push_announce; }
 bool muse_settings_wake_on_battery(void) { return s.wake_on_battery; }
 int muse_settings_mic_gain(void) { return s.mic_gain; }
 int muse_settings_brightness(void) { return s.brightness; }
@@ -221,6 +228,13 @@ void muse_settings_set_pushes_on(bool on)
     s.pushes_on = on;
     save_u8("pushes", on);
     notify(MUSE_SETTING_PUSHES);
+}
+
+void muse_settings_set_push_announce(bool on)
+{
+    s.push_announce = on;
+    save_u8("push_ann", on);
+    notify(MUSE_SETTING_PUSH_ANNOUNCE);
 }
 
 void muse_settings_set_wake_on_battery(bool on)

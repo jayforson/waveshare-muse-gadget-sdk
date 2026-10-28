@@ -613,6 +613,20 @@ static bool hatch_reply(bool *delivered)
 static bool play_push(void)
 {
     ESP_LOGI(TAG, "playing a push from Muse");
+    if (!muse_settings_push_announce()) {
+        /* Quiet push: the message is still received (text and dialog),
+         * but never spoken, so automatic tasks don't wake anyone.
+         * The speaker is muted only for this turn; the saved volume
+         * is untouched, the screen stays dark, and calls are
+         * unaffected (they never go through this path). */
+        int vol = muse_settings_volume();
+        muse_audio_set_volume(0);
+        muse_wifi_power(MUSE_WIFI_FULL);
+        bool delivered;
+        bool r = hatch_reply_as(&delivered, "");
+        muse_audio_set_volume(vol);
+        return r;
+    }
     muse_state_set_asleep(false);
     muse_state_poke();
     muse_wifi_power(MUSE_WIFI_FULL);
