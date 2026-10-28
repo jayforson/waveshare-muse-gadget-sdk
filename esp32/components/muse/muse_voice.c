@@ -90,6 +90,8 @@ static volatile uint32_t s_snore_ms;   /* when a snore was asked for (ms since b
  */
 static bool s_call;
 static volatile bool s_hangup_requested;
+static bool s_reply_failed;      /* last hatch_reply ended in an error */
+static char s_last_error[96];   /* error text from that failed reply */
 static volatile bool s_wake_armed;
 static volatile bool s_wake_fired;
 
@@ -455,6 +457,7 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
     size_t played = 0;
     int64_t t0 = esp_timer_get_time();
     *delivered = false;
+    s_reply_failed = false;
     s_barge_loud_us = 0;
     for (;;) {
         muse_hatch_ev_t ev;
@@ -484,6 +487,8 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
                 break;
             case MUSE_HATCH_EV_ERROR:
                 ESP_LOGW(TAG, "muse: %s", text);
+                s_reply_failed = true;
+                strlcpy(s_last_error, text, sizeof(s_last_error));
                 muse_state_set_level(0);
                 go_idle(text);
                 return false;
@@ -858,9 +863,10 @@ static bool held_due(void)
  * after every utterance: only waking chirps up and hanging up chirps
  * down, and the caller puts the face back to listening instead of idle.
  */
-static bool finish_note(bool in_call)
+static bool finish_note(bool in_call, bool *replied_out)
 {
     bool delivered;
+    s_reply_failed = false;
 #if HOLD_NOTES
     if (s_rec) {
         bool fed = false, interrupted = false;
@@ -889,6 +895,9 @@ static bool finish_note(bool in_call)
         } else {
             hold_rec(s_tried);
         }
+        if (replied_out) {
+            *replied_out = delivered && !s_reply_failed;
+        }
         return interrupted;
     }
 #endif
@@ -896,7 +905,13 @@ static bool finish_note(bool in_call)
     if (!in_call) {
         muse_audio_chirp(0);
     }
-    return hatch_reply(&delivered);
+    {
+        bool interrupted = hatch_reply(&delivered);
+        if (replied_out) {
+            *replied_out = delivered && !s_reply_failed;
+        }
+        return interrupted;
+    }
 }
 
 static bool can_record(void);
@@ -1085,11 +1100,13 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
 }
 
 /*
- * A wake-word call, entered from the voice task's idle branch. Loops
- * utterances until the silence watchdog fires or a hangup is requested,
- * then chirps down and goes back to listening for the wake word. A
- * reply interrupted by BOOT or by voice starts the next utterance at
- * once (barge-in settle skips the speaker tail).
+ * A wake-word call, entered from the voice task's idle branch. One
+ * utterance first: follow-up listening is enabled only after Muse
+ * actually replies. An utterance with no reply (offline, held,
+ * can't reach, error, or dropped before any reply) ends the call
+ * instead of looping back to listening, so recording never switches
+ * on/off repeatedly on a dead connection. A reply interrupted by
+ * BOOT or by voice still starts the next utterance at once.
  */
 static void call_run(void)
 {
@@ -1109,6 +1126,8 @@ static void call_run(void)
     ESP_LOGI(TAG, "call started");
     int64_t silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
     bool barge_in = false;
+    bool got_reply = false;
+    const char *end_caption = "";
     for (;;) {
         call_outcome_t u = capture_call_utterance(barge_in, &silence_deadline);
         barge_in = false;
@@ -1116,25 +1135,43 @@ static void call_run(void)
             break;
         }
         if (u == CALL_CANCELLED) {
-            /* Dropped utterance (or a tap on cancel): the user is there,
-             * so the silence watchdog starts over. */
+            /* Dropped utterance (cough, too short, cancel tap): before
+             * any reply this ends the wake call instead of recapturing.
+             * Once a reply has enabled follow-up, a cancel only drops
+             * that utterance and listening continues. */
+            if (!got_reply) {
+                break;
+            }
             silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
             pre_reset();
             continue;
         }
-        bool interrupted = finish_note(true);
+        bool replied = false;
+        bool interrupted = finish_note(true, &replied);
         if (s_hangup_requested) {
             break;
         }
         if (interrupted) {
-            /* BOOT or voice barge-in: listen again at once. */
+            /* BOOT or voice barge-in: the user is speaking, so listen
+             * again at once. */
             barge_in = true;
             silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
             pre_reset();
             continue;
         }
-        /* Reply done (or the note saved offline): back to listening with
-         * a fresh silence window, happy as after any turn. */
+        if (!replied) {
+            /* No reply (offline, held, can't reach, error): stop after
+             * this one recording instead of looping back to listening.
+             * Keep the failure caption when there was one, so the end
+             * of the call still says why. */
+            if (s_reply_failed) {
+                end_caption = s_last_error;
+            }
+            break;
+        }
+        /* Reply delivered: follow-up listening is enabled from here.
+         * A later utterance with no reply still ends the call. */
+        got_reply = true;
         muse_state_make_happy();
         muse_state_set_mode(MUSE_MODE_LISTENING);
         muse_state_poke();
@@ -1144,7 +1181,7 @@ static void call_run(void)
     s_call = false;
     s_hangup_requested = false;
     muse_audio_chirp(0);
-    go_idle("");
+    go_idle(end_caption);
     pre_reset();
     ESP_LOGI(TAG, "call ended");
 }
@@ -1371,7 +1408,7 @@ static void voice_task(void *arg)
             go_idle(why);   /* Hatch failed it while recording */
             continue;
         }
-        pending_down = finish_note(false);
+        pending_down = finish_note(false, NULL);
         pre_reset();
         if (!pending_down && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
             muse_state_make_happy();
