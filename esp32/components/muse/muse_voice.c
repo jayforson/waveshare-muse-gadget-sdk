@@ -1275,12 +1275,19 @@ static bool can_record(void)
     if (ready && s_held_count) {
         s_next_send_us = 0;   /* the saved ones go first, right after */
     }
-    s_rec = heap_caps_malloc(MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /* Reuse the buffer reserved at startup: allocating a fresh one here
+     * every call would leak the reserved block and, once free PSRAM
+     * drops below one note, overwrite s_rec with NULL - the NO MEMORY
+     * FOR NOTE that kills every later call until reboot. */
     if (!s_rec) {
-        ESP_LOGE(TAG, "no memory to keep a note (psram free %u, largest %u)",
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-    } else {
+        s_rec = heap_caps_malloc(MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_rec) {
+            ESP_LOGE(TAG, "no memory to keep a note (psram free %u, largest %u)",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+        }
+    }
+    if (s_rec) {
         /* Once: the 30 s note buffer plus wake/AFE against free heap. */
         static bool logged;
         if (!logged) {
