@@ -45,6 +45,7 @@ static const char *TAG = "muse_voice";
 #define TAIL_FRAMES (MUSE_AUDIO_RATE * 12 / 100)   /* capture lag + poll interval, stops before the release click */
 #define MAX_FRAMES (MUSE_AUDIO_RATE * MAX_SECS)
 #define MIN_HELD_FRAMES (MUSE_AUDIO_RATE * 3 / 10)   /* shorter presses are taps, not speech */
+#define SPEECH_MIN_CHUNKS 10   /* 0.2 s above CALL_SPEECH_DB counts as speech; isolated clicks are 1-5 chunks */
 #if CONFIG_MUSE_BOARD_M5STACK_CARDPUTER_ADV
 #define PRE_CHUNKS 6                                   /* 120 ms; a 320 ms upload burst stalls on the ADV */
 #else
@@ -305,6 +306,7 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
     muse_state_set_caption(s_live ? "LISTENING..." : "RECORDING...");
     bool heard = false, ok = true;
     bool gave_up = false;   /* Hatch failed this note: it's kept, and goes later */
+    size_t speech_chunks = 0;
     char text[96];
     rec_stats_t st = { 0 };
 
@@ -318,6 +320,9 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
         for (size_t i = 0; i < s_pre_fill; i++) {
             pre_get(i, s_chunk);
             take(&st, s_chunk);
+            if (muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK) > CALL_SPEECH_DB) {
+                speech_chunks++;
+            }
             n += MUSE_AUDIO_CHUNK;
         }
     }
@@ -331,6 +336,9 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
         }
         muse_state_set_level(muse_audio_level(s_chunk, MUSE_AUDIO_CHUNK));
         take(&st, s_chunk);
+        if (muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK) > CALL_SPEECH_DB) {
+            speech_chunks++;
+        }
         /* Live transcript as the caption. A failure stops the streaming; the
          * kept note goes later, or without one the failure is the caption. */
         muse_hatch_ev_t ev;
@@ -384,6 +392,23 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
         muse_state_set_level(0);
         return false;
     }
+    if (!heard && speech_chunks < SPEECH_MIN_CHUNKS) {
+        /* Silence (or only noise below the speech threshold) held
+         * past the tap length: cancel the turn before it is
+         * finalized, so nothing is sent or held for later. Live
+         * audio already streamed is discarded with the turn. A
+         * transcript (heard) overrides the energy count, so quiet
+         * speech the cloud did hear still goes through. */
+        ESP_LOGI(TAG, "no speech in note (%.2fs above threshold), dropped", (double)speech_chunks / 50.0);
+        muse_hatch_turn_cancel();
+        drop_rec();
+        *held = 0;
+        if (cap > 0) {
+            strlcpy(why, "NO SPEECH", cap);
+        }
+        muse_state_set_level(0);
+        return false;
+    }
     muse_state_set_level(0);
     *held = n - pre;
 
@@ -395,9 +420,10 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
     }
     ESP_LOGI(TAG, "end levels:%s", tail);
     float rms_db = st.frames ? 10.0f * log10f((float)(st.acc / st.frames / (32768.0 * 32768.0)) + 1e-10f) : -100.0f;
-    ESP_LOGI(TAG, "recorded %.2fs%s: rms %.1f dBFS, peak %.1f dBFS, floor %.1f dBFS, %d clipped, gain %d dB",
+    ESP_LOGI(TAG, "recorded %.2fs%s: rms %.1f dBFS, peak %.1f dBFS, floor %.1f dBFS, %d clipped, gain %d dB, speech %.2fs",
              (double)n / MUSE_AUDIO_RATE, released ? "" : " (max)", rms_db < -100.0f ? -100.0f : rms_db,
-             20.0 * log10((st.peak + 1) / 32768.0), st.floor_db, st.clipped, muse_settings_mic_gain());
+             20.0 * log10((st.peak + 1) / 32768.0), st.floor_db, st.clipped, muse_settings_mic_gain(),
+             (double)speech_chunks / 50.0);
     return ok;
 }
 
@@ -976,6 +1002,7 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
         }
     }
     bool speech = false, manual = muse_input_talk_down();
+    size_t speech_chunks = 0;
     size_t gap = 0;
     bool released = false;
     size_t stop_at = MAX_FRAMES;
@@ -992,6 +1019,9 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
             continue;
         }
         float db = muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK);
+        if (db > CALL_SPEECH_DB) {
+            speech_chunks++;
+        }
         muse_state_set_level(muse_audio_level(s_chunk, MUSE_AUDIO_CHUNK));
         take(&st, s_chunk);
         muse_hatch_ev_t ev;
@@ -1082,8 +1112,12 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
         drop_rec();
         return CALL_CANCELLED;
     }
-    if (!speech || n < MIN_HELD_FRAMES) {
-        /* A cough, not an utterance: drop it, stay in the call. */
+    if (n < MIN_HELD_FRAMES || (!heard && speech_chunks < SPEECH_MIN_CHUNKS)) {
+        /* A cough, a click, or silence, not an utterance: drop it,
+         * stay in the call. A transcript (heard) overrides the
+         * energy count, so quiet speech the cloud did hear still
+         * goes through. */
+        ESP_LOGI(TAG, "utterance dropped: no speech (%.2fs above threshold)", (double)speech_chunks / 50.0);
         muse_hatch_turn_cancel();
         drop_rec();
         return CALL_CANCELLED;
