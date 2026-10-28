@@ -796,13 +796,17 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
     i2s_chan_handle_t tx, rx;
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
-    /* Voice-sized I2S DMA: 2x120 frames stereo 16-bit = 960 bytes/channel.
-       Defaults (6x240) need 5760/channel, 11520 total; 3x120 (1440/channel)
-       still lost RX to DMA fragmentation (largest block ~1K at boot), so
-       2x120. Cushion 22.5 ms -> 15 ms: if playback stutter appears later,
-       suspect this first. LCD chunks stay at 2 lines: muse_lcd_bands
-       rounds rows to even, so 1 line would divide by zero. */
-    chan_cfg.dma_desc_num = 2;
+    /* Voice-sized I2S DMA: 3x120 frames stereo 16-bit = 1440 bytes per
+       direction, 22.5 ms cushion (was 2x120, 15 ms, the V3 stopgap).
+       Defaults (6x240) need 5760/direction, 90 ms, but lost RX to DMA
+       fragmentation on a bad boot (largest block ~1K), so 3x120 is the
+       step back up: it fits typical boots (largest block ~4K) and
+       still degrades gracefully (voice pipeline unavailable, face and
+       clock stay up) on a badly fragmented one. LCD chunks stay at
+       2 lines: raising them would eat DMA before audio_init and
+       could re-break this allocation, and dirty-region redraws mean
+       line count barely affects playback. */
+    chan_cfg.dma_desc_num = 3;
     chan_cfg.dma_frame_num = 120;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &tx, &rx), TAG, "i2s channel");
     const i2s_std_config_t std_cfg = {
@@ -877,10 +881,10 @@ static esp_err_t gauge_read_u16(uint8_t reg, uint16_t *val)
     return ESP_OK;
 }
 
-/* The 1.85B has no ADC divider: battery state comes from the BQ27220
- * gauge. Current > 0 means charging, which only happens on USB power, so
- * that doubles as the USB-present signal. If the gauge never answers,
- * report "no battery" (same as before) rather than a bogus level. */
+/* The 1.85B has no ADC divider and no VBUS pin: battery state comes
+ * from the BQ27220 gauge, and USB presence is inferred from its
+ * current (see read_power). If the gauge never answers, report "no
+ * battery" (same as before) rather than a bogus level. */
 static esp_err_t read_power(muse_power_t *out)
 {
     uint16_t mv, soc, cur_raw;
@@ -897,7 +901,36 @@ static esp_err_t read_power(muse_power_t *out)
     out->battery_mv = mv;
     out->battery_pct = soc > 100 ? 100 : (int)soc;
     out->charging = (int16_t)cur_raw > 10;
-    out->usb = out->charging;
+    /* USB inference: a full battery on USB reads ~0 mA (the system
+     * runs on USB, the battery neither charges nor discharges),
+     * while on battery the load reads clearly negative, so "not
+     * discharging" is the USB test, not "charging". Schmitt trigger:
+     * enter USB on any charge current, leave it only after 3
+     * consecutive discharge readings (< -10 mA), and hold the
+     * previous state in the dead band (-10..+10 mA). The dead band
+     * matters at rest on battery, where discharge is only a few mA:
+     * holding keeps it "battery". A first reading in the dead band
+     * is taken as USB: at boot the load is high, so on battery it
+     * would read clearly negative. */
+    static bool s_usb_prev;
+    static bool s_usb_known;
+    static int s_discharge_count;
+    int16_t cur = (int16_t)cur_raw;
+    if (out->charging) {
+        s_usb_prev = true;
+        s_discharge_count = 0;
+    } else if (cur < -10) {
+        if (++s_discharge_count >= 3) {
+            s_usb_prev = false;
+        }
+    } else {
+        if (!s_usb_known) {
+            s_usb_prev = true;
+        }
+        s_discharge_count = 0;
+    }
+    s_usb_known = true;
+    out->usb = s_usb_prev;
     return ESP_OK;
 }
 

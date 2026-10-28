@@ -107,7 +107,8 @@ static volatile bool s_wake_fired;
 /* Call capture outcomes. */
 typedef enum {
     CALL_UTTERANCE,   /* a note to send */
-    CALL_CANCELLED,   /* dropped; the call keeps listening */
+    CALL_CANCELLED,   /* dropped (cough, too short); the call keeps listening */
+    CALL_END,         /* cancel tap: end the whole call */
     CALL_HANGUP,      /* silence timeout, hangup request, or no memory */
 } call_outcome_t;
 
@@ -978,7 +979,7 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
             muse_hatch_turn_cancel();
             drop_rec();
             muse_state_set_level(0);
-            return CALL_CANCELLED;
+            return CALL_END;
         }
         if (!speech) {
             if (db > CALL_SPEECH_DB) {
@@ -1078,11 +1079,17 @@ static void call_run(void)
         if (u == CALL_HANGUP) {
             break;
         }
+        if (u == CALL_END) {
+            /* Cancel tap: end the whole call, in any phase. Coughs
+             * and too-short utterances still return CALL_CANCELLED
+             * and stay in follow-up listening. */
+            break;
+        }
         if (u == CALL_CANCELLED) {
-            /* Dropped utterance (cough, too short, cancel tap): before
-             * any reply this ends the wake call instead of recapturing.
-             * Once a reply has enabled follow-up, a cancel only drops
-             * that utterance and listening continues. */
+            /* Dropped utterance (cough, too short): before any reply
+             * this ends the wake call instead of recapturing. Once a
+             * reply has enabled follow-up, it only drops that
+             * utterance and listening continues. */
             if (!got_reply) {
                 break;
             }
@@ -1295,7 +1302,7 @@ static void voice_task(void *arg)
             /* Wake-word arming: idle, plugged in, within reach. The
              * screen may be dark on USB; on battery this never arms,
              * and resting (battery asleep) never reaches this read. */
-            s_wake_armed = !muse_state_on_battery() && muse_hatch_ready()
+            s_wake_armed = (!muse_state_on_battery() || muse_settings_wake_on_battery()) && muse_hatch_ready()
                 && muse_state_mode(NULL) == MUSE_MODE_IDLE;
             /* The 20 ms read paces this loop. */
             idle_capture();

@@ -35,6 +35,7 @@ static struct {
     uint8_t volume;
     bool speaker_on;
     bool pushes_on;
+    bool wake_on_battery;
     uint8_t mic_gain;
     uint8_t brightness;
     uint16_t sleep_s;
@@ -122,6 +123,9 @@ esp_err_t muse_settings_init(void)
     if (nvs_get_u8(s_nvs, "pushes", &b) == ESP_OK) {
         s.pushes_on = b;
     }
+    if (nvs_get_u8(s_nvs, "wake_batt", &b) == ESP_OK) {
+        s.wake_on_battery = b;
+    }
     load_u8("mic_gain", &s.mic_gain);
     load_u8("bright", &s.brightness);
     nvs_get_u16(s_nvs, "sleep_s", &s.sleep_s);
@@ -155,6 +159,7 @@ void muse_settings_set_listener(muse_setting_cb_t cb)
 int muse_settings_volume(void) { return s.volume; }
 bool muse_settings_speaker_on(void) { return s.speaker_on; }
 bool muse_settings_pushes_on(void) { return s.pushes_on; }
+bool muse_settings_wake_on_battery(void) { return s.wake_on_battery; }
 int muse_settings_mic_gain(void) { return s.mic_gain; }
 int muse_settings_brightness(void) { return s.brightness; }
 int muse_settings_sleep_s(void) { return s.sleep_s; }
@@ -216,6 +221,13 @@ void muse_settings_set_pushes_on(bool on)
     s.pushes_on = on;
     save_u8("pushes", on);
     notify(MUSE_SETTING_PUSHES);
+}
+
+void muse_settings_set_wake_on_battery(bool on)
+{
+    s.wake_on_battery = on;
+    save_u8("wake_batt", on);
+    notify(MUSE_SETTING_WAKE_BATTERY);
 }
 
 void muse_settings_set_mic_gain(int db)

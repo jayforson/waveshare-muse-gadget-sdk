@@ -73,7 +73,7 @@ typedef struct {
 } page_t;
 
 /* Home values. */
-static lv_obj_t *s_home_wifi, *s_home_hatch, *s_home_pushes, *s_home_ble, *s_home_sound, *s_home_sleep, *s_home_battery, *s_about;
+static lv_obj_t *s_home_wifi, *s_home_hatch, *s_home_pushes, *s_home_wakebatt, *s_home_ble, *s_home_sound, *s_home_sleep, *s_home_battery, *s_about;
 
 /* Wi-Fi page. */
 static lv_obj_t *s_wifi_sw, *s_wifi_status, *s_wifi_saved, *s_wifi_scan_btn, *s_wifi_scan_lbl, *s_wifi_list;
@@ -104,7 +104,7 @@ static const char *const SLEEP_NAMES[] = { "Never", "30 seconds", "1 minute", "2
 static lv_obj_t *s_sleep_checks[SLEEP_COUNT];
 
 /* Battery page. */
-static lv_obj_t *s_batt_level, *s_batt_left;
+static lv_obj_t *s_batt_level, *s_batt_left, *s_batt_source;
 static int64_t s_batt_shown_us;
 
 /* Text entry page. */
@@ -1131,6 +1131,7 @@ static void build_battery_page(lv_obj_t *tile)
     s_batt_shown_us = 0;
     s_batt_level = info_row(list, "Battery");
     s_batt_left = info_row(list, "Time left");
+    s_batt_source = info_row(list, "Power source");
     note(list, "Time left follows the last few minutes of use, from about a minute after unplugging USB.");
 }
 
@@ -1142,6 +1143,7 @@ static void tick_battery(void)
     }
     s_batt_shown_us = now;
     muse_power_t p = muse_state_power();
+    set_text(s_batt_source, muse_state_on_battery() ? "Battery" : "USB");
     char buf[48];
 
     if (p.battery_pct < 0) {
@@ -1211,6 +1213,11 @@ static void on_pushes_sw(lv_event_t *e)
     muse_settings_set_pushes_on(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
+static void on_wakebatt_sw(lv_event_t *e)
+{
+    muse_settings_set_wake_on_battery(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
 static void build_home(lv_obj_t *tile)
 {
     lv_obj_t *list;
@@ -1218,6 +1225,7 @@ static void build_home(lv_obj_t *tile)
     row(list, LV_SYMBOL_WIFI, "Wi-Fi", &s_home_wifi, on_nav, (void *)&WIFI);
     row(list, LV_SYMBOL_HOME, "Muse", &s_home_hatch, on_nav, (void *)&HATCH);
     s_home_pushes = switch_row_icon(list, LV_SYMBOL_BELL, "All messages", muse_settings_pushes_on(), on_pushes_sw);
+    s_home_wakebatt = switch_row_icon(list, LV_SYMBOL_AUDIO, "Wake on battery", muse_settings_wake_on_battery(), on_wakebatt_sw);
     row(list, LV_SYMBOL_BLUETOOTH, "Bluetooth", &s_home_ble, on_nav, (void *)&BLE);
     row(list, LV_SYMBOL_VOLUME_MAX, "Sound", &s_home_sound, on_nav, (void *)&SOUND);
     row(list, LV_SYMBOL_EYE_CLOSE, "Sleep", &s_home_sleep, on_nav, (void *)&SLEEP);
@@ -1250,6 +1258,10 @@ static void tick_home(void)
     bool pushes = muse_settings_pushes_on();
     if (pushes != lv_obj_has_state(s_home_pushes, LV_STATE_CHECKED)) {
         lv_obj_set_state(s_home_pushes, LV_STATE_CHECKED, pushes);
+    }
+    bool wakebatt = muse_settings_wake_on_battery();
+    if (wakebatt != lv_obj_has_state(s_home_wakebatt, LV_STATE_CHECKED)) {
+        lv_obj_set_state(s_home_wakebatt, LV_STATE_CHECKED, wakebatt);
     }
 
     muse_power_t p = muse_state_power();
