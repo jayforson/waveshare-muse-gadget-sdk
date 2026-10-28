@@ -937,6 +937,32 @@ done:
     return ok;
 }
 
+/* Read-only VM fetch for the muse_vm task, which now runs on a PSRAM
+ * stack (see app_hatch_vm_credentials). A PSRAM-stack task must never
+ * write flash (PSRAM is inaccessible while flash is being written),
+ * so this path never refreshes or stores tokens: it loads the stored
+ * access token, fetches the VM list, and returns. On AUTH (stale
+ * token) it returns AUTH without refreshing; the caller fails and
+ * retries later, after Link's own task (internal stack) has
+ * refreshed tokens on its schedule. note_vm_credentials_accepted()
+ * is RAM-only, so it is safe to call here. Caller holds the
+ * operation gate, as with fetch_vms_with_refresh. */
+static int fetch_vms_readonly_with_gate_held(vm_info_t *vms, int max) {
+    char *access = load_token("access_token");
+    if (!access) {
+        return VM_API_ERR_FAILED;
+    }
+    int count = vm_api_fetch_vms(access, vms, max);
+    free(access);
+    if (count >= 0) {
+        note_vm_credentials_accepted();
+    } else if (count == VM_API_ERR_AUTH) {
+        ESP_LOGW(TAG, "muse_vm read-only fetch: access token rejected; "
+                 "waiting for Link refresh (no self-refresh on PSRAM stack)");
+    }
+    return count;
+}
+
 static int fetch_vms_with_refresh_with_gate_held(vm_info_t *vms, int max) {
     if (!ensure_access_token_ready_with_gate_held(false, true)) {
         return VM_API_ERR_FAILED;
@@ -2268,13 +2294,13 @@ static const vm_info_t *find_vm_by_id(const vm_info_t *vms, int count, const cha
 // and (on token refresh) writes NVS.
 static void hatch_vm_task(void *arg) {
     hatch_vm_request_t *req = arg;
-    /* DIAG: a gate/provisioned skip was silent; log it so a failed
-     * lookup shows whether it ever reached fetch. */
-    bool diag_prov = config_is_provisioned();
-    bool diag_gate = diag_prov && operation_gate_take(pdMS_TO_TICKS(15000), "Muse VM lookup");
-    if (diag_gate) {
+    /* A gate/provisioned skip was silent; log it so a failed lookup
+     * shows whether it ever reached fetch. */
+    bool prov_ok = config_is_provisioned();
+    bool gate_ok = prov_ok && operation_gate_take(pdMS_TO_TICKS(15000), "Muse VM lookup");
+    if (gate_ok) {
         vm_info_t vms[VM_API_MAX_VMS];
-        int count = fetch_vms_with_refresh_with_gate_held(vms, VM_API_MAX_VMS);
+        int count = fetch_vms_readonly_with_gate_held(vms, VM_API_MAX_VMS);
         if (count > 0) {
             const vm_info_t *target = NULL;
             if (req->want_vm && req->want_vm[0]) {
@@ -2296,8 +2322,8 @@ static void hatch_vm_task(void *arg) {
         }
         operation_gate_give();
     } else {
-        ESP_LOGW(TAG, "diag: muse_vm lookup skipped: provisioned=%d gate=%d",
-                 (int)diag_prov, (int)diag_gate);
+        ESP_LOGW(TAG, "muse_vm lookup skipped: provisioned=%d gate=%d",
+                 (int)prov_ok, (int)gate_ok);
     }
     xTaskNotifyGive(req->waiter);
     stack_monitor_record(NULL);
@@ -2311,12 +2337,19 @@ bool app_hatch_vm_credentials(const char *want_vm, char *vm_id, size_t id_cap,
         .vm_name = vm_name, .name_cap = name_cap,
         .waiter = xTaskGetCurrentTaskHandle(),
     };
-    if (xTaskCreate(hatch_vm_task, "muse_vm", 8192, &req, 4, NULL) != pdPASS) {
-        /* DIAG: this silent failure is the prime suspect for
-         * "Can't reach Muse's server" (resolve_vm fails before any
-         * network use). Log heap so one boot settles spawn vs gate
-         * vs fetch. */
-        ESP_LOGE(TAG, "diag: muse_vm task create failed: free internal %u, largest %u",
+    /* PSRAM stack: an 8192-byte internal stack cannot fit the
+     * fragmented internal heap (largest block ~4K), which made every
+     * VM lookup fail with "Can't reach Muse's server". The stack
+     * moves to PSRAM (plentiful); only the small TCB stays internal
+     * and fits. The task must then never write flash, so it uses
+     * the read-only fetch above. */
+    if (xTaskCreatePinnedToCoreWithCaps(hatch_vm_task, "muse_vm", 8192, &req, 4, NULL,
+                                        tskNO_AFFINITY,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        ESP_LOGE(TAG, "muse_vm task create failed: psram free %u largest %u, "
+                 "internal free %u largest %u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         return false;

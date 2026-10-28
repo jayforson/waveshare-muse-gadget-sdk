@@ -765,10 +765,10 @@ static bool resolve_vm(char *err, size_t err_cap)
     }
     char want[MUSE_VM_MAX + 1];
     muse_settings_hatch_vm(want);
-    /* DIAG: which resolve path runs (Link when no own token) and what
-     * VM id was wanted, so a failure shows the path, not just the
-     * generic "Can't reach" string. No token values are logged. */
-    ESP_LOGI(TAG, "diag: resolve_vm own token len=%d want=%s",
+    /* Which resolve path runs (Link when no own token) and what VM id
+     * was wanted, so a failure shows the path, not just the generic
+     * "Can't reach" string. No token values are logged. */
+    ESP_LOGI(TAG, "resolve_vm own token len=%d want=%s",
              (int)muse_settings_hatch_token_len(), want);
     if (!muse_settings_hatch_token_len()) {
         /* No token of our own: use Link's Hatch account. */
@@ -777,7 +777,7 @@ static bool resolve_vm(char *err, size_t err_cap)
             ESP_LOGI(TAG, "VM %s (%s) via Link", s_vm.vm_id, s_vm.vm_name);
             return true;
         }
-        ESP_LOGW(TAG, "diag: resolve_vm via Link failed; linked=%d", (int)muse_link_hatch_linked());
+        ESP_LOGW(TAG, "resolve_vm via Link failed; linked=%d", (int)muse_link_hatch_linked());
         strlcpy(err, muse_link_hatch_linked() ? "Can't reach Muse's server" : "Not paired", err_cap);
         return false;
     }
