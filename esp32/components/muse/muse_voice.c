@@ -670,10 +670,13 @@ static bool held_on_waking(void)
     return !got_event(MUSE_PTT_UP);
 }
 
+/* Discards the note just captured. The buffer itself is never
+ * freed: once taken (at startup, or by the first note that
+ * manages it), it stays for the life of the device, because a
+ * fragmented heap cannot give a fresh 960 KB block back. */
 static void drop_rec(void)
 {
-    free(s_rec);
-    s_rec = NULL;
+    s_rec_n = 0;
 }
 
 #if HOLD_NOTES
@@ -709,14 +712,22 @@ static void hold_rec(bool tried)
         go_idle("");
         return;
     }
-    int16_t *pcm = heap_caps_realloc(s_rec, s_rec_n * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int16_t *pcm = heap_caps_malloc(s_rec_n * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pcm) {
+        /* The note is lost, but the device keeps working: the
+         * reusable note buffer stays, and the next note can try. */
+        ESP_LOGW(TAG, "no memory to save a note for later");
+        drop_rec();
+        go_idle("COULDN'T SAVE THE NOTE");
+        return;
+    }
+    memcpy(pcm, s_rec, s_rec_n * sizeof(int16_t));
     s_held[s_held_count++] = (held_note_t){
-        .pcm = pcm ? pcm : s_rec,
+        .pcm = pcm,
         .frames = s_rec_n,
         .at_us = esp_timer_get_time(),
         .tries = tried,
     };
-    s_rec = NULL;
     if (tried) {
         back_off();
     }
@@ -978,7 +989,9 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
     if (!s_rec) {
         s_rec = heap_caps_malloc(MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!s_rec) {
-            ESP_LOGE(TAG, "no memory to keep a note");
+            ESP_LOGE(TAG, "no memory to keep a note (psram free %u, largest %u)",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
             muse_state_set_caption("NO MEMORY FOR NOTE");
             return CALL_HANGUP;
         }
@@ -1264,7 +1277,9 @@ static bool can_record(void)
     }
     s_rec = heap_caps_malloc(MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_rec) {
-        ESP_LOGE(TAG, "no memory to keep a note");
+        ESP_LOGE(TAG, "no memory to keep a note (psram free %u, largest %u)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
     } else {
         /* Once: the 30 s note buffer plus wake/AFE against free heap. */
         static bool logged;
@@ -1478,6 +1493,26 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
         muse_state_set_caption("AUDIO INIT FAILED");
         return ESP_FAIL;
     }
+#if HOLD_NOTES
+    /* One note buffer for the life of the device, taken while the
+     * PSRAM heap is still clean: after a few notes, held notes,
+     * dialog widgets and session buffers carve the heap into
+     * pieces no longer holding one contiguous 960 KB block, and
+     * a fresh per-note allocation then fails with NO MEMORY
+     * FOR NOTE even though total free PSRAM is ample. Held notes
+     * get their own exact-size copy; this buffer is never freed. */
+    if (!s_rec) {
+        s_rec = heap_caps_malloc(MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_rec) {
+            ESP_LOGI(TAG, "note buffer %u KB reserved: free internal %u, psram %u",
+                     (unsigned)(MAX_FRAMES * sizeof(int16_t) / 1024),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        } else {
+            ESP_LOGW(TAG, "note buffer not reserved at start; each note will try again");
+        }
+    }
+#endif
     /* Create the task FIRST, while internal heap is still ~10K (before
      * wake init consumes it): the task's TCB needs internal RAM and
      * would not fit after wake init leaves only ~100-200 bytes free.
