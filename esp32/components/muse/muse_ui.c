@@ -121,9 +121,6 @@ static lv_obj_t *s_canvas;
  * serves it strip by strip, like the avatar decoder, so no RAM copy. */
 extern const uint16_t moon_bg_data[];
 extern const lv_font_t moon_clock_font_32;
-static lv_image_dsc_t s_moon_src;
-static lv_draw_buf_t *s_moon_strips[STRIPS];
-static uint8_t s_moon_strip_busy[STRIPS];
 static lv_obj_t *s_moon_img;
 static lv_obj_t *s_clock_time, *s_clock_time_sh, *s_clock_date, *s_clock_date_sh;
 static bool s_sntp_started, s_time_synced, s_tz_set;
@@ -271,6 +268,13 @@ static const char *const MODE_NAMES[MUSE_MODE_COUNT] = {
 static lv_image_dsc_t s_muse_src;
 static lv_draw_buf_t *s_strips[STRIPS];
 static bool s_strip_busy[STRIPS];
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_185B
+/* Moon decoder strips live here, after STRIPS is defined above, not with
+ * the other moon statics near s_canvas, which sit before that #define. */
+static lv_image_dsc_t s_moon_src;
+static lv_draw_buf_t *s_moon_strips[STRIPS];
+static uint8_t s_moon_strip_busy[STRIPS];
+#endif
 static uint16_t *s_cells;       /* each cell's colour as last invalidated */
 static uint16_t *s_cell_row;    /* one screen row of Muse */
 static bool s_cells_valid;
@@ -3047,7 +3051,7 @@ static void update_status(muse_mode_t mode, float now)
     if (s_clock_time) {
         /* A fresh caption holds the band: real messages 5 s, status captions
          * (SPEAKER ON/OFF and friends) 2 s, then the clock returns. */
-        if (fresh && caption && caption[0]) {
+        if (fresh && caption[0]) {
             s_clock_hold_until_us =
                 esp_timer_get_time() + (dlg_is_status(caption) ? 2000000 : 5000000);
         }
