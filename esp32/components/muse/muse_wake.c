@@ -82,7 +82,7 @@ bool muse_wake_init(void)
         s_aec_mic_idx = s_aec->pcm_config.mic_ids[0];
         s_aec_ref_idx = s_aec->pcm_config.ref_ids[0];
         size_t frame_bytes = (size_t)s_aec_frame * sizeof(int16_t);
-        s_aec_indata = heap_caps_calloc(1, frame_bytes * (size_t)s_aec_nch, MALLOC_CAP_SPIRAM);
+        s_aec_indata = heap_caps_aligned_calloc(16, 1, frame_bytes * (size_t)s_aec_nch, MALLOC_CAP_SPIRAM);
         /* Room for a leftover partial frame plus one voice-task chunk. */
         size_t acc_bytes = ((size_t)s_aec_frame + 320) * sizeof(int16_t);
         s_aec_mic_acc = heap_caps_aligned_calloc(16, 1, acc_bytes, MALLOC_CAP_SPIRAM);

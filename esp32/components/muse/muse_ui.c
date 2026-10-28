@@ -116,12 +116,8 @@ static lv_obj_t *s_pair_title;
 static lv_obj_t *s_pair_hint;
 static lv_obj_t *s_canvas;
 #if CONFIG_MUSE_BOARD_WAVESHARE_S3_185B
-/* Full-screen moon background (1.85B face tile only) and the clock that lives
- * in the caption band. The moon data is flash (rodata); the moon decoder
- * serves it strip by strip, like the avatar decoder, so no RAM copy. */
-extern const uint16_t moon_bg_data[];
+/* Clock in the caption band (1.85B face tile only). */
 extern const lv_font_t moon_clock_font_32;
-static lv_obj_t *s_moon_img;
 static lv_obj_t *s_clock_time, *s_clock_time_sh, *s_clock_date, *s_clock_date_sh;
 static bool s_sntp_started, s_time_synced, s_tz_set;
 static int64_t s_clock_hold_until_us;
@@ -268,13 +264,6 @@ static const char *const MODE_NAMES[MUSE_MODE_COUNT] = {
 static lv_image_dsc_t s_muse_src;
 static lv_draw_buf_t *s_strips[STRIPS];
 static bool s_strip_busy[STRIPS];
-#if CONFIG_MUSE_BOARD_WAVESHARE_S3_185B
-/* Moon decoder strips live here, after STRIPS is defined above, not with
- * the other moon statics near s_canvas, which sit before that #define. */
-static lv_image_dsc_t s_moon_src;
-static lv_draw_buf_t *s_moon_strips[STRIPS];
-static uint8_t s_moon_strip_busy[STRIPS];
-#endif
 static uint16_t *s_cells;       /* each cell's colour as last invalidated */
 static uint16_t *s_cell_row;    /* one screen row of Muse */
 static bool s_cells_valid;
@@ -318,32 +307,6 @@ static lv_result_t muse_dec_get_area(lv_image_decoder_t *dec, lv_image_decoder_d
         return LV_RESULT_INVALID;
     }
     muse_pixel_scale((uint16_t *)buf->data, buf->header.stride / sizeof(uint16_t), full->x1, full->x2, y1, y2);
-#if CONFIG_MUSE_BOARD_WAVESHARE_S3_185B
-    /* WALL-E's background pixels are 0x0000; replace them with the moon pixel
-     * at the same face-tile position, so the moon shows through behind him.
-     * Face-tile-relative (not screen-absolute), so a mid-swipe frame has no
-     * seam: the avatar and the moon image move together with the tile. The
-     * moon asset is 360x360, so its bounds are 360, not s_w/s_h. */
-    if (s_moon_img) {
-        int stride = (int)buf->header.stride / (int)sizeof(uint16_t);
-        int ax = (s_w - s_canvas_px) / 2;
-        int ay = s_h / 2 + s_big_y - s_canvas_px / 2;
-        for (int32_t r = 0; r <= y2 - y1; r++) {
-            int my = ay + (int)y1 + (int)r;
-            if (my < 0 || my >= 360) {
-                continue;
-            }
-            uint16_t *row = (uint16_t *)buf->data + (size_t)r * stride;
-            for (int32_t c = 0; c <= full->x2 - full->x1; c++) {
-                if (row[c] != 0x0000) {
-                    continue;
-                }
-                int mx = ax + (int)full->x1 + (int)c;
-                row[c] = (mx < 0 || mx >= 360) ? 0x0000 : moon_bg_data[(size_t)my * 360 + mx];
-            }
-        }
-    }
-#endif
     area->x1 = full->x1;
     area->x2 = full->x2;
     area->y1 = y1;
@@ -394,97 +357,6 @@ static void muse_image_init(void)
 }
 
 #if CONFIG_MUSE_BOARD_WAVESHARE_S3_185B
-/* Moon background decoder: mirrors the avatar decoder exactly (same header
- * pattern, same strip handling), but serves rows from the flash moon array
- * instead of scaling the pixel grid. */
-static lv_result_t moon_dec_info(lv_image_decoder_t *dec, lv_image_decoder_dsc_t *dsc, lv_image_header_t *header)
-{
-    (void)dec;
-    if (dsc->src != &s_moon_src) {
-        return LV_RESULT_INVALID;
-    }
-    *header = s_moon_src.header;
-    return LV_RESULT_OK;
-}
-
-static lv_result_t moon_dec_open(lv_image_decoder_t *dec, lv_image_decoder_dsc_t *dsc)
-{
-    (void)dec;
-    if (dsc->src_type != LV_IMAGE_SRC_VARIABLE || dsc->src != &s_moon_src) {
-        return LV_RESULT_INVALID;
-    }
-    for (int i = 0; i < STRIPS; i++) {
-        if (!s_moon_strip_busy[i]) {
-            s_moon_strip_busy[i] = true;
-            dsc->user_data = s_moon_strips[i];
-            return LV_RESULT_OK;
-        }
-    }
-    return LV_RESULT_INVALID;
-}
-
-static lv_result_t moon_dec_get_area(lv_image_decoder_t *dec, lv_image_decoder_dsc_t *dsc,
-                                     const lv_area_t *full, lv_area_t *area)
-{
-    (void)dec;
-    int32_t y1 = area->y1 == LV_COORD_MIN ? full->y1 : area->y2 + 1;
-    if (y1 > full->y2) {
-        return LV_RESULT_INVALID;
-    }
-    int32_t y2 = LV_MIN(y1 + STRIP_ROWS - 1, full->y2);
-    int32_t w = lv_area_get_width(full);
-    lv_draw_buf_t *buf = lv_draw_buf_reshape(dsc->user_data, LV_COLOR_FORMAT_RGB565, w, y2 - y1 + 1,
-                                             LV_STRIDE_AUTO);
-    if (!buf) {
-        return LV_RESULT_INVALID;
-    }
-    for (int32_t r = 0; r <= y2 - y1; r++) {
-        int32_t y = y1 + r;
-        const uint16_t *src_row = moon_bg_data + (size_t)y * 360;
-        uint16_t *dst_row = (uint16_t *)buf->data + (size_t)r * (buf->header.stride / sizeof(uint16_t));
-        for (int32_t x = 0; x < w; x++) {
-            dst_row[x] = src_row[x];
-        }
-    }
-    area->x1 = full->x1;
-    area->x2 = full->x2;
-    area->y1 = y1;
-    area->y2 = y2;
-    dsc->decoded = buf;
-    return LV_RESULT_OK;
-}
-
-static void moon_dec_close(lv_image_decoder_t *dec, lv_image_decoder_dsc_t *dsc)
-{
-    (void)dec;
-    for (int i = 0; i < STRIPS; i++) {
-        if (s_moon_strips[i] == dsc->user_data) {
-            s_moon_strip_busy[i] = false;
-        }
-    }
-}
-
-static void moon_image_init(void)
-{
-    s_moon_src.header.magic = LV_IMAGE_HEADER_MAGIC;
-    s_moon_src.header.cf = LV_COLOR_FORMAT_RGB565;
-    s_moon_src.header.w = 360;
-    s_moon_src.header.h = 360;
-    s_moon_src.header.stride = 360 * sizeof(uint16_t);
-    s_moon_src.data = (const uint8_t *)&s_moon_src;   /* LVGL skips sources without data */
-    for (int i = 0; i < STRIPS; i++) {
-        s_moon_strips[i] = lv_draw_buf_create(360, STRIP_ROWS, LV_COLOR_FORMAT_RGB565, LV_STRIDE_AUTO);
-        assert(s_moon_strips[i]);
-    }
-    lv_image_decoder_t *dec = lv_image_decoder_create();
-    assert(dec);
-    lv_image_decoder_set_info_cb(dec, moon_dec_info);
-    lv_image_decoder_set_open_cb(dec, moon_dec_open);
-    lv_image_decoder_set_get_area_cb(dec, moon_dec_get_area);
-    lv_image_decoder_set_close_cb(dec, moon_dec_close);
-    dec->name = "moon";
-}
-
 static void sntp_sync_cb(struct timeval *tv)
 {
     (void)tv;
@@ -2092,14 +1964,6 @@ static void build_screen(void)
 
     /* The character. */
     muse_image_init();
-#if CONFIG_MUSE_BOARD_WAVESHARE_S3_185B
-    /* Moon first, so WALL-E draws on top of it. The moon image is 360x360,
-     * exactly the face tile, so centre alignment covers the tile. */
-    moon_image_init();
-    s_moon_img = lv_image_create(face);
-    lv_image_set_src(s_moon_img, &s_moon_src);
-    lv_obj_align(s_moon_img, LV_ALIGN_CENTER, 0, 0);
-#endif
     s_canvas = lv_image_create(face);
     lv_image_set_src(s_canvas, &s_muse_src);
     lv_obj_align(s_canvas, LV_ALIGN_CENTER, 0, s_big_y);

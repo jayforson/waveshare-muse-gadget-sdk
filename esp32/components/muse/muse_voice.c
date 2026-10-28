@@ -414,7 +414,7 @@ static int64_t s_barge_loud_us;   /* cleaned speech above threshold, continuous 
 static bool aec_barge_check(const int16_t *ref)
 {
     static int16_t mic[MUSE_AUDIO_CHUNK];
-    static int16_t cleaned[MUSE_AUDIO_CHUNK + 1024];
+    static int16_t cleaned[MUSE_AUDIO_CHUNK + 1024] __attribute__((aligned(16)));
     if (!s_call || muse_wake_aec_frame_size() == 0) {
         return false;
     }

@@ -60,7 +60,7 @@ if(CONFIG_MUSE_ENABLED)
         list(APPEND srcs "fonts/muse_font_cjk_16.c")   # captions' CJK fallback (rare chars)
     endif()
     if(CONFIG_MUSE_BOARD_WAVESHARE_S3_185B)
-        list(APPEND srcs "moon_bg.c" "fonts/moon_clock_font_32.c")   # face tile: moon background + clock digits
+        list(APPEND srcs "fonts/moon_clock_font_32.c")   # face tile: clock digits
     endif()
     # Your own character (tools/muse/AVATAR_RECIPE.md) stands in for the default
     # avatar when avatar/muse_pixel.c exists here; this avatar/ is gitignored. The
