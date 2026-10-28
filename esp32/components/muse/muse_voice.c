@@ -62,7 +62,7 @@ static const char *TAG = "muse_voice";
 #else
 #define HOLD_NOTES 0   /* no PSRAM: a press needs Hatch */
 #endif
-#define HELD_MAX 4
+#define HELD_MAX 1                            /* only the latest note is kept: a new held note drops the previous one */
 #define HELD_TRIES 8                            /* then a saved note is dropped */
 #define HELD_POLL_MS 5000                       /* resting with notes saved: check for Wi-Fi this often */
 #define HELD_KEEP_US (30LL * 60 * 1000000)      /* muse_voice_notes_waiting() */
@@ -699,14 +699,13 @@ static void back_off(void)
     s_send_backoff_us = s_send_backoff_us * 2 > RETRY_MAX_US ? RETRY_MAX_US : s_send_backoff_us * 2;
 }
 
-/* Saves the note just recorded to send later. `tried`: Hatch failed it, so it waits out the backoff. */
+static void drop_oldest(void);
+
+/* Saves the note just recorded to send later. `tried`: Hatch failed it, so it waits out the backoff.
+ * Only the latest note is kept: once the copy is safely allocated, any
+ * previously held note is dropped to make room for this one. */
 static void hold_rec(bool tried)
 {
-    if (s_held_count >= HELD_MAX) {   /* can_record() leaves room: not expected */
-        drop_rec();
-        go_idle("COULDN'T SAVE THE NOTE");
-        return;
-    }
     if (!s_rec_n) {   /* nothing captured: realloc to 0 would free s_rec and return NULL */
         drop_rec();
         go_idle("");
@@ -722,6 +721,9 @@ static void hold_rec(bool tried)
         return;
     }
     memcpy(pcm, s_rec, s_rec_n * sizeof(int16_t));
+    if (s_held_count >= HELD_MAX) {
+        drop_oldest();   /* keep only the latest: the previous note goes */
+    }
     s_held[s_held_count++] = (held_note_t){
         .pcm = pcm,
         .frames = s_rec_n,
@@ -1268,10 +1270,8 @@ static bool can_record(void)
         go_idle("SET UP MUSE FIRST");
         return false;
     }
-    if ((!ready || s_held_count) && s_held_count >= HELD_MAX) {
-        go_idle("NOTES STILL WAITING TO SEND");
-        return false;
-    }
+    /* No cap refusal: with HELD_MAX 1, a new note that ends up held
+     * drops the previous held note instead of being refused. */
     if (ready && s_held_count) {
         s_next_send_us = 0;   /* the saved ones go first, right after */
     }
