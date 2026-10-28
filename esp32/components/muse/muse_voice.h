@@ -28,6 +28,9 @@
  * it's back, on boards with PSRAM. Consumes muse_input_event_t from `queue` and
  * drives muse_state for the UI.
  */
+/* Takes the note buffer at app startup, before the UI carves the heap. */
+void muse_voice_reserve_note_buffer(void);
+
 esp_err_t muse_voice_start(QueueHandle_t queue);
 
 /* While on (settings' Sound page), idle mic audio feeds muse_voice_monitor_db(). */

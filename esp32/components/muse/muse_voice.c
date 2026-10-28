@@ -1484,23 +1484,15 @@ static void voice_task(void *arg)
     }
 }
 
-esp_err_t muse_voice_start(QueueHandle_t queue)
+/* Takes the note buffer while the heap is still clean. App startup
+ * calls this before the UI: by voice start, the UI's avatar cells,
+ * image buffer, strips and widgets (all in PSRAM) have already
+ * carved the heap, and the largest free block can be smaller than
+ * one note even though total free PSRAM looks ample. Kept for the
+ * life of the device; held notes get their own exact-size copy. */
+void muse_voice_reserve_note_buffer(void)
 {
-    s_queue = queue;
-    s_pre = heap_caps_malloc(PRE_CHUNKS * sizeof(pre_chunk_t), MUSE_BIG_CAPS);
-    if (!s_pre || muse_audio_init(muse_settings_volume(), muse_settings_mic_gain()) != ESP_OK) {
-        muse_state_set_mode(MUSE_MODE_ERROR);
-        muse_state_set_caption("AUDIO INIT FAILED");
-        return ESP_FAIL;
-    }
 #if HOLD_NOTES
-    /* One note buffer for the life of the device, taken while the
-     * PSRAM heap is still clean: after a few notes, held notes,
-     * dialog widgets and session buffers carve the heap into
-     * pieces no longer holding one contiguous 960 KB block, and
-     * a fresh per-note allocation then fails with NO MEMORY
-     * FOR NOTE even though total free PSRAM is ample. Held notes
-     * get their own exact-size copy; this buffer is never freed. */
     if (!s_rec) {
         s_rec = heap_caps_malloc(MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (s_rec) {
@@ -1513,6 +1505,18 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
         }
     }
 #endif
+}
+
+esp_err_t muse_voice_start(QueueHandle_t queue)
+{
+    s_queue = queue;
+    s_pre = heap_caps_malloc(PRE_CHUNKS * sizeof(pre_chunk_t), MUSE_BIG_CAPS);
+    if (!s_pre || muse_audio_init(muse_settings_volume(), muse_settings_mic_gain()) != ESP_OK) {
+        muse_state_set_mode(MUSE_MODE_ERROR);
+        muse_state_set_caption("AUDIO INIT FAILED");
+        return ESP_FAIL;
+    }
+    muse_voice_reserve_note_buffer();   /* fallback if app startup did not take it */
     /* Create the task FIRST, while internal heap is still ~10K (before
      * wake init consumes it): the task's TCB needs internal RAM and
      * would not fit after wake init leaves only ~100-200 bytes free.

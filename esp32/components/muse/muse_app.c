@@ -63,6 +63,10 @@ const muse_board_t *muse_board;
 void muse_app_run(const muse_board_t *board)
 {
     muse_board = board;
+    /* First, before board init and the UI carve the PSRAM heap:
+     * the note buffer needs one contiguous block, and by voice
+     * start the UI has already taken the heap apart. */
+    muse_voice_reserve_note_buffer();
     ESP_LOGI(TAG, "board: %s", board->name);
     ESP_ERROR_CHECK(board->init());
     ESP_ERROR_CHECK(muse_settings_init());
