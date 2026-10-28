@@ -1003,6 +1003,7 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
     }
     bool speech = false, manual = muse_input_talk_down();
     size_t speech_chunks = 0;
+    float wait_progress = 0;   /* ring fraction of the silence wait, frozen once speech starts */
     size_t gap = 0;
     bool released = false;
     size_t stop_at = MAX_FRAMES;
@@ -1047,7 +1048,23 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
             ESP_LOGI(TAG, "Muse in reach: streaming the note so far");
             go_live();
         }
-        muse_state_set_progress((float)n / MAX_FRAMES);
+        /* Ring: while waiting for speech it tracks the silence wait
+         * (full ring = hangup at 15 s), not the 30 s note cap; once
+         * speech starts it tracks the utterance toward the 30 s cap,
+         * never stepping back from the wait fraction already shown. */
+        if (!speech) {
+            wait_progress = 1.0f - (float)(*silence_deadline - esp_timer_get_time()) / (float)CALL_SILENCE_US;
+            if (wait_progress < 0) {
+                wait_progress = 0;
+            }
+            if (wait_progress > 1) {
+                wait_progress = 1;
+            }
+        }
+        {
+            float dur_progress = (float)n / MAX_FRAMES;
+            muse_state_set_progress(speech && dur_progress > wait_progress ? dur_progress : wait_progress);
+        }
         if (!heard && ok && tick) {
             muse_state_set_caption("%s %.1fs", s_live ? "LISTENING" : "RECORDING", (double)n / MUSE_AUDIO_RATE);
         }
