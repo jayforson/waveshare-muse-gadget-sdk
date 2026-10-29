@@ -55,11 +55,19 @@ static int16_t *s_feed_acc;    /* mic samples waiting for a full AFE frame */
 static size_t s_feed_acc_len;
 
 
+/* Measurement (v3.1): log free AND largest for every heap. Free alone
+ * lies: free big + largest small means fragmentation (space exists but
+ * no block fits), free and largest both small means true exhaustion.
+ * DMA is a subset view of internal RAM, not an additional heap. */
 static void heap_log(const char *what)
 {
-    ESP_LOGI(TAG, "%s: free internal %u, psram %u", what,
+    ESP_LOGI(TAG, "%s: free/largest internal %u/%u, psram %u/%u, dma %u/%u", what,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
 }
 
 bool muse_wake_init(void)

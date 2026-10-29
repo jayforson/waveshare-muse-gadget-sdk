@@ -24,6 +24,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "lvgl.h"
 #include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
@@ -1194,6 +1195,36 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
  * on/off repeatedly on a dead connection. A reply interrupted by
  * BOOT still starts the next utterance at once.
  */
+/* Measurement (v3.1, logging only): heap + LVGL + task stack peaks at
+ * the end of a call, when usage is at its worst. HWM is in words;
+ * bytes = words * 4. A task not created yet is skipped. */
+static void call_end_measure_log(void)
+{
+    lv_mem_monitor_t mon;
+    lv_mem_monitor(&mon);
+    ESP_LOGI(TAG, "call measure: free/largest internal %u/%u, psram %u/%u, dma %u/%u; lvgl blocks %u peak %uB used %u%% frag %u%%, psram free %uB biggest %uB",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+             (unsigned)mon.used_cnt, (unsigned)mon.max_used, (unsigned)mon.used_pct, (unsigned)mon.frag_pct,
+             (unsigned)mon.free_size, (unsigned)mon.free_biggest_size);
+    static const char *const tasks[] = {
+        "muse_voice", "muse_chat", "muse_tts", "noise_ctrl",
+        "muse_vm", "muse_input", "muse_serial", "lcd_send",
+    };
+    for (size_t i = 0; i < sizeof(tasks) / sizeof(tasks[0]); i++) {
+        TaskHandle_t h = xTaskGetHandle(tasks[i]);
+        if (h) {
+            UBaseType_t hw = uxTaskGetStackHighWaterMark(h);
+            ESP_LOGI(TAG, "call measure: stack %s hwm %u words (%u B)",
+                     tasks[i], (unsigned)hw, (unsigned)(hw * sizeof(StackType_t)));
+        }
+    }
+}
+
 static void call_run(void)
 {
     s_call = true;
@@ -1296,6 +1327,7 @@ static void call_run(void)
     muse_audio_chirp(0);
     go_idle(end_caption);
     pre_reset();
+    call_end_measure_log();
     ESP_LOGI(TAG, "call ended");
 }
 

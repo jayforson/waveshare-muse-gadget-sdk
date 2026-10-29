@@ -17,6 +17,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "lvgl.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
@@ -60,6 +61,27 @@ static void on_setting(muse_setting_t what)
 
 const muse_board_t *muse_board;
 
+/* Measurement (v3.1, logging only): one snapshot line per boot stage:
+ * free/largest for every heap plus LVGL's allocator stats (counters in
+ * muse_lv_mem.c). DMA is a subset view of internal RAM, not an extra
+ * heap. Safe to call before LVGL init: the monitor core only reads
+ * atomic counters and heap_caps. */
+static void app_heap_log(const char *what)
+{
+    lv_mem_monitor_t mon;
+    lv_mem_monitor(&mon);
+    ESP_LOGI(TAG, "%s: free/largest internal %u/%u, psram %u/%u, dma %u/%u; lvgl blocks %u peak %uB used %u%% frag %u%%, psram free %uB biggest %uB",
+             what,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+             (unsigned)mon.used_cnt, (unsigned)mon.max_used, (unsigned)mon.used_pct, (unsigned)mon.frag_pct,
+             (unsigned)mon.free_size, (unsigned)mon.free_biggest_size);
+}
+
 void muse_app_run(const muse_board_t *board)
 {
     muse_board = board;
@@ -67,6 +89,7 @@ void muse_app_run(const muse_board_t *board)
      * the note buffer needs one contiguous block, and by voice
      * start the UI has already taken the heap apart. */
     muse_voice_reserve_note_buffer();
+    app_heap_log("stage: note reserved");
     ESP_LOGI(TAG, "board: %s", board->name);
     ESP_ERROR_CHECK(board->init());
     ESP_ERROR_CHECK(muse_settings_init());
@@ -75,7 +98,7 @@ void muse_app_run(const muse_board_t *board)
     muse_battery_init();
     muse_state_set_caption("WAKING UP...");
     ESP_ERROR_CHECK(muse_ui_start());
-    ESP_LOGI(TAG, "UI built: free internal %u", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    app_heap_log("stage: UI built");
 
     QueueHandle_t q = xQueueCreate(16, sizeof(muse_input_event_t));
     ESP_ERROR_CHECK(muse_input_start(q));
@@ -98,11 +121,10 @@ void muse_app_run(const muse_board_t *board)
         muse_state_set_caption("%s", "");   /* the button icons say how to talk */
     }
 
+    app_heap_log("stage: voice started");
     muse_hatch_start();
     /* Home Link owns the radios; these just hand it the saved settings. */
     muse_wifi_apply();
     muse_ble_apply();
-    ESP_LOGI(TAG, "ready: free heap %u internal, %u psram",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    app_heap_log("stage: ready");
 }
