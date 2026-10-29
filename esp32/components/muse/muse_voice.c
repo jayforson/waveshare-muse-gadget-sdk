@@ -772,7 +772,12 @@ static void drop_oldest(void)
 {
     free(s_held[0].pcm);
     s_held_count--;
+#if HELD_MAX > 1
+    /* With a cap of 1 there is never a second element to shift, and
+     * keeping this line would read s_held + 1 past a 1-element array,
+     * which GCC rejects under -Werror=stringop-overread. */
     memmove(s_held, s_held + 1, s_held_count * sizeof(s_held[0]));
+#endif
     if (!s_held_count) {
         s_next_send_us = 0;
         s_send_backoff_us = RETRY_MIN_US;
