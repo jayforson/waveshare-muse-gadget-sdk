@@ -1220,6 +1220,11 @@ static void call_run(void)
     bool got_reply = false;
     const char *end_caption = "";
     for (;;) {
+        /* A dropped utterance must not extend the silence budget:
+         * remember the deadline from before this capture, so a
+         * CALL_CANCELLED below can restore it instead of starting
+         * a fresh 15 s window. */
+        int64_t deadline_before = silence_deadline;
         call_outcome_t u = capture_call_utterance(barge_in, &silence_deadline);
         barge_in = false;
         if (u == CALL_HANGUP) {
@@ -1235,11 +1240,15 @@ static void call_run(void)
             /* Dropped utterance (cough, too short): before any reply
              * this ends the wake call instead of recapturing. Once a
              * reply has enabled follow-up, it only drops that
-             * utterance and listening continues. */
+             * utterance and listening continues, but the silence
+             * budget is NOT extended: the deadline is restored to
+             * what it was before this capture (15 s after the last
+             * reply), so a blip cannot restart a fresh 15 s window
+             * and total silence stays bounded at 15 s. */
             if (!got_reply) {
                 break;
             }
-            silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
+            silence_deadline = deadline_before;
             pre_reset();
             continue;
         }
