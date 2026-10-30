@@ -95,7 +95,7 @@ static int64_t s_link_reset_armed_us;
 static lv_obj_t *s_ble_sw, *s_ble_status;
 
 /* Sound page. */
-static lv_obj_t *s_spk_sw, *s_vol_val, *s_vol_sl, *s_gain_val, *s_gain_sl, *s_sw_val, *s_sw_sl, *s_bright_val, *s_bright_sl, *s_mic_bar, *s_mic_val;
+static lv_obj_t *s_spk_sw, *s_vol_val, *s_vol_sl, *s_gain_val, *s_gain_sl, *s_sw_val, *s_sw_sl, *s_sil_val, *s_sil_sl, *s_bright_val, *s_bright_sl, *s_mic_bar, *s_mic_val;
 
 /* Sleep page. */
 static const int SLEEP_CHOICES[] = { 0, 30, 60, 120, 300, 600 };
@@ -1021,6 +1021,15 @@ static void on_sw_gain(lv_event_t *e)
     }
 }
 
+static void on_silence(lv_event_t *e)
+{
+    int secs = lv_slider_get_value(s_sil_sl);
+    set_val(s_sil_val, "%ds", secs);
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+        muse_settings_set_silence_s(secs);
+    }
+}
+
 static void on_bright(lv_event_t *e)
 {
     int v = lv_slider_get_value(s_bright_sl);
@@ -1040,6 +1049,7 @@ static void build_sound_page(lv_obj_t *tile)
     s_vol_sl = slider(list, "Volume", 0, 100, muse_settings_volume(), &s_vol_val, on_volume);
     s_gain_sl = slider(list, "Mic gain", 0, MUSE_MIC_GAIN_MAX / 3, muse_settings_mic_gain() / 3, &s_gain_val, on_gain);
     s_sw_sl = slider(list, "SW gain", 1, MUSE_SW_GAIN_MAX, muse_settings_sw_gain(), &s_sw_val, on_sw_gain);
+    s_sil_sl = slider(list, "Silence timeout", MUSE_SILENCE_S_MIN, MUSE_SILENCE_S_MAX, muse_settings_silence_s(), &s_sil_val, on_silence);
 
     lv_obj_t *meter = lv_obj_create(list);
     lv_obj_remove_style_all(meter);
@@ -1062,6 +1072,7 @@ static void build_sound_page(lv_obj_t *tile)
     set_val(s_vol_val, "%d%%", muse_settings_volume());
     set_val(s_gain_val, "%d dB", muse_settings_mic_gain() / 3 * 3);
     set_val(s_sw_val, "x%d", muse_settings_sw_gain());
+    set_val(s_sil_val, "%ds", muse_settings_silence_s());
     set_val(s_bright_val, "%d%%", muse_settings_brightness());
 }
 

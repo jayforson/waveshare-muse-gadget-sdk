@@ -39,6 +39,7 @@ static struct {
     bool wake_on_battery;
     uint8_t mic_gain;
     uint8_t sw_gain;
+    uint8_t silence_s;
     uint8_t brightness;
     uint16_t sleep_s;
     bool wifi_on;
@@ -54,6 +55,7 @@ static struct {
     .push_announce = true,
     .mic_gain = 30,
     .sw_gain = 2,
+    .silence_s = MUSE_SILENCE_S_DEFAULT,
     .brightness = 100,
     .sleep_s = 120,
     .wifi_on = true,
@@ -135,6 +137,7 @@ esp_err_t muse_settings_init(void)
     }
     load_u8("mic_gain", &s.mic_gain);
     load_u8("sw_gain", &s.sw_gain);
+    load_u8("silence_s", &s.silence_s);
     load_u8("bright", &s.brightness);
     nvs_get_u16(s_nvs, "sleep_s", &s.sleep_s);
     if (nvs_get_u8(s_nvs, "wifi_on", &b) == ESP_OK) {
@@ -152,6 +155,7 @@ esp_err_t muse_settings_init(void)
     s.volume = clampi(s.volume, 0, 100);
     s.mic_gain = clampi(s.mic_gain, 0, MUSE_MIC_GAIN_MAX);
     s.sw_gain = clampi(s.sw_gain, 1, MUSE_SW_GAIN_MAX);
+    s.silence_s = clampi(s.silence_s, MUSE_SILENCE_S_MIN, MUSE_SILENCE_S_MAX);
     s.brightness = clampi(s.brightness, 10, 100);
     ESP_LOGI(TAG, "all messages %s", s.pushes_on ? "on" : "off");
     ESP_LOGI(TAG, "push announcements %s", s.push_announce ? "on" : "off");
@@ -173,6 +177,7 @@ bool muse_settings_push_announce(void) { return s.push_announce; }
 bool muse_settings_wake_on_battery(void) { return s.wake_on_battery; }
 int muse_settings_mic_gain(void) { return s.mic_gain; }
 int muse_settings_sw_gain(void) { return s.sw_gain; }
+int muse_settings_silence_s(void) { return s.silence_s; }
 int muse_settings_brightness(void) { return s.brightness; }
 int muse_settings_sleep_s(void) { return s.sleep_s; }
 bool muse_settings_wifi_on(void) { return s.wifi_on; }
@@ -261,6 +266,14 @@ void muse_settings_set_sw_gain(int mul)
     s.sw_gain = clampi(mul, 1, MUSE_SW_GAIN_MAX);
     save_u8("sw_gain", s.sw_gain);
     notify(MUSE_SETTING_SW_GAIN);
+}
+
+/* No notify: the voice task polls the getter where the window is used,
+ * so a change applies to the next window without a hardware update. */
+void muse_settings_set_silence_s(int secs)
+{
+    s.silence_s = clampi(secs, MUSE_SILENCE_S_MIN, MUSE_SILENCE_S_MAX);
+    save_u8("silence_s", s.silence_s);
 }
 
 void muse_settings_set_brightness(int pct)

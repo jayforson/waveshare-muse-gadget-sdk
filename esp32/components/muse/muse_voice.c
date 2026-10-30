@@ -86,7 +86,8 @@ static volatile uint32_t s_snore_ms;   /* when a snore was asked for (ms since b
  * in and within reach of Muse; idle_capture feeds the wake-word engine
  * and sets s_wake_fired. A call is the same turn machinery as a
  * push-to-talk note, looped: listen (voice activity ends the utterance),
- * send, play the reply, listen again, until 5 s of silence or a
+ * send, play the reply, listen again, until the silence timeout
+ * (Settings, default 5 s) or a
  * hangup. s_call is also read by the input task (BOOT short press
  * during a call hangs up instead of sleeping).
  */
@@ -105,7 +106,8 @@ static char s_last_heard[96];    /* transcript of the utterance in progress */
  * is filtered out by the length cap. Bare acknowledgements like a
  * lone "好的" are deliberately NOT closings: they are too ambiguous
  * (they also answer commands), so those calls still open follow-up,
- * now only for 5 s of silence instead of 30 s. */
+ * now only for the silence timeout (Settings, default 5 s)
+ * instead of 30 s. */
 static bool reply_is_closing(const char *text)
 {
     if (!text || !text[0]) {
@@ -156,7 +158,12 @@ static volatile bool s_wake_fired;
 #define CALL_SPEECH_DB (-45.0f)    /* speech starts above this */
 #define CALL_SILENCE_DB (-50.0f)   /* an utterance ends below this */
 #define CALL_GAP_CHUNKS 75         /* 1.5 s of silence ends an utterance */
-#define CALL_SILENCE_US (5LL * 1000000)   /* no speech this long hangs up */
+/* No-speech hangup window, from Settings (default 5 s, 3..30 s);
+ * polled live, so a change applies to the next window. */
+static int64_t silence_window_us(void)
+{
+    return (int64_t)muse_settings_silence_s() * 1000000;
+}
 
 /* Call capture outcomes. */
 typedef enum {
@@ -1152,7 +1159,7 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
                 speech = true;
                 gap = 0;
                 muse_state_poke();
-                *silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
+                *silence_deadline = esp_timer_get_time() + silence_window_us();
             } else if (esp_timer_get_time() > *silence_deadline) {
                 muse_hatch_turn_cancel();
                 drop_rec();
@@ -1162,14 +1169,14 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
                 /* A BOOT hold released without speech: the user is
                  * there, so the watchdog starts over. */
                 manual = false;
-                *silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
+                *silence_deadline = esp_timer_get_time() + silence_window_us();
             }
             continue;
         }
         /* Speech heard: any loud chunk pushes the watchdog out. */
         if (db > CALL_SILENCE_DB) {
             gap = 0;
-            *silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
+            *silence_deadline = esp_timer_get_time() + silence_window_us();
         } else if (!manual) {
             gap++;
         }
@@ -1239,7 +1246,7 @@ static void call_run(void)
     muse_audio_chirp(1);
     pre_reset();
     ESP_LOGI(TAG, "call started");
-    int64_t silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
+    int64_t silence_deadline = esp_timer_get_time() + silence_window_us();
     /* First capture follows the rising chirp: skip its 200 ms tail
      * the same way a capture after an interrupted reply does, so
      * the chirp cannot false-trigger speech and cut a silent first
@@ -1252,7 +1259,7 @@ static void call_run(void)
         /* A dropped utterance must not extend the silence budget:
          * remember the deadline from before this capture, so a
          * CALL_CANCELLED below can restore it instead of starting
-         * a fresh 5 s window. */
+         * a fresh silence window. */
         int64_t deadline_before = silence_deadline;
         call_outcome_t u = capture_call_utterance(barge_in, &silence_deadline);
         barge_in = false;
@@ -1271,9 +1278,10 @@ static void call_run(void)
              * reply has enabled follow-up, it only drops that
              * utterance and listening continues, but the silence
              * budget is NOT extended: the deadline is restored to
-             * what it was before this capture (5 s after the last
-             * reply), so a blip cannot restart a fresh 5 s window
-             * and total silence stays bounded at 5 s. */
+             * what it was before this capture (the silence window
+             * after the last reply), so a blip cannot restart a
+             * fresh silence window and total silence stays bounded
+             * at the silence window. */
             if (!got_reply) {
                 break;
             }
@@ -1290,7 +1298,7 @@ static void call_run(void)
             /* BOOT barge-in: the user is speaking, so listen
              * again at once. */
             barge_in = true;
-            silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
+            silence_deadline = esp_timer_get_time() + silence_window_us();
             pre_reset();
             continue;
         }
@@ -1317,7 +1325,7 @@ static void call_run(void)
         muse_state_make_happy();
         muse_state_set_mode(MUSE_MODE_LISTENING);
         muse_state_poke();
-        silence_deadline = esp_timer_get_time() + CALL_SILENCE_US;
+        silence_deadline = esp_timer_get_time() + silence_window_us();
         pre_reset();
     }
     s_call = false;

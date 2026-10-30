@@ -36,6 +36,9 @@
 
 #define MUSE_MIC_GAIN_MAX 36      /* dB; ES7210 PGA, applied in 3 dB steps */
 #define MUSE_SW_GAIN_MAX 4        /* software gain multiplier, 1..4 */
+#define MUSE_SILENCE_S_MIN 3      /* no-speech hangup window, seconds */
+#define MUSE_SILENCE_S_MAX 30
+#define MUSE_SILENCE_S_DEFAULT 5
 
 typedef enum {
     MUSE_SETTING_VOLUME,
@@ -64,6 +67,7 @@ bool muse_settings_push_announce(void);  /* on (default): pushed messages are sp
 bool muse_settings_wake_on_battery(void);  /* on: Jarvis wake arms even when the board reports battery */
 int muse_settings_mic_gain(void);       /* dB, 0..MUSE_MIC_GAIN_MAX */
 int muse_settings_sw_gain(void);        /* multiplier, 1..MUSE_SW_GAIN_MAX */
+int muse_settings_silence_s(void);      /* no-speech hangup window, seconds */
 int muse_settings_brightness(void);     /* 10..100 */
 int muse_settings_sleep_s(void);        /* 0 = never */
 bool muse_settings_wifi_on(void);
@@ -82,6 +86,7 @@ void muse_settings_set_push_announce(bool on);
 void muse_settings_set_wake_on_battery(bool on);
 void muse_settings_set_mic_gain(int db);
 void muse_settings_set_sw_gain(int mul);
+void muse_settings_set_silence_s(int secs);
 void muse_settings_set_brightness(int pct);
 void muse_settings_set_sleep_s(int secs);
 void muse_settings_set_wifi_on(bool on);
