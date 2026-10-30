@@ -110,8 +110,8 @@ static const char *TAG = "muse_chat_session";
 #define AUTO_RETRY_MIN_US (5 * 1000000LL)  /* connecting without a turn, after a failure */
 #define AUTO_RETRY_MAX_US (120 * 1000000LL)
 #define FINAL_TIMEOUT_US (15 * 1000000LL)  /* release -> final transcript */
-#define REPLY_TIMEOUT_US (10 * 60 * 1000000LL)  /* chat posted -> first assistant message */
-#define TURN_CAP_US (11 * 60 * 1000000LL)  /* must exceed the reply timeout: the turn stays open while waiting */
+#define REPLY_TIMEOUT_US (60 * 1000000LL)  /* chat posted -> first assistant message */
+#define TURN_CAP_US (180 * 1000000LL)
 #define SETTLE_US (3 * 1000000LL)          /* quiet period that ends a turn */
 #define BUSY_HOLD_US (20 * 1000000LL)      /* how long a busy agent keeps it open */
 #define TEXT_REPLY_TIMEOUT_US (5 * 60 * 1000000LL)   /* typed turns: agents can work a while */
@@ -963,23 +963,152 @@ static void turn_reset_streams(void)
 }
 
 static void remember_shown(const char *id);
+static bool was_shown(const char *id);
 
-/* The user message of the newest voice turn that died with NO REPLY and no
- * message received. A push replying to it is the answer the user is still
- * waiting for, so it plays aloud even with announcements off. Single slot:
- * the newest unanswered turn wins. One-shot: consumed when a matching push
- * turn starts (or matches mid-turn). UUIDs never collide, so a stale record
- * can't misfire a later push. Declared here, before turn_finish and
- * turn_fail use them. */
-static char s_late_id[sizeof(msg_t::id)];
-static bool s_late_valid;
-static int64_t s_late_us;  /* when the watched turn failed */
+/* Conversation window: 10 minutes from the last outgoing message (or
+ * from a turn that ended still owing a reply). While it runs, every
+ * push reads aloud, as if Speak all were on; when it lapses, pushes go
+ * back to being dropped with Speak all off. It is only ever (re)started
+ * by outgoing sends and by qualifying turn ends, never by an incoming
+ * push, so automatic pushes cannot keep it alive forever. A timestamp,
+ * not a task: about 16 bytes, no allocation. Declared here, before
+ * turn_finish and turn_fail use it. */
+static int64_t s_conv_us;  /* 0 = window inactive */
+static const int64_t CONV_WINDOW_US = 10 * 60 * 1000000LL;
 
-/* A push within this long after the fail is the late reply. Covers the
- * observed latencies (about 10 s in tests, about 150 s once) with
- * margin, while bounding the false-positive window: an unrelated push
- * can only misfire inside it. */
-static const int64_t LATE_WINDOW_US = 10 * 60 * 1000000LL;
+static void conv_timer_reset(void)
+{
+    s_conv_us = now_us();
+}
+
+static bool conv_timer_active(void)
+{
+    if (!s_conv_us) {
+        return false;
+    }
+    if (now_us() - s_conv_us > CONV_WINDOW_US) {
+        s_conv_us = 0;  /* lapse lazily, so it stops logging as active */
+        return false;
+    }
+    return true;
+}
+
+/* Push queue: pushes accepted while the voice task is busy playing
+ * something (or while a push is already pending) wait here instead of
+ * being dropped. Each slot holds only the message text (at most
+ * TEXT_MAX); TTS is fetched only when the slot becomes current, after
+ * the previous message is played and discarded, so peak speech memory
+ * is unchanged. Fixed 4 slots in PSRAM: about 4.5 KB. Session task
+ * only; the voice task never touches it (it only flips the pending
+ * flag and the flush request below). */
+#define PUSH_QUEUE_MAX 4
+struct push_queue_slot {
+    bool used;
+    bool done;
+    char id[sizeof(msg_t::id)];
+    char text[TEXT_MAX + 1];
+    size_t len;
+};
+static push_queue_slot *s_push_queue;  /* psram, PUSH_QUEUE_MAX slots */
+static int s_push_queue_head;          /* oldest slot */
+static int s_push_queue_count;
+static std::atomic<bool> s_push_queue_flush{false};  /* voice task asks, session task flushes */
+
+static bool push_queue_ensure(void)
+{
+    if (s_push_queue) {
+        return true;
+    }
+    s_push_queue = static_cast<push_queue_slot *>(
+        psram_alloc(sizeof(push_queue_slot) * PUSH_QUEUE_MAX));
+    if (!s_push_queue) {
+        ESP_LOGW(TAG, "push queue: out of PSRAM, pushes will be dropped");
+        return false;
+    }
+    memset(s_push_queue, 0, sizeof(push_queue_slot) * PUSH_QUEUE_MAX);
+    return true;
+}
+
+static int push_queue_find(const char *id)
+{
+    if (!s_push_queue || !id) {
+        return -1;
+    }
+    for (int n = 0; n < s_push_queue_count; n++) {
+        int i = (s_push_queue_head + n) % PUSH_QUEUE_MAX;
+        if (s_push_queue[i].used && !strcmp(s_push_queue[i].id, id)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool push_queue_has(const char *id)
+{
+    return push_queue_find(id) >= 0;
+}
+
+/* Enqueue a push. text may be null (streaming: not arrived yet).
+ * False when already queued, already shown, or the queue is full:
+ * the caller then leaves the push for the app, as before. */
+static bool push_queue_push(const char *id, const char *text, bool done)
+{
+    if (!id || push_queue_has(id) || was_shown(id)) {
+        return false;
+    }
+    if (!push_queue_ensure() || s_push_queue_count >= PUSH_QUEUE_MAX) {
+        ESP_LOGI(TAG, "push: queue full, message %s left for the app", id);
+        return false;
+    }
+    int i = (s_push_queue_head + s_push_queue_count) % PUSH_QUEUE_MAX;
+    push_queue_slot &slot = s_push_queue[i];
+    slot = push_queue_slot{};
+    slot.used = true;
+    slot.done = done;
+    strlcpy(slot.id, id, sizeof(slot.id));
+    if (text && text[0]) {
+        strlcpy(slot.text, text, sizeof(slot.text));
+        slot.len = strlen(slot.text);
+    }
+    s_push_queue_count++;
+    ESP_LOGI(TAG, "push: queued message %s (%d waiting)", id, s_push_queue_count);
+    return true;
+}
+
+static bool push_queue_append(const char *id, const char *text)
+{
+    int i = push_queue_find(id);
+    if (i < 0 || s_push_queue[i].done || !text || !text[0]) {
+        return false;
+    }
+    push_queue_slot &slot = s_push_queue[i];
+    size_t before = slot.len;
+    strlcat(slot.text, text, sizeof(slot.text));
+    slot.len = strlen(slot.text);
+    return slot.len > before;
+}
+
+static bool push_queue_mark_done(const char *id)
+{
+    int i = push_queue_find(id);
+    if (i < 0) {
+        return false;
+    }
+    s_push_queue[i].done = true;
+    return true;
+}
+
+static void push_queue_flush(void)
+{
+    if (!s_push_queue) {
+        return;
+    }
+    for (int i = 0; i < PUSH_QUEUE_MAX; i++) {
+        s_push_queue[i].used = false;
+    }
+    s_push_queue_head = 0;
+    s_push_queue_count = 0;
+}
 
 static void turn_finish(void)
 {
@@ -997,15 +1126,17 @@ static void turn_finish(void)
 static void turn_fail(const char *why)
 {
     ESP_LOGW(TAG, "turn failed: %s", why);
-    if (!s_turn.text && !s_turn.nmsgs && !strcmp(why, "NO REPLY FROM MUSE") && s_turn.user_ids[0][0]) {
-        /* The user is still waiting for this answer: remember the turn's
-         * user message so a later push replying to it plays aloud even
-         * with announcements off. A fail without an ack leaves any older
-         * watch untouched. */
-        strlcpy(s_late_id, s_turn.user_ids[0], sizeof(s_late_id));
-        s_late_valid = true;
-        s_late_us = now_us();
-        ESP_LOGI(TAG, "late reply watch: user %s", s_late_id);
+    /* The conversation window restarts when a turn ends still owing its
+     * reply: the 1-minute timeout deferral, a lost connection, or a
+     * settings change. It does NOT restart on user ends (CANCELLED,
+     * INTERRUPTED) or on sends that never went out (CAN'T REACH,
+     * DIDN'T CATCH THAT), where no reply is coming. A cancel neither
+     * restarts nor clears it: it lapses on its own, and a new send
+     * restarts it anyway. */
+    if (!strcmp(why, "WAITING FOR MUSE RESPONSE") ||
+        !strcmp(why, "LOST CONNECTION TO MUSE") ||
+        !strcmp(why, "SETTINGS CHANGED")) {
+        conv_timer_reset();
     }
     if (s_turn.text) {
         muse_hatch_console("error", why, nullptr);
@@ -1017,6 +1148,11 @@ static void turn_fail(const char *why)
 /* Ends the turn once its reply is in; `complete` is false when it was cut off. */
 static void turn_done(bool complete)
 {
+    if (!complete) {
+        /* Cut off with messages unfinished (the time cap): the full
+         * reply may still arrive as a push, so restart the window. */
+        conv_timer_reset();
+    }
     if (s_turn.text) {
         muse_hatch_console("done", nullptr, "\"messages\":%d,\"complete\":%s", s_turn.nmsgs,
                            complete ? "true" : "false");
@@ -1205,6 +1341,7 @@ static bool record_note(void)
     s_turn.chat_posted = true;
     s_turn.chat_us = s_turn.last_event_us = now_us();
     s_turn.phase = P_WAIT_REPLY;
+    conv_timer_reset();  /* outgoing send: the window runs from here */
     return true;
 }
 
@@ -1238,6 +1375,7 @@ static void send_chat(const char *text, const char *modality)
     s_turn.body_sent = len;
     s_turn.chat_us = s_turn.last_event_us = now_us();
     s_turn.phase = P_WAIT_REPLY;
+    conv_timer_reset();  /* outgoing send: the window runs from here */
 }
 
 static void post_chat(const char *text)
@@ -1354,52 +1492,17 @@ static bool turn_start(uint32_t gen, bool text);
 
 /* The message a push replies to, if the event carries one. Mirrors msg_id:
  * payload first, then the event object, empty treated as missing. */
-static const char *msg_parent(cJSON *payload, cJSON *line)
+/* Start a push turn. text is null for a streaming push (its text
+ * arrives via deltas); for a complete push it is the full text and
+ * done is true. When the voice task is busy, the push waits in the
+ * queue instead of being dropped; a push that cannot be queued is
+ * left for the app, as before. */
+static void push_begin(const char *id, const char *text, bool done)
 {
-    const char *parent = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "reply_to_message_id"));
-    if (!parent || !parent[0]) {
-        parent = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "parent_message_id"));
-    }
-    if (!parent || !parent[0]) {
-        parent = cJSON_GetStringValue(cJSON_GetObjectItem(line, "reply_to_message_id"));
-    }
-    if (!parent || !parent[0]) {
-        parent = cJSON_GetStringValue(cJSON_GetObjectItem(line, "parent_message_id"));
-    }
-    return parent && parent[0] ? parent : nullptr;
-}
-
-static bool late_parent_match(const char *parent)
-{
-    return s_late_valid && parent && parent[0] && !strcmp(parent, s_late_id);
-}
-
-/* The watch is fresh: any push inside the window after the fail may be
- * the late reply. The server does not thread pushes to the failed
- * message (their parent is absent, or the message's own id), so timing
- * is the signal. Not one-shot: an unrelated push inside the window must
- * not consume the watch and block the real reply arriving later in the
- * window. A redelivery is still deduped by was_shown. Expired watches
- * are cleared here so they stop logging as active. */
-static bool late_window_open(void)
-{
-    if (!s_late_valid) {
-        return false;
-    }
-    if (now_us() - s_late_us > LATE_WINDOW_US) {
-        s_late_valid = false;
-        return false;
-    }
-    return true;
-}
-
-static void push_begin(const char *id, bool late)
-{
-    /* Only between turns, with the voice task free to play it. The
-     * Speak-all drop for automatic pushes already happened in
-     * push_maybe_begin; a late reply reaches here even with Speak all off. */
     if (muse_state_mode(nullptr) != MUSE_MODE_IDLE || s_push_pending.load()) {
-        ESP_LOGI(TAG, "push: busy, message %s left for the app", id);
+        if (!push_queue_push(id, text, done)) {
+            ESP_LOGI(TAG, "push: busy, message %s left for the app", id);
+        }
         return;
     }
     uint32_t gen = ++s_gen;
@@ -1409,13 +1512,6 @@ static void push_begin(const char *id, bool late)
     s_turn.phase = P_WAIT_REPLY;
     s_turn.chat_us = s_turn.last_event_us = now_us();
     s_turn.push_turn = true;
-    if (late) {
-        /* The watch stays valid for the full window (see
-         * late_window_open): a redelivery is deduped by was_shown, but an
-         * unrelated push must not consume the watch before the real
-         * reply arrives. */
-        ESP_LOGI(TAG, "push: late reply to failed turn, playing aloud");
-    }
     s_push_pending = true;
     ESP_LOGI(TAG, "push: message %s with no turn waiting, playing it", id);
 }
@@ -1430,23 +1526,31 @@ static void push_maybe_begin(const char *event, cJSON *payload, cJSON *line)
         return;
     }
     const char *id = msg_id(payload, line);
-    if (id && !was_shown(id)) {
-        const char *parent = msg_parent(payload, line);
-        bool window = late_window_open();
-        bool late = late_parent_match(parent) || window;
-        if (s_late_valid) {
-            ESP_LOGI(TAG, "push: watch active, id %s parent %s watch %s late %d window %d",
-                     id, parent ? parent : "(none)", s_late_id, (int)late, (int)window);
-        }
-        if (!late && !muse_settings_speak_all()) {
-            /* Automatic push with Speak all off: drop it at the door. No
-             * turn, no TTS, no decode, so it can neither wake the screen
-             * nor wedge the speech worker. Left for the app. */
-            ESP_LOGI(TAG, "push: automatic, Speak all off, dropping %s", id);
-            return;
-        }
-        push_begin(id, late);
+    if (!id || was_shown(id) || push_queue_has(id)) {
+        return;  /* already shown, or already queued */
     }
+    bool conv = conv_timer_active();
+    if (s_conv_us) {
+        ESP_LOGI(TAG, "push: conversation window active, id %s", id);
+    }
+    if (!conv && !muse_settings_speak_all()) {
+        /* Automatic push with Speak all off and no window: drop it at
+         * the door. No turn, no TTS, no decode, so it can neither wake
+         * the screen nor wedge the speech worker. Left for the app. */
+        ESP_LOGI(TAG, "push: automatic, Speak all off, dropping %s", id);
+        return;
+    }
+    /* A complete push carries its text; a streaming push starts empty
+     * and fills via deltas (into the turn, or into its queue slot). */
+    bool full = !strcmp(event, "message.assistant");
+    const char *text = nullptr;
+    if (full) {
+        text = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "display_text"));
+        if (!text) {
+            text = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "content"));
+        }
+    }
+    push_begin(id, text, full);
 }
 
 static int find_msg(const char *id)
@@ -1579,6 +1683,58 @@ static const char *msg_id(cJSON *payload, cJSON *event)
     return id && id[0] ? id : nullptr;
 }
 
+/* Start the oldest queued push as its own push turn, pre-filled with
+ * the text it arrived with. Called from the session loop when the
+ * voice task is idle and no push is pending. A slot accepted while
+ * the window was active plays even if the window has since lapsed:
+ * it was accepted, so it drains. */
+static void push_begin_queued(void)
+{
+    if (!s_push_queue || s_push_queue_count <= 0) {
+        return;
+    }
+    push_queue_slot slot = s_push_queue[s_push_queue_head];
+    s_push_queue[s_push_queue_head].used = false;
+    s_push_queue_head = (s_push_queue_head + 1) % PUSH_QUEUE_MAX;
+    s_push_queue_count--;
+    uint32_t gen = ++s_gen;
+    if (!turn_start(gen, false)) {
+        return;
+    }
+    s_turn.phase = P_WAIT_REPLY;
+    s_turn.chat_us = s_turn.last_event_us = now_us();
+    s_turn.push_turn = true;
+    msg_t &m = s_turn.msgs[0];
+    m = msg_t{};
+    strlcpy(m.id, slot.id, sizeof(m.id));
+    if (slot.len) {
+        append_text(m, slot.text);
+    }
+    m.done = slot.done;
+    if (slot.done && m.len && m.tts == TTS_NONE) {
+        m.tts = TTS_QUEUED;  /* like message_done: start_tts picks it up */
+    }
+    s_turn.nmsgs = 1;
+    show_reply_start(m);  /* emits EV_REPLY so the voice task starts playback */
+    s_push_pending = true;
+    ESP_LOGI(TAG, "push: playing queued message %s", slot.id);
+}
+
+/* Queued pushes, drained by the session loop when the voice task is
+ * idle. A user takeover (press/wake) asks for a flush first, so stale
+ * queued pushes do not play after the user's new turn. */
+static void push_queue_drain_if_idle(void)
+{
+    if (s_push_queue_flush.exchange(false)) {
+        push_queue_flush();
+        ESP_LOGI(TAG, "push: queue flushed by user takeover");
+    }
+    if (s_turn.phase == P_IDLE && muse_state_mode(nullptr) == MUSE_MODE_IDLE &&
+        !s_push_pending.load() && s_push_queue_count > 0) {
+        push_begin_queued();
+    }
+}
+
 static void on_event(cJSON *line)
 {
     if (strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(line, "type")) ?: "", "event") != 0) {
@@ -1596,6 +1752,20 @@ static void on_event(cJSON *line)
     cJSON *payload = cJSON_GetObjectItem(line, "payload");
     push_maybe_begin(event, payload, line);
     if (s_turn.phase != P_WAIT_REPLY) {
+        /* A queued push still streaming while idle: fill its slot. */
+        if (!strcmp(event, "delta.text_append") || !strcmp(event, "delta.message_done")) {
+            const char *qid = msg_id(payload, line);
+            if (qid && push_queue_has(qid)) {
+                if (!strcmp(event, "delta.text_append")) {
+                    const char *t = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "text"));
+                    if (t) {
+                        push_queue_append(qid, t);
+                    }
+                } else {
+                    push_queue_mark_done(qid);
+                }
+            }
+        }
         return;
     }
 
@@ -1624,6 +1794,36 @@ static void on_event(cJSON *line)
     const char *id = msg_id(payload, line);
     int i = id ? bind_msg(id, payload) : -1;
     if (i < 0) {
+        /* Not part of this turn: a late reply to an earlier message
+         * arriving during a new turn, or a turn that overflowed. Queue
+         * it for after the turn when the conversation window is active
+         * or Speak all is on, instead of losing it. */
+        if (id && !was_shown(id) && (conv_timer_active() || muse_settings_speak_all())) {
+            if (start) {
+                push_queue_push(id, nullptr, false);
+            } else if (append) {
+                const char *t = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "text"));
+                if (t && !push_queue_append(id, t)) {
+                    push_queue_push(id, t, false);
+                }
+            } else if (done) {
+                if (!push_queue_mark_done(id)) {
+                    const char *t = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "display_text"));
+                    if (!t) {
+                        t = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "content"));
+                    }
+                    if (t) {
+                        push_queue_push(id, t, true);
+                    }
+                }
+            } else if (full) {
+                const char *t = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "display_text"));
+                if (!t) {
+                    t = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "content"));
+                }
+                push_queue_push(id, t, true);
+            }
+        }
         return;
     }
     s_turn.last_event_us = s_turn.last_content_us = now_us();
@@ -2168,7 +2368,11 @@ static void check_turn(void)
     if (!s_turn.nmsgs) {
         /* A typed turn waits as long as the agent says it's working. */
         if (t - s_turn.chat_us > (text ? TEXT_REPLY_TIMEOUT_US : REPLY_TIMEOUT_US) && !(text && s_turn.agent_busy)) {
-            turn_fail("NO REPLY FROM MUSE");
+            /* The turn ends after a minute, but the wait continues in the
+             * background: the conversation timer below keeps pushes
+             * aloud, and the device is idle again, so the user can wake
+             * it for a new conversation while the reply is still owed. */
+            turn_fail("WAITING FOR MUSE RESPONSE");
         }
         return;
     }
@@ -2496,6 +2700,7 @@ static void hatch_task(void *arg)
             continue;
         }
         check_turn();
+        push_queue_drain_if_idle();
 
         int64_t t = now_us();
         if (t - s_conn.last_rx_us > DEAD_US) {
@@ -2613,6 +2818,9 @@ extern "C" bool muse_hatch_push_take(void)
 extern "C" void muse_hatch_push_drop(void)
 {
     s_push_pending = false;
+    /* A user takeover drops the pending push; queued pushes go too
+     * (the session task flushes them, so this stays race-free). */
+    s_push_queue_flush = true;
 }
 
 extern "C" void muse_hatch_turn_end(void)
