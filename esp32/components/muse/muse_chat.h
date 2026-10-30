@@ -92,10 +92,6 @@ void muse_hatch_turn_cancel(void);
  * like any reply. A press that starts a turn drops it (muse_hatch_push_drop). */
 bool muse_hatch_push_take(void);
 void muse_hatch_push_drop(void);
-/* The current push turn answers a turn that died unanswered: play it aloud
- * even with announcements off. False once the turn ends. */
-bool muse_hatch_push_late_reply(void);
-
 typedef enum {
     MUSE_HATCH_EV_NONE,
     MUSE_HATCH_EV_HEARD,    /* transcript so far (partial while talking, then final) */

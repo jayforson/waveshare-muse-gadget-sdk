@@ -512,12 +512,6 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
 
 static void go_idle(const char *caption);
 
-/* While a quiet push plays: if the push turns out to answer a dead turn,
- * hatch_reply_as upgrades it to the loud path (volume restored, screen
- * woken). Set by play_push, cleared when playback ends or upgrades. */
-static bool s_push_quiet;
-static int s_push_quiet_vol;
-
 /*
  * Plays Hatch's reply as it arrives, with its text as the caption. Returns
  * true if interrupted by a new press. *delivered: the VM has the note.
@@ -572,16 +566,6 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
             default:
                 break;
             }
-        }
-        if (s_push_quiet && muse_hatch_push_late_reply()) {
-            /* The parent arrived after playback started: upgrade to the
-             * loud path mid-playback. Pages before the upgrade were never
-             * polled into the dialog, so it may start mid-reply. */
-            s_push_quiet = false;
-            muse_audio_set_volume(s_push_quiet_vol);
-            muse_state_set_asleep(false);
-            muse_state_poke();
-            ESP_LOGI(TAG, "push: late reply recognized, playing aloud");
         }
         if (s_hangup_requested) {
             ESP_LOGI(TAG, "reply hung up");
@@ -639,30 +623,12 @@ static bool hatch_reply(bool *delivered)
 }
 
 /* A push from Muse: play it like a reply. True if a press interrupted it,
- * to be recorded as one. Announcements on, or a late reply to a dead turn,
- * wake the screen and speak; otherwise it plays quietly. */
+ * to be recorded as one. Only pushes that passed the Speak-all switch
+ * reach here (a late reply to a dead turn, or every push when Speak all
+ * is on), so every push here wakes the screen and speaks. */
 static bool play_push(void)
 {
     ESP_LOGI(TAG, "playing a push from Muse");
-    if (!muse_settings_push_announce() && !muse_hatch_push_late_reply()) {
-        /* Quiet push: never spoken, screen stays dark, so automatic
-         * tasks don't wake anyone. The speaker is muted only for this
-         * turn; the saved volume is untouched, and calls are unaffected
-         * (they never go through this path). Note: while the screen
-         * sleeps the UI never polls the dialog either, so a quiet push
-         * leaves no dialog trace; that is why a late reply takes the
-         * loud path instead. */
-        int vol = muse_settings_volume();
-        muse_audio_set_volume(0);
-        muse_wifi_power(MUSE_WIFI_FULL);
-        bool delivered;
-        s_push_quiet = true;
-        s_push_quiet_vol = vol;
-        bool r = hatch_reply_as(&delivered, "");
-        s_push_quiet = false;
-        muse_audio_set_volume(vol);
-        return r;
-    }
     muse_state_set_asleep(false);
     muse_state_poke();
     muse_wifi_power(MUSE_WIFI_FULL);

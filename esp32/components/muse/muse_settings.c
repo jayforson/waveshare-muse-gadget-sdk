@@ -34,8 +34,9 @@ static const char *TAG = "muse_settings";
 static struct {
     uint8_t volume;
     bool speaker_on;
-    bool pushes_on;
-    bool push_announce;
+    bool speak_all;
+    int tts_fail_reason;
+    int tts_fail_status;
     bool wake_on_battery;
     uint8_t mic_gain;
     uint8_t sw_gain;
@@ -52,7 +53,8 @@ static struct {
 } s = {
     .volume = CONFIG_MUSE_DEFAULT_VOLUME,
     .speaker_on = true,
-    .push_announce = true,
+    /* speak_all defaults off: only current-conversation content is spoken,
+     * automatic pushes are dropped before any TTS or decode. */
     .mic_gain = 30,
     .sw_gain = 2,
     .silence_s = MUSE_SILENCE_S_DEFAULT,
@@ -126,11 +128,15 @@ esp_err_t muse_settings_init(void)
     if (nvs_get_u8(s_nvs, "speaker", &b) == ESP_OK) {
         s.speaker_on = b;
     }
-    if (nvs_get_u8(s_nvs, "pushes", &b) == ESP_OK) {
-        s.pushes_on = b;
+    if (nvs_get_u8(s_nvs, "speak_all", &b) == ESP_OK) {
+        s.speak_all = b;
     }
-    if (nvs_get_u8(s_nvs, "push_ann", &b) == ESP_OK) {
-        s.push_announce = b;
+    if (nvs_get_u8(s_nvs, "tts_fail", &b) == ESP_OK) {
+        s.tts_fail_reason = b;
+    }
+    uint16_t w;
+    if (nvs_get_u16(s_nvs, "tts_stat", &w) == ESP_OK) {
+        s.tts_fail_status = w;
     }
     if (nvs_get_u8(s_nvs, "wake_batt", &b) == ESP_OK) {
         s.wake_on_battery = b;
@@ -157,8 +163,10 @@ esp_err_t muse_settings_init(void)
     s.sw_gain = clampi(s.sw_gain, 1, MUSE_SW_GAIN_MAX);
     s.silence_s = clampi(s.silence_s, MUSE_SILENCE_S_MIN, MUSE_SILENCE_S_MAX);
     s.brightness = clampi(s.brightness, 10, 100);
-    ESP_LOGI(TAG, "all messages %s", s.pushes_on ? "on" : "off");
-    ESP_LOGI(TAG, "push announcements %s", s.push_announce ? "on" : "off");
+    ESP_LOGI(TAG, "speak all pushes %s", s.speak_all ? "on" : "off");
+    if (s.tts_fail_reason) {
+        ESP_LOGI(TAG, "last speech failure %d status %d", s.tts_fail_reason, s.tts_fail_status);
+    }
     ESP_LOGI(TAG, "vol %d%s, mic %d dB, bright %d, sleep %ds, wifi %s (%s), ble %s, muse %s",
              s.volume, s.speaker_on ? "" : " (speaker off)", s.mic_gain, s.brightness, s.sleep_s, s.wifi_on ? "on" : "off",
              "network saved by Link", s.ble_on ? "on" : "off", s.token[0] ? "token set" : "no token");
@@ -172,8 +180,26 @@ void muse_settings_set_listener(muse_setting_cb_t cb)
 
 int muse_settings_volume(void) { return s.volume; }
 bool muse_settings_speaker_on(void) { return s.speaker_on; }
-bool muse_settings_pushes_on(void) { return s.pushes_on; }
-bool muse_settings_push_announce(void) { return s.push_announce; }
+bool muse_settings_speak_all(void) { return s.speak_all; }
+int muse_settings_tts_fail_reason(void) { return s.tts_fail_reason; }
+int muse_settings_tts_fail_status(void) { return s.tts_fail_status; }
+
+void muse_settings_tts_fail_text(char *buf, size_t cap)
+{
+    const char *t;
+    switch (s.tts_fail_reason) {
+    case TTS_FAIL_FETCH: t = "Network error"; break;
+    case TTS_FAIL_STATUS:
+        snprintf(buf, cap, "HTTP %d", s.tts_fail_status);
+        return;
+    case TTS_FAIL_INCOMPLETE: t = "Incomplete audio"; break;
+    case TTS_FAIL_QUEUE: t = "Queue full"; break;
+    case TTS_FAIL_STUCK: t = "Stuck job dropped"; break;
+    case TTS_FAIL_SEND: t = "Output stalled"; break;
+    default: t = "—"; break;
+    }
+    snprintf(buf, cap, "%s", t);
+}
 bool muse_settings_wake_on_battery(void) { return s.wake_on_battery; }
 int muse_settings_mic_gain(void) { return s.mic_gain; }
 int muse_settings_sw_gain(void) { return s.sw_gain; }
@@ -233,18 +259,21 @@ void muse_settings_set_speaker_on(bool on)
     notify(MUSE_SETTING_SPEAKER);
 }
 
-void muse_settings_set_pushes_on(bool on)
+void muse_settings_set_speak_all(bool on)
 {
-    s.pushes_on = on;
-    save_u8("pushes", on);
-    notify(MUSE_SETTING_PUSHES);
+    s.speak_all = on;
+    save_u8("speak_all", on);
+    notify(MUSE_SETTING_SPEAK_ALL);
 }
 
-void muse_settings_set_push_announce(bool on)
+/* Diagnostic only: no listener notification, since no hardware applies it. */
+void muse_settings_set_tts_fail(int reason, int status)
 {
-    s.push_announce = on;
-    save_u8("push_ann", on);
-    notify(MUSE_SETTING_PUSH_ANNOUNCE);
+    s.tts_fail_reason = reason;
+    s.tts_fail_status = status;
+    save_u8("tts_fail", (uint8_t)reason);
+    nvs_set_u16(s_nvs, "tts_stat", (uint16_t)status);
+    nvs_commit(s_nvs);
 }
 
 void muse_settings_set_wake_on_battery(bool on)

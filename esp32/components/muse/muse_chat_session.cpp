@@ -107,7 +107,6 @@ static const char *TAG = "muse_chat_session";
 
 #define PING_US (20 * 1000000LL)
 #define DEAD_US (60 * 1000000LL)           /* nothing from the server, pongs included */
-#define IDLE_CLOSE_US (10 * 60 * 1000000LL)
 #define AUTO_RETRY_MIN_US (5 * 1000000LL)  /* connecting without a turn, after a failure */
 #define AUTO_RETRY_MAX_US (120 * 1000000LL)
 #define FINAL_TIMEOUT_US (15 * 1000000LL)  /* release -> final transcript */
@@ -965,10 +964,6 @@ static void turn_reset_streams(void)
 
 static void remember_shown(const char *id);
 
-/* Visible to the voice task: the current push turn answers a turn that died
- * unanswered. Set by push_begin / on_event, cleared by turn_finish. */
-static std::atomic<bool> s_push_late{false};
-
 /* The user message of the newest voice turn that died with NO REPLY and no
  * message received. A push replying to it is the answer the user is still
  * waiting for, so it plays aloud even with announcements off. Single slot:
@@ -992,7 +987,6 @@ static void turn_finish(void)
         remember_shown(s_turn.msgs[i].id);
     }
     turn_reset_streams();
-    s_push_late = false;
     s_turn.phase = P_IDLE;
     s_turn.dict_id = s_turn.chat_id = 0;
     s_turn.tts_msg = -1;
@@ -1390,11 +1384,9 @@ static bool late_window_open(void)
 
 static void push_begin(const char *id, bool late)
 {
-    if (!muse_settings_pushes_on()) {
-        ESP_LOGI(TAG, "push: message %s left for the app (All messages is off)", id);
-        return;
-    }
-    /* Only between turns, with the voice task free to play it. */
+    /* Only between turns, with the voice task free to play it. The
+     * Speak-all drop for automatic pushes already happened in
+     * push_maybe_begin; a late reply reaches here even with Speak all off. */
     if (muse_state_mode(nullptr) != MUSE_MODE_IDLE || s_push_pending.load()) {
         ESP_LOGI(TAG, "push: busy, message %s left for the app", id);
         return;
@@ -1408,7 +1400,6 @@ static void push_begin(const char *id, bool late)
     s_turn.push_turn = true;
     if (late) {
         /* One-shot: consumed here, so a redelivery can't re-trigger it. */
-        s_push_late = true;
         s_late_valid = false;
         ESP_LOGI(TAG, "push: late reply to failed turn, playing aloud");
     }
@@ -1433,6 +1424,13 @@ static void push_maybe_begin(const char *event, cJSON *payload, cJSON *line)
         if (s_late_valid) {
             ESP_LOGI(TAG, "push: watch active, id %s parent %s watch %s late %d window %d",
                      id, parent ? parent : "(none)", s_late_id, (int)late, (int)window);
+        }
+        if (!late && !muse_settings_speak_all()) {
+            /* Automatic push with Speak all off: drop it at the door. No
+             * turn, no TTS, no decode, so it can neither wake the screen
+             * nor wedge the speech worker. Left for the app. */
+            ESP_LOGI(TAG, "push: automatic, Speak all off, dropping %s", id);
+            return;
         }
         push_begin(id, late);
     }
@@ -1615,20 +1613,6 @@ static void on_event(cJSON *line)
     if (i < 0) {
         return;
     }
-    if (s_turn.push_turn && s_late_valid) {
-        /* The parent may arrive on a later event than the push itself:
-         * log what arrived so a missed match is diagnosable, and mark
-         * the turn late so playback upgrades to the loud path. */
-        const char *parent = msg_parent(payload, line);
-        if (parent) {
-            bool late = late_parent_match(parent);
-            ESP_LOGI(TAG, "push: turn parent %s watch %s late %d", parent, s_late_id, (int)late);
-            if (late) {
-                s_push_late = true;
-                s_late_valid = false;
-            }
-        }
-    }
     s_turn.last_event_us = s_turn.last_content_us = now_us();
     msg_t &m = s_turn.msgs[i];
     if (append) {
@@ -1694,10 +1678,23 @@ struct tts_job_t {
 
 static QueueHandle_t s_tts_jobs;
 static StreamBufferHandle_t s_tts_rx;
+static TaskHandle_t s_tts_task;
 static std::atomic<uint32_t> s_tts_job{0};
 static std::atomic<bool> s_tts_busy{false};    /* the fetch task holds a job */
 static std::atomic<bool> s_tts_ok{false};      /* the last job's response was a whole MP3 */
 static bool s_tts_pending;                     /* tts_msg's speech is still arriving */
+/* Watchdog: the fetch task's last progress (a chunk handed to s_tts_rx, or
+ * a job start). A job with no progress for TTS_STALL_US is presumed wedged
+ * in a read that neither returns nor times out, and is dropped preemptively
+ * by rebuilding the fetch task. */
+static std::atomic<int64_t> s_tts_progress_us{0};
+#define TTS_STALL_US (30 * 1000000LL)
+/* Why the last job failed (TTS_FAIL_*), for the Settings row and the log.
+ * Written by the fetch task, persisted by the session task on fallback. */
+static std::atomic<int> s_tts_fail_reason{TTS_FAIL_NONE};
+static std::atomic<int> s_tts_fail_status{0};
+/* The tts_msg index that already used its one fetch retry, or -1. */
+static int s_tts_retry_msg = -1;
 
 static bool tts_enabled(void)
 {
@@ -1706,11 +1703,27 @@ static bool tts_enabled(void)
 
 static bool tts_send(uint32_t job, const uint8_t *data, size_t len)
 {
+    int zero_ms = 0;
     while (len) {
         if (job != s_tts_job.load()) {
             return false;
         }
         size_t n = xStreamBufferSend(s_tts_rx, data, len, pdMS_TO_TICKS(100));
+        if (n == 0) {
+            /* Nobody drains the output (the turn is gone, or the pump
+             * stopped): retrying forever would wedge the worker, so abort
+             * the job after 10 s of zero progress. */
+            zero_ms += 100;
+            if (zero_ms >= 10000) {
+                ESP_LOGW(TAG, "speech: output not drained for 10s, dropping job");
+                s_tts_fail_reason = TTS_FAIL_SEND;
+                s_tts_fail_status = 0;
+                return false;
+            }
+        } else {
+            zero_ms = 0;
+            s_tts_progress_us = now_us();
+        }
         data += n;
         len -= n;
     }
@@ -1738,7 +1751,10 @@ static bool tts_fetch(const tts_job_t &j)
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     bool ok = false;
-    if (c) {
+    if (!c) {
+        s_tts_fail_reason = TTS_FAIL_FETCH;
+        s_tts_fail_status = 0;
+    } else {
         esp_http_client_set_header(c, "xi-api-key", CONFIG_MUSE_ELEVENLABS_API_KEY);
         esp_http_client_set_header(c, "Content-Type", "application/json");
         esp_http_client_set_header(c, "Accept", "audio/mpeg");
@@ -1746,6 +1762,8 @@ static bool tts_fetch(const tts_job_t &j)
         int64_t t0 = esp_timer_get_time();
         if (esp_http_client_open(c, len) != ESP_OK || esp_http_client_write(c, body, len) != len) {
             ESP_LOGW(TAG, "speech: can't reach ElevenLabs");
+            s_tts_fail_reason = TTS_FAIL_FETCH;
+            s_tts_fail_status = 0;
         } else {
             esp_http_client_fetch_headers(c);
             int status = esp_http_client_get_status_code(c);
@@ -1754,9 +1772,12 @@ static bool tts_fetch(const tts_job_t &j)
                 int n = esp_http_client_read(c, (char *)buf, sizeof(buf) - 1);
                 buf[n > 0 ? n : 0] = '\0';
                 ESP_LOGW(TAG, "speech: ElevenLabs HTTP %d %s", status, (char *)buf);
+                s_tts_fail_reason = TTS_FAIL_STATUS;
+                s_tts_fail_status = status;
             } else {
                 size_t total = 0;
-                int n;
+                int n = 0;
+                bool send_failed = false;
                 ok = true;
                 while ((n = esp_http_client_read(c, (char *)buf, sizeof(buf))) > 0) {
                     if (!total) {
@@ -1765,11 +1786,24 @@ static bool tts_fetch(const tts_job_t &j)
                     total += n;
                     if (!tts_send(j.job, buf, n)) {
                         ok = false;
+                        send_failed = true;
                         break;
                     }
                 }
                 ok = ok && n == 0 && total > 0 && esp_http_client_is_complete_data_received(c);
                 ESP_LOGI(TAG, "speech: %u bytes of MP3%s", (unsigned)total, ok ? "" : ", incomplete");
+                if (ok) {
+                    s_tts_fail_reason = TTS_FAIL_NONE;
+                    s_tts_fail_status = 0;
+                } else if (s_tts_fail_reason.load() != TTS_FAIL_SEND) {
+                    /* Not a send stall (that already recorded itself), and
+                     * not a stale-job abort (the pump never falls back for
+                     * a cancelled job, since pending is already false). */
+                    if (!send_failed) {
+                        s_tts_fail_reason = n < 0 ? TTS_FAIL_FETCH : TTS_FAIL_INCOMPLETE;
+                        s_tts_fail_status = 0;
+                    }
+                }
             }
         }
         esp_http_client_close(c);
@@ -1799,7 +1833,7 @@ static bool tts_start(const char *text)
         s_tts_jobs = xQueueCreateWithCaps(1, sizeof(tts_job_t), MALLOC_CAP_SPIRAM);
         s_tts_rx = xStreamBufferCreateWithCaps(TTS_RX_BYTES, 1, MALLOC_CAP_SPIRAM);
         if (!s_tts_jobs || !s_tts_rx ||
-            xTaskCreatePinnedToCoreWithCaps(tts_task, "muse_tts", 8 * 1024, nullptr, 4, nullptr, 1,
+            xTaskCreatePinnedToCoreWithCaps(tts_task, "muse_tts", 8 * 1024, nullptr, 4, &s_tts_task, 1,
                                             MALLOC_CAP_SPIRAM) != pdPASS) {
             ESP_LOGE(TAG, "speech: no memory for the fetch task");
             return false;
@@ -1811,6 +1845,7 @@ static bool tts_start(const char *text)
     xStreamBufferReset(s_tts_rx);
     s_tts_ok = false;
     s_tts_busy = true;
+    s_tts_progress_us = now_us();
     if (xQueueSend(s_tts_jobs, &j, 0) != pdTRUE) {
         s_tts_busy = false;
         return false;
@@ -1822,6 +1857,38 @@ static void tts_cancel(void)
 {
     ++s_tts_job;
     s_tts_pending = false;
+}
+
+/* Preemptive drop for a wedged fetch task: delete it and rebuild the task,
+ * queue and output buffer from scratch, so the next message's speech works.
+ * Called only from the session task (which owns the pump), after the task
+ * itself is deleted, so nothing else can touch the freed queue or buffer.
+ * The dead task's HTTP handle leaks; a watchdog event is rare, and a leak
+ * beats a permanently wedged speaker. */
+static void tts_rebuild(void)
+{
+    if (s_tts_task) {
+        vTaskDelete(s_tts_task);
+        s_tts_task = nullptr;
+    }
+    if (s_tts_jobs) {
+        vQueueDelete(s_tts_jobs);
+        s_tts_jobs = nullptr;
+    }
+    if (s_tts_rx) {
+        vStreamBufferDelete(s_tts_rx);
+        s_tts_rx = nullptr;
+    }
+    s_tts_jobs = xQueueCreateWithCaps(1, sizeof(tts_job_t), MALLOC_CAP_SPIRAM);
+    s_tts_rx = xStreamBufferCreateWithCaps(TTS_RX_BYTES, 1, MALLOC_CAP_SPIRAM);
+    if (!s_tts_jobs || !s_tts_rx ||
+        xTaskCreatePinnedToCoreWithCaps(tts_task, "muse_tts", 8 * 1024, nullptr, 4, &s_tts_task, 1,
+                                        MALLOC_CAP_SPIRAM) != pdPASS) {
+        ESP_LOGE(TAG, "speech: watchdog could not rebuild the fetch task");
+    }
+    ++s_tts_job;   /* any output from the dead task is stale */
+    s_tts_busy = false;
+    s_tts_ok = false;
 }
 
 static void start_tts(void)
@@ -1850,10 +1917,16 @@ static void start_tts(void)
                 s_turn.down_rate = 0;
                 mp3dec_init(&s_turn.dec);
                 s_tts_pending = true;
+                s_tts_retry_msg = -1;   /* this message gets one fetch retry */
                 ESP_LOGI(TAG, "speaking message %s (%u chars)", m.id, (unsigned)m.len);
                 show_reply_start(m);
                 return;
             }
+            /* The job could not be queued (the fetch worker is wedged and
+             * the watchdog has not cleared it yet). Record it, then fall
+             * through to the silent path below. */
+            ESP_LOGW(TAG, "speech: message %s could not be queued", m.id);
+            muse_settings_set_tts_fail(TTS_FAIL_QUEUE, 0);
         }
         /*
          * Replies are text, shown at reading pace: silence in place of speech
@@ -1925,15 +1998,55 @@ static void tts_pump(void)
         }
         tts_data(chunk, n);
     }
-    if (s_tts_busy.load() || !xStreamBufferIsEmpty(s_tts_rx)) {
+    if (s_tts_busy.load()) {
+        /* Watchdog: a fetch with no progress for TTS_STALL_US is wedged in
+         * a read that neither returns nor times out, where no cooperative
+         * drop (generation bump, HTTP timeout) can reach it. Rebuild the
+         * fetch task so the next message's speech works, then fall through
+         * to the retry-or-silent logic below for this message. */
+        if (now_us() - s_tts_progress_us.load() > TTS_STALL_US) {
+            ESP_LOGW(TAG, "speech: watchdog, no progress for %ds, rebuilding fetch task",
+                     (int)(TTS_STALL_US / 1000000LL));
+            tts_rebuild();
+            s_tts_fail_reason = TTS_FAIL_STUCK;
+            s_tts_fail_status = 0;
+            msg_t &wm = s_turn.msgs[s_turn.tts_msg];
+            if (s_turn.pcm_out == wm.pcm_start) {
+                s_turn.mp3_len = 0;   /* discard the wedged job's partial MP3 */
+            }
+        } else {
+            return;
+        }
+    } else if (!xStreamBufferIsEmpty(s_tts_rx)) {
         return;
     }
     s_tts_pending = false;
     msg_t &m = s_turn.msgs[s_turn.tts_msg];
     if (s_tts_ok.load() || s_turn.pcm_out != m.pcm_start || s_turn.mp3_len) {
         s_turn.mp3_ended = true;   /* decode() drains the rest, then finishes */
+        if (s_tts_ok.load()) {
+            muse_settings_set_tts_fail(TTS_FAIL_NONE, 0);
+        } else {
+            muse_settings_set_tts_fail(s_tts_fail_reason.load(), s_tts_fail_status.load());
+        }
         return;
     }
+    /* The fetch finished with no audio at all: retry once on a fresh
+     * connection before falling back to silence, so a transient failure
+     * does not cost the reply its voice. */
+    if (s_tts_retry_msg != s_turn.tts_msg && s_turn.texts) {
+        s_tts_retry_msg = s_turn.tts_msg;
+        ESP_LOGI(TAG, "speech: retrying message %s after failed fetch", m.id);
+        if (tts_start(s_turn.texts + s_turn.tts_msg * TEXT_MAX)) {
+            s_tts_pending = true;
+            return;
+        }
+        s_tts_fail_reason = TTS_FAIL_QUEUE;
+        s_tts_fail_status = 0;
+    }
+    muse_settings_set_tts_fail(s_tts_fail_reason.load(), s_tts_fail_status.load());
+    ESP_LOGW(TAG, "speech: message %s silent, reason %d status %d", m.id,
+             s_tts_fail_reason.load(), s_tts_fail_status.load());
     m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
     s_turn.silent = true;
 }
@@ -2328,9 +2441,10 @@ static void hatch_task(void *arg)
             if (!muse_wifi_connected()) {
                 s_auto_next_us = 0;
                 s_auto_backoff_us = AUTO_RETRY_MIN_US;
-            } else if (muse_hatch_configured()
-                       && (now_us() >= s_auto_next_us || (s_auto_next_us == INT64_MAX && muse_settings_pushes_on()))) {
-                /* Closed when idle, then All messages turned on: connect again for pushes. */
+            } else if (muse_hatch_configured() && now_us() >= s_auto_next_us) {
+                /* Reconnect when the backoff expires. The connection stays
+                 * up once open (late replies need it), so there is no
+                 * closed-when-idle state to wake from. */
                 if (ensure_connected()) {
                     s_auto_next_us = INT64_MAX;   /* until it drops */
                     s_auto_backoff_us = AUTO_RETRY_MIN_US;
@@ -2373,11 +2487,6 @@ static void hatch_task(void *arg)
         int64_t t = now_us();
         if (t - s_conn.last_rx_us > DEAD_US) {
             drop_connection("server went quiet");
-        } else if (s_turn.phase == P_IDLE && t - s_conn.last_use_us > IDLE_CLOSE_US && !muse_settings_pushes_on()) {
-            /* With All messages on it stays up, battery or not, so pushes keep arriving. */
-            disconnect("idle");
-            muse_hatch_report(MUSE_HATCH_UNTESTED, "");
-            s_auto_next_us = INT64_MAX;   /* the next turn connects */
         } else if (t - s_conn.last_ping_us > PING_US) {
             s_conn.last_ping_us = t;
             if (!ws_send_ping(s_conn.tls)) {
@@ -2491,11 +2600,6 @@ extern "C" bool muse_hatch_push_take(void)
 extern "C" void muse_hatch_push_drop(void)
 {
     s_push_pending = false;
-}
-
-extern "C" bool muse_hatch_push_late_reply(void)
-{
-    return s_push_late.load();
 }
 
 extern "C" void muse_hatch_turn_end(void)

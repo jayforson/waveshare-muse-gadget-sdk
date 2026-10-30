@@ -50,10 +50,21 @@ typedef enum {
     MUSE_SETTING_WIFI,          /* on/off or credentials */
     MUSE_SETTING_BLE,
     MUSE_SETTING_HATCH,
-    MUSE_SETTING_PUSHES,
-    MUSE_SETTING_PUSH_ANNOUNCE,
+    MUSE_SETTING_SPEAK_ALL,
     MUSE_SETTING_WAKE_BATTERY,
 } muse_setting_t;
+
+/* Last speech (TTS) failure, for diagnosis without a serial log. Saved in
+ * NVS; set by the chat session, shown in Settings. No listener notification:
+ * it is diagnostic, not a setting the hardware applies. Cleared by the next
+ * successful speech fetch. */
+#define TTS_FAIL_NONE 0
+#define TTS_FAIL_FETCH 1      /* ElevenLabs fetch failed (network/timeout) */
+#define TTS_FAIL_STATUS 2     /* ElevenLabs answered non-200; see tts_fail_status */
+#define TTS_FAIL_INCOMPLETE 3 /* fetch ended without a whole MP3 */
+#define TTS_FAIL_QUEUE 4      /* TTS job could not be queued (worker wedged) */
+#define TTS_FAIL_STUCK 5      /* watchdog dropped a job with no progress */
+#define TTS_FAIL_SEND 6       /* output buffer never drained, job aborted */
 
 typedef void (*muse_setting_cb_t)(muse_setting_t what);
 
@@ -62,8 +73,12 @@ void muse_settings_set_listener(muse_setting_cb_t cb);
 
 int muse_settings_volume(void);         /* 0..100 */
 bool muse_settings_speaker_on(void);    /* off: replies are shown, not played */
-bool muse_settings_pushes_on(void);     /* on: messages Muse sends unasked are shown and played */
-bool muse_settings_push_announce(void);  /* on (default): pushed messages are spoken; off: received silently, calls unaffected */
+bool muse_settings_speak_all(void);     /* on: every push is spoken; off (default): only
+                                        * current-conversation content is spoken, automatic
+                                        * pushes are dropped before any TTS or decode */
+int muse_settings_tts_fail_reason(void);  /* TTS_FAIL_* above, 0 = none */
+int muse_settings_tts_fail_status(void);  /* HTTP status for TTS_FAIL_STATUS, else 0 */
+void muse_settings_tts_fail_text(char *buf, size_t cap);  /* "—" when none */
 bool muse_settings_wake_on_battery(void);  /* on: Jarvis wake arms even when the board reports battery */
 int muse_settings_mic_gain(void);       /* dB, 0..MUSE_MIC_GAIN_MAX */
 int muse_settings_sw_gain(void);        /* multiplier, 1..MUSE_SW_GAIN_MAX */
@@ -81,8 +96,8 @@ size_t muse_settings_hatch_token_len(void);
 
 void muse_settings_set_volume(int pct);
 void muse_settings_set_speaker_on(bool on);
-void muse_settings_set_pushes_on(bool on);
-void muse_settings_set_push_announce(bool on);
+void muse_settings_set_speak_all(bool on);
+void muse_settings_set_tts_fail(int reason, int status);  /* diagnostic only, no notify */
 void muse_settings_set_wake_on_battery(bool on);
 void muse_settings_set_mic_gain(int db);
 void muse_settings_set_sw_gain(int mul);

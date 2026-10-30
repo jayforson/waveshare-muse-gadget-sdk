@@ -73,7 +73,7 @@ typedef struct {
 } page_t;
 
 /* Home values. */
-static lv_obj_t *s_home_wifi, *s_home_hatch, *s_home_pushes, *s_home_push_ann, *s_home_wakebatt, *s_home_ble, *s_home_sound, *s_home_sleep, *s_home_battery, *s_about;
+static lv_obj_t *s_home_wifi, *s_home_hatch, *s_home_speakall, *s_home_wakebatt, *s_home_ble, *s_home_sound, *s_home_sleep, *s_home_battery, *s_about;
 
 /* Wi-Fi page. */
 static lv_obj_t *s_wifi_sw, *s_wifi_status, *s_wifi_saved, *s_wifi_scan_btn, *s_wifi_scan_lbl, *s_wifi_list;
@@ -95,7 +95,7 @@ static int64_t s_link_reset_armed_us;
 static lv_obj_t *s_ble_sw, *s_ble_status;
 
 /* Sound page. */
-static lv_obj_t *s_spk_sw, *s_vol_val, *s_vol_sl, *s_gain_val, *s_gain_sl, *s_sw_val, *s_sw_sl, *s_sil_val, *s_sil_sl, *s_bright_val, *s_bright_sl, *s_mic_bar, *s_mic_val;
+static lv_obj_t *s_spk_sw, *s_vol_val, *s_vol_sl, *s_gain_val, *s_gain_sl, *s_sw_val, *s_sw_sl, *s_sil_val, *s_sil_sl, *s_bright_val, *s_bright_sl, *s_mic_bar, *s_mic_val, *s_speech_err;
 
 /* Sleep page. */
 static const int SLEEP_CHOICES[] = { 0, 30, 60, 120, 300, 600 };
@@ -1074,6 +1074,10 @@ static void build_sound_page(lv_obj_t *tile)
     set_val(s_sw_val, "x%d", muse_settings_sw_gain());
     set_val(s_sil_val, "%ds", muse_settings_silence_s());
     set_val(s_bright_val, "%d%%", muse_settings_brightness());
+
+    /* Last speech failure, if any: "—" means speech last worked. Cleared by
+     * the next successful speech fetch. */
+    s_speech_err = info_row(list, "Speech error");
 }
 
 static void tick_sound(void)
@@ -1094,6 +1098,9 @@ static void tick_sound(void)
     uint32_t color = db > -12.0f ? COLOR_WARN : (db > -30.0f ? COLOR_OK : COLOR_ACCENT);
     lv_obj_set_style_bg_color(s_mic_bar, lv_color_hex(color), LV_PART_INDICATOR);
     set_val(s_mic_val, "%d dBFS", (int)db);
+    char fail[32];
+    muse_settings_tts_fail_text(fail, sizeof(fail));
+    set_text(s_speech_err, fail);
 }
 
 /* ---------- Sleep ---------- */
@@ -1234,16 +1241,14 @@ static const page_t SLEEP = { &s_sleep, build_sleep_page };
 static const page_t BATTERY = { &s_battery, build_battery_page };
 static const page_t POWER = { &s_power, build_power_page };
 
-/* Off (the default): only replies to the talk button are played, and the
- * connection may close when idle, which saves battery. */
-static void on_pushes_sw(lv_event_t *e)
+/* On: every push is spoken. Off (the default): only current-conversation
+ * content is spoken (a reply, or a late reply to a dead turn); automatic
+ * pushes are dropped before any TTS or decode, so they can neither wake
+ * the screen nor wedge the speech worker. The connection stays up either
+ * way, since late replies arrive over it. */
+static void on_speakall_sw(lv_event_t *e)
 {
-    muse_settings_set_pushes_on(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
-}
-
-static void on_push_ann_sw(lv_event_t *e)
-{
-    muse_settings_set_push_announce(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+    muse_settings_set_speak_all(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
 static void on_wakebatt_sw(lv_event_t *e)
@@ -1257,8 +1262,7 @@ static void build_home(lv_obj_t *tile)
     s_home = page(tile, "SETTINGS", false, &list);
     row(list, LV_SYMBOL_WIFI, "Wi-Fi", &s_home_wifi, on_nav, (void *)&WIFI);
     row(list, LV_SYMBOL_HOME, "Muse", &s_home_hatch, on_nav, (void *)&HATCH);
-    s_home_pushes = switch_row_icon(list, LV_SYMBOL_BELL, "All messages", muse_settings_pushes_on(), on_pushes_sw);
-    s_home_push_ann = switch_row_icon(list, LV_SYMBOL_VOLUME_MID, "Announce pushes", muse_settings_push_announce(), on_push_ann_sw);
+    s_home_speakall = switch_row_icon(list, LV_SYMBOL_VOLUME_MID, "Speak all pushes", muse_settings_speak_all(), on_speakall_sw);
     s_home_wakebatt = switch_row_icon(list, LV_SYMBOL_AUDIO, "Wake on battery", muse_settings_wake_on_battery(), on_wakebatt_sw);
     row(list, LV_SYMBOL_BLUETOOTH, "Bluetooth", &s_home_ble, on_nav, (void *)&BLE);
     row(list, LV_SYMBOL_VOLUME_MAX, "Sound", &s_home_sound, on_nav, (void *)&SOUND);
@@ -1289,13 +1293,9 @@ static void tick_home(void)
         set_text(s_home_sound, "Muted");
     }
     set_text(s_home_sleep, sleep_name(muse_settings_sleep_s()));
-    bool pushes = muse_settings_pushes_on();
-    if (pushes != lv_obj_has_state(s_home_pushes, LV_STATE_CHECKED)) {
-        lv_obj_set_state(s_home_pushes, LV_STATE_CHECKED, pushes);
-    }
-    bool push_ann = muse_settings_push_announce();
-    if (push_ann != lv_obj_has_state(s_home_push_ann, LV_STATE_CHECKED)) {
-        lv_obj_set_state(s_home_push_ann, LV_STATE_CHECKED, push_ann);
+    bool speak_all = muse_settings_speak_all();
+    if (speak_all != lv_obj_has_state(s_home_speakall, LV_STATE_CHECKED)) {
+        lv_obj_set_state(s_home_speakall, LV_STATE_CHECKED, speak_all);
     }
     bool wakebatt = muse_settings_wake_on_battery();
     if (wakebatt != lv_obj_has_state(s_home_wakebatt, LV_STATE_CHECKED)) {
