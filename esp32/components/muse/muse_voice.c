@@ -86,7 +86,7 @@ static volatile uint32_t s_snore_ms;   /* when a snore was asked for (ms since b
  * in and within reach of Muse; idle_capture feeds the wake-word engine
  * and sets s_wake_fired. A call is the same turn machinery as a
  * push-to-talk note, looped: listen (voice activity ends the utterance),
- * send, play the reply, listen again, until 15 s of silence or a
+ * send, play the reply, listen again, until 5 s of silence or a
  * hangup. s_call is also read by the input task (BOOT short press
  * during a call hangs up instead of sleeping).
  */
@@ -105,7 +105,7 @@ static char s_last_heard[96];    /* transcript of the utterance in progress */
  * is filtered out by the length cap. Bare acknowledgements like a
  * lone "好的" are deliberately NOT closings: they are too ambiguous
  * (they also answer commands), so those calls still open follow-up,
- * now only for 15 s of silence instead of 30 s. */
+ * now only for 5 s of silence instead of 30 s. */
 static bool reply_is_closing(const char *text)
 {
     if (!text || !text[0]) {
@@ -156,7 +156,7 @@ static volatile bool s_wake_fired;
 #define CALL_SPEECH_DB (-45.0f)    /* speech starts above this */
 #define CALL_SILENCE_DB (-50.0f)   /* an utterance ends below this */
 #define CALL_GAP_CHUNKS 75         /* 1.5 s of silence ends an utterance */
-#define CALL_SILENCE_US (15LL * 1000000)   /* no speech this long hangs up */
+#define CALL_SILENCE_US (5LL * 1000000)   /* no speech this long hangs up */
 
 /* Call capture outcomes. */
 typedef enum {
@@ -1252,7 +1252,7 @@ static void call_run(void)
         /* A dropped utterance must not extend the silence budget:
          * remember the deadline from before this capture, so a
          * CALL_CANCELLED below can restore it instead of starting
-         * a fresh 15 s window. */
+         * a fresh 5 s window. */
         int64_t deadline_before = silence_deadline;
         call_outcome_t u = capture_call_utterance(barge_in, &silence_deadline);
         barge_in = false;
@@ -1271,9 +1271,9 @@ static void call_run(void)
              * reply has enabled follow-up, it only drops that
              * utterance and listening continues, but the silence
              * budget is NOT extended: the deadline is restored to
-             * what it was before this capture (15 s after the last
-             * reply), so a blip cannot restart a fresh 15 s window
-             * and total silence stays bounded at 15 s. */
+             * what it was before this capture (5 s after the last
+             * reply), so a blip cannot restart a fresh 5 s window
+             * and total silence stays bounded at 5 s. */
             if (!got_reply) {
                 break;
             }
