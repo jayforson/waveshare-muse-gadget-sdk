@@ -94,10 +94,10 @@ static const char *TAG = "muse_chat_session";
 #define NDJSON_LINE_MAX (16 * 1024)               /* one NDJSON line / the chat ack */
 #define SUB_LINE_MAX (256 * 1024)          /* an event line grows its buffer up to this */
 #define CHAT_PART (16 * 1024)              /* one body chunk of a long typed message */
-#define MP3_BUF (512 * 1024)
+#define MP3_BUF (256 * 1024)
 #define MP3_HOLD (1441 + 4)               /* the largest MP3 frame and the next header */
 #define MP3_POLL_ROOM (SCRATCH + 8192)     /* stop reading the socket below this much MP3 room */
-#define IN_BYTES (MIC_RATE * 2 * 8)        /* 8 s of mic backlog while connecting */
+#define IN_BYTES (MIC_RATE * 2 * 2)        /* 2 s of mic backlog while connecting */
 #define OUT_BYTES (MIC_RATE * 2 * 2)       /* 2 s of decoded reply */
 #define EV_TEXT 72
 #define TEXT_MAX 1024                      /* a message's text, for captions timed to its speech */
@@ -2345,9 +2345,11 @@ extern "C" void muse_hatch_start(void)
         s.cap = NDJSON_LINE_MAX;
     }
     s_turn.tts_msg = -1;
-    /* Stack in PSRAM: TLS, Noise and the MP3 decoder (~16 KB of scratch) all run here. */
+    /* Stack in PSRAM: TLS, Noise and the MP3 decoder (~16 KB of scratch) all run here.
+     * Sized from the measured peak use (~17.7 KB) plus margin; do not grow it back
+     * without a new measurement. */
     if (!s_cmds || !s_events || !s_in || !s_out || !s_turn.chunk || !s_turn.mp3 || (VOICE_NOTE && !s_turn.note) || !s_pcm || !s_pcm16 ||
-        xTaskCreatePinnedToCoreWithCaps(hatch_task, "muse_chat", 48 * 1024, nullptr, 5, nullptr, 0,
+        xTaskCreatePinnedToCoreWithCaps(hatch_task, "muse_chat", 32 * 1024, nullptr, 5, nullptr, 0,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         ESP_LOGE(TAG, "start failed");
     }
