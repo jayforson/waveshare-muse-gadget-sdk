@@ -1350,13 +1350,21 @@ static bool was_shown(const char *id)
 
 static bool turn_start(uint32_t gen, bool text);
 
-static const char *msg_parent(cJSON *payload)
+/* The message a push replies to, if the event carries one. Mirrors msg_id:
+ * payload first, then the event object, empty treated as missing. */
+static const char *msg_parent(cJSON *payload, cJSON *line)
 {
     const char *parent = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "reply_to_message_id"));
-    if (!parent) {
+    if (!parent || !parent[0]) {
         parent = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "parent_message_id"));
     }
-    return parent;
+    if (!parent || !parent[0]) {
+        parent = cJSON_GetStringValue(cJSON_GetObjectItem(line, "reply_to_message_id"));
+    }
+    if (!parent || !parent[0]) {
+        parent = cJSON_GetStringValue(cJSON_GetObjectItem(line, "parent_message_id"));
+    }
+    return parent && parent[0] ? parent : nullptr;
 }
 
 static bool late_parent_match(const char *parent)
@@ -1403,7 +1411,13 @@ static void push_maybe_begin(const char *event, cJSON *payload, cJSON *line)
     }
     const char *id = msg_id(payload, line);
     if (id && !was_shown(id)) {
-        push_begin(id, late_parent_match(msg_parent(payload)));
+        const char *parent = msg_parent(payload, line);
+        bool late = late_parent_match(parent);
+        if (s_late_valid) {
+            ESP_LOGI(TAG, "push: watch active, id %s parent %s watch %s late %d",
+                     id, parent ? parent : "(none)", s_late_id, (int)late);
+        }
+        push_begin(id, late);
     }
 }
 
@@ -1584,11 +1598,19 @@ static void on_event(cJSON *line)
     if (i < 0) {
         return;
     }
-    if (s_turn.push_turn && late_parent_match(msg_parent(payload))) {
-        /* The parent arrived on a later event than the push itself:
-         * mark the turn late so playback upgrades to the loud path. */
-        s_push_late = true;
-        s_late_valid = false;
+    if (s_turn.push_turn && s_late_valid) {
+        /* The parent may arrive on a later event than the push itself:
+         * log what arrived so a missed match is diagnosable, and mark
+         * the turn late so playback upgrades to the loud path. */
+        const char *parent = msg_parent(payload, line);
+        if (parent) {
+            bool late = late_parent_match(parent);
+            ESP_LOGI(TAG, "push: turn parent %s watch %s late %d", parent, s_late_id, (int)late);
+            if (late) {
+                s_push_late = true;
+                s_late_valid = false;
+            }
+        }
     }
     s_turn.last_event_us = s_turn.last_content_us = now_us();
     msg_t &m = s_turn.msgs[i];
