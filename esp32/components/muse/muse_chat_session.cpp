@@ -965,6 +965,20 @@ static void turn_reset_streams(void)
 
 static void remember_shown(const char *id);
 
+/* Visible to the voice task: the current push turn answers a turn that died
+ * unanswered. Set by push_begin / on_event, cleared by turn_finish. */
+static std::atomic<bool> s_push_late{false};
+
+/* The user message of the newest voice turn that died with NO REPLY and no
+ * message received. A push replying to it is the answer the user is still
+ * waiting for, so it plays aloud even with announcements off. Single slot:
+ * the newest unanswered turn wins. One-shot: consumed when a matching push
+ * turn starts (or matches mid-turn). UUIDs never collide, so a stale record
+ * can't misfire a later push. Declared here, before turn_finish and
+ * turn_fail use them. */
+static char s_late_id[sizeof(msg_t::id)];
+static bool s_late_valid;
+
 static void turn_finish(void)
 {
     for (int i = 0; i < s_turn.nmsgs; i++) {
@@ -1315,18 +1329,6 @@ static void on_dictation_end(bool ok)
 #define SHOWN_IDS 8
 
 static std::atomic<bool> s_push_pending{false};
-/* Visible to the voice task: the current push turn answers a turn that died
- * unanswered. Set by push_begin / on_event, cleared by turn_finish. */
-static std::atomic<bool> s_push_late{false};
-
-/* The user message of the newest voice turn that died with NO REPLY and no
- * message received. A push replying to it is the answer the user is still
- * waiting for, so it plays aloud even with announcements off. Single slot:
- * the newest unanswered turn wins. One-shot: consumed when a matching push
- * turn starts (or matches mid-turn). UUIDs never collide, so a stale record
- * can't misfire a later push. */
-static char s_late_id[sizeof(msg_t::id)];
-static bool s_late_valid;
 static char s_shown_ids[SHOWN_IDS][sizeof(msg_t::id)];
 static int s_shown_next;
 
