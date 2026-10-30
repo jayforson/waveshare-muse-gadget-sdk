@@ -216,6 +216,7 @@ struct turn_t {
     phase_t phase;
     uint32_t gen;
     bool text;               /* typed at the console: the reply goes there, unspoken */
+    bool push_turn;          /* reply-only turn opened by push_begin */
     bool end_requested, end_sent, chat_posted, acked;
     int64_t dict_id, chat_id;
     int64_t start_us, end_sent_us, chat_us, last_event_us, last_content_us;
@@ -970,6 +971,7 @@ static void turn_finish(void)
         remember_shown(s_turn.msgs[i].id);
     }
     turn_reset_streams();
+    s_push_late = false;
     s_turn.phase = P_IDLE;
     s_turn.dict_id = s_turn.chat_id = 0;
     s_turn.tts_msg = -1;
@@ -980,6 +982,15 @@ static void turn_finish(void)
 static void turn_fail(const char *why)
 {
     ESP_LOGW(TAG, "turn failed: %s", why);
+    if (!s_turn.text && !s_turn.nmsgs && !strcmp(why, "NO REPLY FROM MUSE") && s_turn.user_ids[0][0]) {
+        /* The user is still waiting for this answer: remember the turn's
+         * user message so a later push replying to it plays aloud even
+         * with announcements off. A fail without an ack leaves any older
+         * watch untouched. */
+        strlcpy(s_late_id, s_turn.user_ids[0], sizeof(s_late_id));
+        s_late_valid = true;
+        ESP_LOGI(TAG, "late reply watch: user %s", s_late_id);
+    }
     if (s_turn.text) {
         muse_hatch_console("error", why, nullptr);
     }
@@ -1304,6 +1315,18 @@ static void on_dictation_end(bool ok)
 #define SHOWN_IDS 8
 
 static std::atomic<bool> s_push_pending{false};
+/* Visible to the voice task: the current push turn answers a turn that died
+ * unanswered. Set by push_begin / on_event, cleared by turn_finish. */
+static std::atomic<bool> s_push_late{false};
+
+/* The user message of the newest voice turn that died with NO REPLY and no
+ * message received. A push replying to it is the answer the user is still
+ * waiting for, so it plays aloud even with announcements off. Single slot:
+ * the newest unanswered turn wins. One-shot: consumed when a matching push
+ * turn starts (or matches mid-turn). UUIDs never collide, so a stale record
+ * can't misfire a later push. */
+static char s_late_id[sizeof(msg_t::id)];
+static bool s_late_valid;
 static char s_shown_ids[SHOWN_IDS][sizeof(msg_t::id)];
 static int s_shown_next;
 
@@ -1325,7 +1348,21 @@ static bool was_shown(const char *id)
 
 static bool turn_start(uint32_t gen, bool text);
 
-static void push_begin(const char *id)
+static const char *msg_parent(cJSON *payload)
+{
+    const char *parent = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "reply_to_message_id"));
+    if (!parent) {
+        parent = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "parent_message_id"));
+    }
+    return parent;
+}
+
+static bool late_parent_match(const char *parent)
+{
+    return s_late_valid && parent && parent[0] && !strcmp(parent, s_late_id);
+}
+
+static void push_begin(const char *id, bool late)
 {
     if (!muse_settings_pushes_on()) {
         ESP_LOGI(TAG, "push: message %s left for the app (All messages is off)", id);
@@ -1342,6 +1379,13 @@ static void push_begin(const char *id)
     }
     s_turn.phase = P_WAIT_REPLY;
     s_turn.chat_us = s_turn.last_event_us = now_us();
+    s_turn.push_turn = true;
+    if (late) {
+        /* One-shot: consumed here, so a redelivery can't re-trigger it. */
+        s_push_late = true;
+        s_late_valid = false;
+        ESP_LOGI(TAG, "push: late reply to failed turn, playing aloud");
+    }
     s_push_pending = true;
     ESP_LOGI(TAG, "push: message %s with no turn waiting, playing it", id);
 }
@@ -1357,7 +1401,7 @@ static void push_maybe_begin(const char *event, cJSON *payload, cJSON *line)
     }
     const char *id = msg_id(payload, line);
     if (id && !was_shown(id)) {
-        push_begin(id);
+        push_begin(id, late_parent_match(msg_parent(payload)));
     }
 }
 
@@ -1537,6 +1581,12 @@ static void on_event(cJSON *line)
     int i = id ? bind_msg(id, payload) : -1;
     if (i < 0) {
         return;
+    }
+    if (s_turn.push_turn && late_parent_match(msg_parent(payload))) {
+        /* The parent arrived on a later event than the push itself:
+         * mark the turn late so playback upgrades to the loud path. */
+        s_push_late = true;
+        s_late_valid = false;
     }
     s_turn.last_event_us = s_turn.last_content_us = now_us();
     msg_t &m = s_turn.msgs[i];
@@ -2400,6 +2450,11 @@ extern "C" bool muse_hatch_push_take(void)
 extern "C" void muse_hatch_push_drop(void)
 {
     s_push_pending = false;
+}
+
+extern "C" bool muse_hatch_push_late_reply(void)
+{
+    return s_push_late.load();
 }
 
 extern "C" void muse_hatch_turn_end(void)
