@@ -110,8 +110,8 @@ static const char *TAG = "muse_chat_session";
 #define AUTO_RETRY_MIN_US (5 * 1000000LL)  /* connecting without a turn, after a failure */
 #define AUTO_RETRY_MAX_US (120 * 1000000LL)
 #define FINAL_TIMEOUT_US (15 * 1000000LL)  /* release -> final transcript */
-#define REPLY_TIMEOUT_US (60 * 1000000LL)  /* chat posted -> first assistant message */
-#define TURN_CAP_US (180 * 1000000LL)
+#define REPLY_TIMEOUT_US (10 * 60 * 1000000LL)  /* chat posted -> first assistant message */
+#define TURN_CAP_US (11 * 60 * 1000000LL)  /* must exceed the reply timeout: the turn stays open while waiting */
 #define SETTLE_US (3 * 1000000LL)          /* quiet period that ends a turn */
 #define BUSY_HOLD_US (20 * 1000000LL)      /* how long a busy agent keeps it open */
 #define TEXT_REPLY_TIMEOUT_US (5 * 60 * 1000000LL)   /* typed turns: agents can work a while */
@@ -1374,12 +1374,23 @@ static bool late_parent_match(const char *parent)
     return s_late_valid && parent && parent[0] && !strcmp(parent, s_late_id);
 }
 
-/* The watch is fresh: the first push after the fail is the late reply.
- * The server does not thread pushes to the failed message (their parent
- * is absent, or the message's own id), so timing is the signal. */
+/* The watch is fresh: any push inside the window after the fail may be
+ * the late reply. The server does not thread pushes to the failed
+ * message (their parent is absent, or the message's own id), so timing
+ * is the signal. Not one-shot: an unrelated push inside the window must
+ * not consume the watch and block the real reply arriving later in the
+ * window. A redelivery is still deduped by was_shown. Expired watches
+ * are cleared here so they stop logging as active. */
 static bool late_window_open(void)
 {
-    return s_late_valid && now_us() - s_late_us <= LATE_WINDOW_US;
+    if (!s_late_valid) {
+        return false;
+    }
+    if (now_us() - s_late_us > LATE_WINDOW_US) {
+        s_late_valid = false;
+        return false;
+    }
+    return true;
 }
 
 static void push_begin(const char *id, bool late)
@@ -1399,8 +1410,10 @@ static void push_begin(const char *id, bool late)
     s_turn.chat_us = s_turn.last_event_us = now_us();
     s_turn.push_turn = true;
     if (late) {
-        /* One-shot: consumed here, so a redelivery can't re-trigger it. */
-        s_late_valid = false;
+        /* The watch stays valid for the full window (see
+         * late_window_open): a redelivery is deduped by was_shown, but an
+         * unrelated push must not consume the watch before the real
+         * reply arrives. */
         ESP_LOGI(TAG, "push: late reply to failed turn, playing aloud");
     }
     s_push_pending = true;

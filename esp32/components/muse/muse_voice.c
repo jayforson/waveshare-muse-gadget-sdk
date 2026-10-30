@@ -542,7 +542,7 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
             case MUSE_HATCH_EV_SENT:
                 *delivered = true;
                 if (!speaking && !replied) {
-                    muse_state_set_caption("NOTE SENT - WAITING FOR MUSE");
+                    muse_state_set_caption("WAITING RESPONSE FROM MUSE");
                 }
                 break;
             case MUSE_HATCH_EV_REPLY:

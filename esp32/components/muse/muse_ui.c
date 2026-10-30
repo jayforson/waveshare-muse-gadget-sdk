@@ -943,7 +943,8 @@ static bool dlg_is_status(const char *s)
     if (strncmp(s, "LISTENING", 9) == 0 || strncmp(s, "RECORDING", 9) == 0) {
         return true;
     }
-    if (strcmp(s, "NOTE SENT - WAITING FOR MUSE") == 0 || strcmp(s, "SENDING VOICE NOTE") == 0 ||
+    if (strcmp(s, "NOTE SENT - WAITING FOR MUSE") == 0 || strcmp(s, "WAITING RESPONSE FROM MUSE") == 0 ||
+        strcmp(s, "SENDING VOICE NOTE") == 0 ||
         strcmp(s, "WAKING UP...") == 0 ||
         strcmp(s, "GOODBYE!") == 0 || strcmp(s, "SPEAKER ON") == 0 || strcmp(s, "SPEAKER OFF") == 0 ||
         strcmp(s, "HOLD TO MUTE") == 0 || strcmp(s, "HOLD TO UNMUTE") == 0 ||
