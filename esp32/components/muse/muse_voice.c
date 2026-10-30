@@ -232,16 +232,22 @@ static void pre_reset(void)
 }
 
 /* Software gain on top of the 36 dB hardware PGA, which is already
- * maxed out: every captured chunk is amplified 4x (+12 dB) at capture
- * time, so the speech gate, the stats, the note buffer, the pre-roll
- * ring and the live stream all hear the louder signal. Saturates
- * instead of wrapping, so over-gain shows up as clipped samples in
- * the record log. Applied at capture only, never at pre-roll replay,
- * so no chunk is ever gained twice. */
+ * maxed out: every captured chunk is amplified by the Settings "SW
+ * gain" multiplier (default x2, 1..4) at capture time, so the speech
+ * gate, the stats, the note buffer, the pre-roll ring and the live
+ * stream all hear the louder signal. Saturates instead of wrapping,
+ * so over-gain shows up as clipped samples in the record log.
+ * Applied at capture only, never at pre-roll replay, so no chunk is
+ * ever gained twice. Read live from settings, so a slider change
+ * takes effect on the next chunk with no apply step. */
 static void sw_gain(int16_t *pcm, size_t n)
 {
+    int mul = muse_settings_sw_gain();
+    if (mul <= 1) {
+        return;
+    }
     for (size_t i = 0; i < n; i++) {
-        int x = (int)pcm[i] * 4;
+        int x = (int)pcm[i] * mul;
         pcm[i] = x > 32767 ? 32767 : x < -32768 ? -32768 : (int16_t)x;
     }
 }
@@ -490,10 +496,10 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
     }
     ESP_LOGI(TAG, "end levels:%s", tail);
     float rms_db = st.frames ? 10.0f * log10f((float)(st.acc / st.frames / (32768.0 * 32768.0)) + 1e-10f) : -100.0f;
-    ESP_LOGI(TAG, "recorded %.2fs%s: rms %.1f dBFS, peak %.1f dBFS, floor %.1f dBFS, %d clipped, gain %d dB, speech %.2fs",
+    ESP_LOGI(TAG, "recorded %.2fs%s: rms %.1f dBFS, peak %.1f dBFS, floor %.1f dBFS, %d clipped, gain %d dB, sw x%d, speech %.2fs",
              (double)n / MUSE_AUDIO_RATE, released ? "" : " (max)", rms_db < -100.0f ? -100.0f : rms_db,
              20.0 * log10((st.peak + 1) / 32768.0), st.floor_db, st.clipped, muse_settings_mic_gain(),
-             (double)speech_chunks / 50.0);
+             muse_settings_sw_gain(), (double)speech_chunks / 50.0);
     return ok;
 }
 
