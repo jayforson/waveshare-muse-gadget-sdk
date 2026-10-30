@@ -978,6 +978,13 @@ static std::atomic<bool> s_push_late{false};
  * turn_fail use them. */
 static char s_late_id[sizeof(msg_t::id)];
 static bool s_late_valid;
+static int64_t s_late_us;  /* when the watched turn failed */
+
+/* A push within this long after the fail is the late reply. Covers the
+ * observed latencies (about 10 s in tests, about 150 s once) with
+ * margin, while bounding the false-positive window: an unrelated push
+ * can only misfire inside it. */
+static const int64_t LATE_WINDOW_US = 10 * 60 * 1000000LL;
 
 static void turn_finish(void)
 {
@@ -1003,6 +1010,7 @@ static void turn_fail(const char *why)
          * watch untouched. */
         strlcpy(s_late_id, s_turn.user_ids[0], sizeof(s_late_id));
         s_late_valid = true;
+        s_late_us = now_us();
         ESP_LOGI(TAG, "late reply watch: user %s", s_late_id);
     }
     if (s_turn.text) {
@@ -1372,6 +1380,14 @@ static bool late_parent_match(const char *parent)
     return s_late_valid && parent && parent[0] && !strcmp(parent, s_late_id);
 }
 
+/* The watch is fresh: the first push after the fail is the late reply.
+ * The server does not thread pushes to the failed message (their parent
+ * is absent, or the message's own id), so timing is the signal. */
+static bool late_window_open(void)
+{
+    return s_late_valid && now_us() - s_late_us <= LATE_WINDOW_US;
+}
+
 static void push_begin(const char *id, bool late)
 {
     if (!muse_settings_pushes_on()) {
@@ -1412,10 +1428,11 @@ static void push_maybe_begin(const char *event, cJSON *payload, cJSON *line)
     const char *id = msg_id(payload, line);
     if (id && !was_shown(id)) {
         const char *parent = msg_parent(payload, line);
-        bool late = late_parent_match(parent);
+        bool window = late_window_open();
+        bool late = late_parent_match(parent) || window;
         if (s_late_valid) {
-            ESP_LOGI(TAG, "push: watch active, id %s parent %s watch %s late %d",
-                     id, parent ? parent : "(none)", s_late_id, (int)late);
+            ESP_LOGI(TAG, "push: watch active, id %s parent %s watch %s late %d window %d",
+                     id, parent ? parent : "(none)", s_late_id, (int)late, (int)window);
         }
         push_begin(id, late);
     }
