@@ -331,14 +331,16 @@ static void keep(rec_stats_t *st, const int16_t *pcm, size_t n)
     }
 }
 
-/* Gives Hatch what it has room for of the note being recorded. */
+/* Gives Hatch what it has room for of the note being recorded.
+ * Live forwarding is unconditional: it streams the current turn, not
+ * a held note, so it must work even with HOLD_NOTES 0 (which only
+ * removes saving failed turns for later). Guarding it broke every
+ * live turn once saved notes were removed. */
 static void feed_live(void)
 {
-#if HOLD_NOTES
     if (s_live && s_sent < s_rec_n) {
         s_sent += muse_hatch_turn_audio_wait(s_rec + s_sent, s_rec_n - s_sent, 0);
     }
-#endif
 }
 
 /* Streams the note being recorded from its start, then the rest as it comes. */
