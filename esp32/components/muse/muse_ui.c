@@ -1609,9 +1609,29 @@ static lv_obj_t *dlg_add(const char *text, uint32_t color)
         }
         s_dlg_n--;
     }
-    lv_obj_t *cont = lv_obj_create(s_dlg_list);
+    /* Chat layout: each message is a full-width row holding a
+     * content-width bubble. A growing spacer before a user bubble
+     * pushes it right (user messages right-aligned); Muse bubbles
+     * have no spacer, so they stay left. The row is what the list
+     * tracks (so overflow deletion removes the whole row); the
+     * bubble is returned, so live updates render into it. */
+    bool is_user = (color == COLOR_DIM);
+    lv_obj_t *row = lv_obj_create(s_dlg_list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, s_w - 104);
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_style_pad_column(row, 0, 0);
+    if (is_user) {
+        lv_obj_t *spacer = lv_obj_create(row);
+        lv_obj_remove_style_all(spacer);
+        lv_obj_set_style_flex_grow(spacer, 1, 0);
+    }
+    lv_obj_t *cont = lv_obj_create(row);
     lv_obj_remove_style_all(cont);
-    lv_obj_set_width(cont, s_w - 104);
+    lv_obj_set_width(cont, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(cont, s_w - 104, 0);
     lv_obj_set_height(cont, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(cont, 0, 0);
@@ -1620,7 +1640,7 @@ static lv_obj_t *dlg_add(const char *text, uint32_t color)
      * from Muse's black-background messages; dark text for contrast on
      * the light background (dim text on light blue would wash out). */
     uint32_t text_color = color;
-    if (color == COLOR_DIM) {
+    if (is_user) {
         lv_obj_set_style_bg_color(cont, lv_color_hex(0xBDD7EE), 0);
         lv_obj_set_style_bg_opa(cont, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(cont, 8, 0);
@@ -1628,7 +1648,7 @@ static lv_obj_t *dlg_add(const char *text, uint32_t color)
         text_color = 0x000000;
     }
     dlg_render_blocks(cont, text, text_color);
-    s_dlg_msgs[s_dlg_n++] = cont;
+    s_dlg_msgs[s_dlg_n++] = row;
     if (s_dlg_empty) {
         lv_obj_add_flag(s_dlg_empty, LV_OBJ_FLAG_HIDDEN);
     }

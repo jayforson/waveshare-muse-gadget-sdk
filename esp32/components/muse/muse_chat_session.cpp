@@ -1388,6 +1388,29 @@ static void send_chat(const char *text, const char *modality)
     conv_timer_reset();  /* outgoing send: the window runs from here */
 }
 
+/* Gadget attribution: the protocol has no source-device field, so user
+ * messages from this gadget carry a fixed "[WALL-E] " prefix (the
+ * main-chat assistant tells gadget text apart by it). The marked copy
+ * is transient (send_chat copies it into JSON, so it is freed right
+ * after). On malloc failure, the message still goes out unmarked
+ * rather than being dropped. The on-device dialog and log keep the
+ * unmarked transcript. */
+static void send_chat_marked(const char *text, const char *modality)
+{
+    const char *marker = "[WALL-E] ";
+    size_t mlen = strlen(marker);
+    size_t tlen = strlen(text);
+    char *marked = static_cast<char *>(malloc(mlen + tlen + 1));
+    if (!marked) {
+        send_chat(text, modality);
+        return;
+    }
+    memcpy(marked, marker, mlen);
+    memcpy(marked + mlen, text, tlen + 1);
+    send_chat(marked, modality);
+    free(marked);
+}
+
 static void post_chat(const char *text)
 {
     if (s_turn.chat_posted) {
@@ -1405,7 +1428,7 @@ static void post_chat(const char *text)
     }
     ESP_LOGI(TAG, "heard: \"%s\"", text);
     emit(MUSE_HATCH_EV_HEARD, text);
-    send_chat(text, "text");
+    send_chat_marked(text, "text");
 }
 
 /* A typed turn: the text goes straight to the chat. */
@@ -1415,7 +1438,7 @@ static void text_begin(const char *text)
         return;
     }
     ESP_LOGI(TAG, "typed turn: %u bytes", (unsigned)strlen(text));
-    send_chat(text, "text");
+    send_chat_marked(text, "text");
     if (s_turn.phase == P_WAIT_REPLY) {
         mark(M_SENT);
         muse_hatch_console("sent", nullptr, "\"bytes\":%u", (unsigned)strlen(text));
