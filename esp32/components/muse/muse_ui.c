@@ -933,6 +933,8 @@ static lv_obj_t *s_dlg_live_user;
 static lv_obj_t *s_dlg_live_muse;
 static char s_dlg_reply[DLG_MSG_MAX];
 static char s_dlg_last_page[DLG_MSG_MAX];
+static char s_dlg_user[DLG_MSG_MAX];
+static char s_dlg_last_user_page[DLG_MSG_MAX];
 static muse_mode_t s_dlg_prev_mode = MUSE_MODE_BOOT;
 
 static bool dlg_is_status(const char *s)
@@ -1850,46 +1852,161 @@ static void build_dialog_tile(lv_obj_t *tile)
     dlg_restore();
 }
 
+/* Longest prefix of the new caption already present as a suffix of the
+ * accumulated text, so appending it would repeat content. Captions are
+ * sliding windows, not clean page turns: a new caption usually carries
+ * most of the previous one (plus a few new words), and the old one-line
+ * dedup only removed a single overlapping line, leaving the rest to pile
+ * up into the repeated-sentence snowball seen on device. Overlaps happen
+ * at line starts on both sides (a page join in the accumulation is a
+ * space where the fresh caption has a newline, so ' ' and '\n' compare
+ * equal here); requiring both boundaries keeps a coincidental shared
+ * word from being mistaken for an overlap. Returns the skip length. */
+static size_t dlg_overlap(const char *acc, size_t acc_len, const char *text, size_t text_len)
+{
+    size_t best = 0;
+    for (size_t k = 0; k <= text_len;) {
+        /* Compare the prefix content, not the raw k chars: the
+         * accumulation ends without a trailing newline, while a text
+         * prefix ending at a line start carries one, so comparing raw
+         * slices is shifted by one and never matches. Strip that one
+         * newline for the comparison, but return k (the full skip,
+         * newline included) so the remainder starts at a line start. */
+        size_t clen = k;
+        if (clen > 0 && text[clen - 1] == '\n') {
+            clen--;
+        }
+        if (clen <= acc_len && k > best) {
+            size_t start = acc_len - clen;
+            bool boundary = (start == 0) || (acc[start - 1] == '\n') || (acc[start - 1] == ' ');
+            if (boundary) {
+                bool ok = true;
+                for (size_t i = 0; i < clen; i++) {
+                    char a = acc[start + i];
+                    char b = text[i];
+                    if (a != b && !((a == ' ' || a == '\n' || a == '\t') &&
+                                    (b == ' ' || b == '\n' || b == '\t'))) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) {
+                    best = k;
+                }
+            }
+        }
+        if (k >= text_len) {
+            break;
+        }
+        size_t nxt = k;
+        while (nxt < text_len && text[nxt] != '\n') {
+            nxt++;
+        }
+        if (nxt >= text_len) {
+            break;
+        }
+        k = nxt + 1;
+    }
+    return best;
+}
+
+/* Append a caption to an accumulated message, skipping whatever is
+ * already there. Two shapes, both seen on device:
+ *  - Extension: the new caption continues the previous one on the same
+ *    line (streaming grows a paragraph word by word, with no newline at
+ *    the joint). Append only the extension, with no join space, since
+ *    it is a direct continuation. A whitespace run in one side matches
+ *    a run in the other, so a blank line versus a space cannot shift
+ *    the cut by a character.
+ *  - Window/page: the new caption is a sliding window over old content
+ *    (see dlg_overlap). Append only past the longest line-start overlap.
+ * Pages join with a space: wrapping consumes the boundary space, so
+ * re-adding one can only ever add a harmless extra space, never join
+ * words. */
+static void dlg_accumulate(char *acc, size_t acc_size, const char *caption, const char *last_page)
+{
+    size_t have = strlen(acc);
+    if (last_page[0] != '\0') {
+        size_t plen = strlen(last_page);
+        size_t clen = strlen(caption);
+        size_t li = 0;
+        size_t ci = 0;
+        bool prefix = true;
+        while (li < plen) {
+            if (ci >= clen) {
+                prefix = false;
+                break;
+            }
+            char a = last_page[li];
+            char b = caption[ci];
+            if (a == b) {
+                li++;
+                ci++;
+            } else if ((a == ' ' || a == '\n' || a == '\t') &&
+                       (b == ' ' || b == '\n' || b == '\t')) {
+                while (li < plen && (last_page[li] == ' ' || last_page[li] == '\n' ||
+                                     last_page[li] == '\t')) {
+                    li++;
+                }
+                while (ci < clen && (caption[ci] == ' ' || caption[ci] == '\n' ||
+                                     caption[ci] == '\t')) {
+                    ci++;
+                }
+            } else {
+                prefix = false;
+                break;
+            }
+        }
+        if (prefix && ci < clen) {
+            size_t room = acc_size - have - 1;
+            if (room > 0) {
+                strncat(acc, caption + ci, room);
+                dlg_fix_tail(acc);
+            }
+            return;
+        }
+        if (prefix) {
+            return;
+        }
+    }
+    size_t skip = dlg_overlap(acc, have, caption, strlen(caption));
+    const char *append = caption + skip;
+    size_t room = acc_size - have - 1;
+    if (room > 0 && append[0] != '\0') {
+        if (have > 0) {
+            strncat(acc, " ", room);
+            room = acc_size - strlen(acc) - 1;
+        }
+        if (room > 0) {
+            strncat(acc, append, room);
+            dlg_fix_tail(acc);
+        }
+    }
+}
+
 static void dlg_reply_page(const char *caption)
 {
     if (strcmp(caption, s_dlg_last_page) == 0) {
         return;
     }
-    /* Pages overlap by a line (caption_at: a page's last line starts the
-     * next one, so page turns skip nothing). Concatenating pages verbatim
-     * therefore repeats that line at every page boundary. Drop the new
-     * page's first line when it is exactly the previous page's last line
-     * (both pages multi-line, so the overlap applies); single-line pages
-     * advance without overlap, so identical consecutive single lines are
-     * genuine repeats and are kept. */
-    const char *append = caption;
-    const char *new_nl = strchr(caption, '\n');
-    const char *prev_nl = strrchr(s_dlg_last_page, '\n');
-    if (new_nl && prev_nl) {
-        const char *prev_last = prev_nl + 1;
-        size_t first_len = (size_t)(new_nl - caption);
-        if (strlen(prev_last) == first_len &&
-            strncmp(prev_last, caption, first_len) == 0) {
-            append = new_nl + 1;
-        }
-    }
-    /* Pages join with a space: wrapping consumes the boundary space, so
-     * re-adding one can only ever add a harmless extra space, never join
-     * words. */
-    size_t have = strlen(s_dlg_reply);
-    size_t room = sizeof(s_dlg_reply) - have - 1;
-    if (room > 0 && append[0] != '\0') {
-        if (have > 0) {
-            strncat(s_dlg_reply, " ", room);
-            room = sizeof(s_dlg_reply) - strlen(s_dlg_reply) - 1;
-        }
-        if (room > 0) {
-            strncat(s_dlg_reply, append, room);
-            dlg_fix_tail(s_dlg_reply);
-        }
-    }
+    dlg_accumulate(s_dlg_reply, sizeof(s_dlg_reply), caption, s_dlg_last_page);
     dlg_copy_trunc(s_dlg_last_page, sizeof(s_dlg_last_page), caption);
     dlg_live(&s_dlg_live_muse, s_dlg_reply, COLOR_CAPTION);
+}
+
+/* The user turn accumulates the same way: listening captions are windows
+ * too, and overwriting the dialog entry with each window left only the
+ * last few characters visible. The quoted final transcript (thinking)
+ * replaces the accumulation outright, since it is authoritative. */
+static void dlg_user_page(const char *caption)
+{
+    if (strcmp(caption, s_dlg_last_user_page) == 0) {
+        return;
+    }
+    dlg_accumulate(s_dlg_user, sizeof(s_dlg_user), caption, s_dlg_last_user_page);
+    dlg_copy_trunc(s_dlg_last_user_page, sizeof(s_dlg_last_user_page), caption);
+    dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
+    dlg_copy_trunc(s_dlg_save_user, sizeof(s_dlg_save_user), s_dlg_user);
 }
 
 static void dialog_poll(muse_mode_t mode, const char *caption)
@@ -1906,8 +2023,7 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
     if (caption && caption[0]) {
         if (mode == MUSE_MODE_LISTENING) {
             if (!dlg_is_status(caption)) {
-                dlg_live(&s_dlg_live_user, caption, COLOR_DIM);
-                dlg_copy_trunc(s_dlg_save_user, sizeof(s_dlg_save_user), caption);
+                dlg_user_page(caption);
             }
         } else if (mode == MUSE_MODE_THINKING) {
             size_t n = strlen(caption);
@@ -1916,8 +2032,10 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
                 size_t inner = n - 2 < sizeof(s_dlg_tmp) - 1 ? n - 2 : sizeof(s_dlg_tmp) - 1;
                 memcpy(s_dlg_tmp, caption + 1, inner);
                 s_dlg_tmp[inner] = '\0';
-                dlg_live(&s_dlg_live_user, s_dlg_tmp, COLOR_DIM);
-                dlg_copy_trunc(s_dlg_save_user, sizeof(s_dlg_save_user), s_dlg_tmp);
+                dlg_copy_trunc(s_dlg_user, sizeof(s_dlg_user), s_dlg_tmp);
+                s_dlg_last_user_page[0] = '\0';
+                dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
+                dlg_copy_trunc(s_dlg_save_user, sizeof(s_dlg_save_user), s_dlg_user);
             } else if (!dlg_is_status(caption)) {
                 /* A reply shown before playback (speaker off, or text
                  * arriving early): same stream as the speaking pages. */
@@ -1933,6 +2051,8 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
             dlg_store_save(false, s_dlg_save_user);
             s_dlg_save_user[0] = '\0';
         }
+        s_dlg_user[0] = '\0';
+        s_dlg_last_user_page[0] = '\0';
         s_dlg_live_user = NULL;
     }
     if (s_dlg_live_muse && mode != MUSE_MODE_SPEAKING && mode != MUSE_MODE_THINKING) {
