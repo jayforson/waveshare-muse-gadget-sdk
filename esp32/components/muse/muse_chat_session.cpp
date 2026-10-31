@@ -1121,6 +1121,9 @@ static void turn_finish(void)
     s_turn.tts_msg = -1;
     s_turn.silent = false;
     s_turn.mp3_len = 0;
+    ESP_LOGI(TAG, "heap internal free %u largest %u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 static void turn_fail(const char *why)
@@ -1975,6 +1978,9 @@ static bool tts_fetch(const tts_job_t &j)
         int64_t t0 = esp_timer_get_time();
         if (esp_http_client_open(c, len) != ESP_OK || esp_http_client_write(c, body, len) != len) {
             ESP_LOGW(TAG, "speech: can't reach ElevenLabs");
+            ESP_LOGW(TAG, "speech: heap internal free %u largest %u",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
             s_tts_fail_reason = TTS_FAIL_FETCH;
             s_tts_fail_status = 0;
         } else {

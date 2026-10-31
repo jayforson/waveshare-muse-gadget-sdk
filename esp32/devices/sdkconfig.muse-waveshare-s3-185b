@@ -35,6 +35,10 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # lwIP's and BT's, and those marked EXT_RAM_BSS_ATTR. The chip always has
 # PSRAM, so booting without it needn't be allowed.
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# No malloc is forced internal: the default pool is PSRAM, so small
+# allocations (TLS handshake pieces included) don't churn the tight
+# internal heap; only explicit MALLOC_CAP_INTERNAL requests use it.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
 # CONFIG_SPIRAM_IGNORE_NOTFOUND is not set
 CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
 
