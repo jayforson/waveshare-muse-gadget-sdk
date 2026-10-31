@@ -1587,13 +1587,28 @@ static bool scribe_realtime_start(void)
         ESP_LOGW(TAG, "scribe: no room for session buffer");
         return false;
     }
-    snprintf(s_scribe_headers, sizeof(s_scribe_headers), "xi-api-key: %s",
-             CONFIG_MUSE_ELEVENLABS_API_KEY);
+        /* ESP-IDF requires each config header item terminated with CRLF;
+     * without it the handshake request is malformed and the server
+     * never returns a valid Upgrade response (the hardware failure:
+     * no "scribe: connected", 10 s network timeout). */
+    int scribe_hdr_len = snprintf(s_scribe_headers, sizeof(s_scribe_headers), "xi-api-key: %s\r\n", CONFIG_MUSE_ELEVENLABS_API_KEY);
+    if (scribe_hdr_len < 0 || (size_t)scribe_hdr_len >= sizeof(s_scribe_headers)) {
+        /* A truncated header would fail auth silently (same symptom as
+         * the missing-CRLF handshake failure), so fail loudly instead. */
+        ESP_LOGW(TAG, "scribe: api key header too long");
+        heap_caps_free(s_scribe_pre_buf);
+        s_scribe_pre_buf = nullptr;
+        return false;
+    }
     esp_websocket_client_config_t cfg = {};
     cfg.uri = SCRIBE_RT_URL;
     cfg.headers = s_scribe_headers;
     cfg.buffer_size = 16384;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    /* Explicitly the defaults (10 s): silences the client's warnings
+     * about unset timeouts; no behavior change. */
+    cfg.network_timeout_ms = 10000;
+    cfg.reconnect_timeout_ms = 10000;
     s_scribe_ws = esp_websocket_client_init(&cfg);
     if (!s_scribe_ws) {
         ESP_LOGW(TAG, "scribe: websocket init failed");
