@@ -57,12 +57,12 @@ static const char *TAG = "muse_voice";
 #define SNORE_STALE_MS 500    /* a snore asked for longer ago than this is dropped */
 #define SNORE_AMP 1100.0f     /* peak; the chirp's is ~7000: about 16 dB quieter */
 
-#if CONFIG_MUSE_HATCH
-/* A note recorded while Hatch is out of reach is saved in PSRAM, and goes once it's back. */
-#define HOLD_NOTES 1
-#else
-#define HOLD_NOTES 0   /* no PSRAM: a press needs Hatch */
-#endif
+/* Saved notes disabled by user direction (2026-10-31): no PSRAM copy of a
+ * failed utterance, no backoff, no retry-later. A turn that fails drops
+ * its recording; the user re-speaks. The turn already waits for Scribe
+ * (5 s pre-buffer + 5 s session wait) and sends immediately when ready;
+ * the focus is on Scribe not failing, not on recovering from failure. */
+#define HOLD_NOTES 0
 #define HELD_MAX 1                            /* only the latest note is kept: a new held note drops the previous one */
 #define HELD_TRIES 8                            /* then a saved note is dropped */
 #define HELD_POLL_MS 5000                       /* resting with notes saved: check for Wi-Fi this often */
