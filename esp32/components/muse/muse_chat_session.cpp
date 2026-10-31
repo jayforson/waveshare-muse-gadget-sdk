@@ -1768,10 +1768,10 @@ static bool record_scribe_realtime(void)
         turn_fail("NO SPEECH");
         return false;
     }
-    if (!post_chat(s_scribe_transcript)) {
-        turn_fail("CAN'T REACH MUSE");
-        return false;
-    }
+    /* post_chat returns void (same as the Muse-note path): there is no
+     * synchronous send-failure signal. A failed send surfaces through
+     * the reply wait timeout, exactly as it does for a Muse note. */
+    post_chat(s_scribe_transcript);
     /* The transcript is sent; Scribe is done. Close it before waiting for
      * Muse's reply, so a later idle close cannot log a spurious error. */
     scribe_realtime_cleanup();
