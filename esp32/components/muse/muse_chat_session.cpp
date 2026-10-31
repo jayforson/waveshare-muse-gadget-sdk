@@ -1453,6 +1453,9 @@ static void text_begin(const char *text)
 #define SCRIBE_RT_PRE_BYTES (160 * 1024)  /* 5 s of 16 kHz PCM, session-start buffer */
 #define SCRIBE_RT_SESSION_TIMEOUT_US (5 * 1000000LL)
 #define SCRIBE_RT_COMMIT_TIMEOUT_US (15 * 1000000LL)
+#define SCRIBE_RT_MSG_BYTES 4096
+#define SCRIBE_RT_TRANSCRIPT_BYTES 2048
+#define SCRIBE_RT_JSON_BYTES 16384
 
 static esp_websocket_client_handle_t s_scribe_ws;
 static std::atomic<bool> s_scribe_session_ready{false};
@@ -1462,12 +1465,15 @@ static int64_t s_scribe_start_us;
 static uint8_t *s_scribe_pre_buf;
 static size_t s_scribe_pre_len;
 static bool s_scribe_pre_sent;
-/* Large buffers live in PSRAM (EXT_RAM_ATTR), not internal DRAM, which
- * is tight on this board; the handler runs on the websocket task, whose
- * stack is small, so these must not be stack buffers either. */
-static EXT_RAM_ATTR char s_scribe_msg[4096];
-static EXT_RAM_ATTR char s_scribe_transcript[2048];
-static EXT_RAM_ATTR char s_scribe_json[16384];
+/* The three large buffers live in PSRAM (allocated with psram_alloc in
+ * scribe_realtime_start, once, and never freed): internal DRAM is tight
+ * on this board, and the handler runs on the websocket task, whose stack
+ * is small, so these must not be stack buffers either. They are never
+ * freed because the websocket task may touch msg/transcript
+ * asynchronously; freeing them at turn end could race it. */
+static char *s_scribe_msg;
+static char *s_scribe_transcript;
+static char *s_scribe_json;
 static char s_scribe_headers[128];  /* static: the websocket task reads it after start returns */
 
 static void scribe_ws_handler(void *arg, esp_event_base_t base, int32_t event_id, void *event_data)
@@ -1492,9 +1498,12 @@ static void scribe_ws_handler(void *arg, esp_event_base_t base, int32_t event_id
     if (!ev || ev->op_code != 1 /* text */ || !ev->data_ptr || ev->data_len == 0) {
         return;
     }
-    size_t n = ev->data_len < (int)sizeof(s_scribe_msg) - 1
+    if (!s_scribe_msg || !s_scribe_transcript) {
+        return;
+    }
+    size_t n = ev->data_len < (int)SCRIBE_RT_MSG_BYTES - 1
                    ? (size_t)ev->data_len
-                   : sizeof(s_scribe_msg) - 1;
+                   : SCRIBE_RT_MSG_BYTES - 1;
     memcpy(s_scribe_msg, ev->data_ptr, n);
     s_scribe_msg[n] = '\0';
     cJSON *msg = cJSON_Parse(s_scribe_msg);
@@ -1519,8 +1528,8 @@ static void scribe_ws_handler(void *arg, esp_event_base_t base, int32_t event_id
                                    text[len - 1] == '\r' || text[len - 1] == '\n')) {
                     len--;
                 }
-                if (len >= sizeof(s_scribe_transcript)) {
-                    len = sizeof(s_scribe_transcript) - 1;
+                if (len >= SCRIBE_RT_TRANSCRIPT_BYTES) {
+                    len = SCRIBE_RT_TRANSCRIPT_BYTES - 1;
                 }
                 memcpy(s_scribe_transcript, text, len);
                 s_scribe_transcript[len] = '\0';
@@ -1551,6 +1560,24 @@ static bool scribe_realtime_start(void)
     s_scribe_session_ready.store(false);
     s_scribe_committed.store(false);
     s_scribe_error.store(0);
+    /* Buffers are allocated from PSRAM once and kept for the life of the
+     * app (never freed): the websocket task touches msg/transcript
+     * asynchronously, so freeing them at turn end could race it. If any
+     * allocation fails, the turn fails; the ones that succeeded stay
+     * allocated and are reused next turn. */
+    if (!s_scribe_msg) {
+        s_scribe_msg = static_cast<char *>(psram_alloc(SCRIBE_RT_MSG_BYTES));
+    }
+    if (!s_scribe_transcript) {
+        s_scribe_transcript = static_cast<char *>(psram_alloc(SCRIBE_RT_TRANSCRIPT_BYTES));
+    }
+    if (!s_scribe_json) {
+        s_scribe_json = static_cast<char *>(psram_alloc(SCRIBE_RT_JSON_BYTES));
+    }
+    if (!s_scribe_msg || !s_scribe_transcript || !s_scribe_json) {
+        ESP_LOGW(TAG, "scribe: no room for buffers");
+        return false;
+    }
     s_scribe_transcript[0] = '\0';
     s_scribe_start_us = now_us();
     s_scribe_pre_buf = static_cast<uint8_t *>(psram_alloc(SCRIBE_RT_PRE_BYTES));
@@ -1602,7 +1629,11 @@ static void scribe_realtime_cleanup(void)
     s_scribe_session_ready.store(false);
     s_scribe_committed.store(false);
     s_scribe_error.store(0);
-    s_scribe_transcript[0] = '\0';
+    /* msg/transcript/json are never freed (see start): the websocket task
+     * may still touch them, so freeing here could race it. */
+    if (s_scribe_transcript) {
+        s_scribe_transcript[0] = '\0';
+    }
 }
 
 static const char *scribe_error_caption(void)
@@ -1618,13 +1649,13 @@ static const char *scribe_error_caption(void)
 static bool scribe_send_chunk(const uint8_t *pcm, size_t pcm_len, bool commit)
 {
     char *o = s_scribe_json;
-    o += snprintf(o, sizeof(s_scribe_json) - (size_t)(o - s_scribe_json),
+    o += snprintf(o, SCRIBE_RT_JSON_BYTES - (size_t)(o - s_scribe_json),
                   "{\"message_type\":\"input_audio_chunk\",\"audio_base_64\":\"");
     o += muse_hatch_base64(pcm, pcm_len, o);
-    o += snprintf(o, sizeof(s_scribe_json) - (size_t)(o - s_scribe_json),
+    o += snprintf(o, SCRIBE_RT_JSON_BYTES - (size_t)(o - s_scribe_json),
                   "\",\"commit\":%s,\"sample_rate\":16000}", commit ? "true" : "false");
     size_t len = (size_t)(o - s_scribe_json);
-    if (len >= sizeof(s_scribe_json)) {
+    if (len >= SCRIBE_RT_JSON_BYTES) {
         return false;
     }
     int sent = esp_websocket_client_send_text(s_scribe_ws, s_scribe_json, (int)len,
