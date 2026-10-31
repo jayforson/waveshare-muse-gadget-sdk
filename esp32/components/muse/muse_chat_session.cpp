@@ -1472,6 +1472,7 @@ static bool s_scribe_pre_sent;
  * freed because the websocket task may touch msg/transcript
  * asynchronously; freeing them at turn end could race it. */
 static char *s_scribe_msg;
+static size_t s_scribe_msg_len;  /* bytes accumulated in s_scribe_msg for the message being reassembled */
 static char *s_scribe_transcript;
 static char *s_scribe_json;
 static char s_scribe_headers[128];  /* static: the websocket task reads it after start returns */
@@ -1495,24 +1496,40 @@ static void scribe_ws_handler(void *arg, esp_event_base_t base, int32_t event_id
         return;
     }
     auto *ev = static_cast<esp_websocket_event_data_t *>(event_data);
-    if (!ev || (ev->op_code != 1 && ev->op_code != 2) /* text or binary JSON */ ||
+    if (!ev || (ev->op_code != 0 && ev->op_code != 1 && ev->op_code != 2) /* continuation, text or binary JSON */ ||
         !ev->data_ptr || ev->data_len == 0) {
         return;
     }
     if (!s_scribe_msg || !s_scribe_transcript) {
         return;
     }
-    size_t n = ev->data_len < (int)SCRIBE_RT_MSG_BYTES - 1
-                   ? (size_t)ev->data_len
-                   : SCRIBE_RT_MSG_BYTES - 1;
-    memcpy(s_scribe_msg, ev->data_ptr, n);
-    s_scribe_msg[n] = '\0';
+    /* Accumulate: a large server message (SessionStarted carries a big
+     * config) can arrive split across frames/events, and each piece
+     * alone is not valid JSON. The old code overwrote the buffer per
+     * event and parsed each piece, so every piece was dropped as
+     * unparseable and the session never became ready (the follow-up
+     * failure: SessionStarted split mid-word, "session never started").
+     * Append instead, and only parse once the accumulated bytes form a
+     * complete JSON message; the buffer is cleared after a message is
+     * consumed, below. If the buffer fills and still does not parse,
+     * it is garbage or oversized: log it and drop it so a bad stream
+     * cannot wedge the session. */
+    size_t room = SCRIBE_RT_MSG_BYTES - 1 - s_scribe_msg_len;
+    size_t n = (size_t)ev->data_len < room ? (size_t)ev->data_len : room;
+    memcpy(s_scribe_msg + s_scribe_msg_len, ev->data_ptr, n);
+    s_scribe_msg_len += n;
+    s_scribe_msg[s_scribe_msg_len] = '\0';
     cJSON *msg = cJSON_Parse(s_scribe_msg);
     if (!msg) {
-        /* Log it: a non-JSON (or truncated) server message would otherwise
-         * vanish silently, which is exactly how the missing-SessionStarted
-         * failure hid. Truncated to keep the log readable. */
-        ESP_LOGW(TAG, "scribe: unparseable msg: %.*s", (int)(n < 200 ? n : 200), s_scribe_msg);
+        if (s_scribe_msg_len >= SCRIBE_RT_MSG_BYTES - 1) {
+            /* Full and still not JSON: drop it, or the next fragment
+             * would have nowhere to go and the session would stall. */
+            ESP_LOGW(TAG, "scribe: unparseable msg: %.*s",
+                     (int)(s_scribe_msg_len < 200 ? s_scribe_msg_len : 200), s_scribe_msg);
+            s_scribe_msg_len = 0;
+            s_scribe_msg[0] = '\0';
+        }
+        /* Otherwise incomplete: wait for the next fragment. */
         return;
     }
     const char *mt = cJSON_GetStringValue(cJSON_GetObjectItem(msg, "message_type"));
@@ -1560,12 +1577,12 @@ static void scribe_ws_handler(void *arg, esp_event_base_t base, int32_t event_id
             /* Unknown type: log it (truncated) so the next failure shows
              * what the server actually sends, instead of vanishing. */
             ESP_LOGW(TAG, "scribe: unrecognized msg type %s: %.*s", mt,
-                     (int)(n < 200 ? n : 200), s_scribe_msg);
+                     (int)(s_scribe_msg_len < 200 ? s_scribe_msg_len : 200), s_scribe_msg);
         }
     } else {
         /* No message_type field: log it so a differently-shaped server
          * message is visible instead of silently ignored. */
-        ESP_LOGW(TAG, "scribe: msg without type: %.*s", (int)(n < 200 ? n : 200), s_scribe_msg);
+        ESP_LOGW(TAG, "scribe: msg without type: %.*s", (int)(s_scribe_msg_len < 200 ? s_scribe_msg_len : 200), s_scribe_msg);
     }
     /* Any parseable non-error message proves the session is live, so it
      * counts as ready even if it is not literally SessionStarted: the
@@ -1575,6 +1592,9 @@ static void scribe_ws_handler(void *arg, esp_event_base_t base, int32_t event_id
         s_scribe_session_ready.store(true);
     }
     cJSON_Delete(msg);
+    /* Message consumed: clear the accumulation buffer for the next one. */
+    s_scribe_msg_len = 0;
+    s_scribe_msg[0] = '\0';
 }
 
 static bool scribe_realtime_start(void)
@@ -1600,6 +1620,8 @@ static bool scribe_realtime_start(void)
         ESP_LOGW(TAG, "scribe: no room for buffers");
         return false;
     }
+    s_scribe_msg_len = 0;
+    s_scribe_msg[0] = '\0';
     s_scribe_transcript[0] = '\0';
     s_scribe_start_us = now_us();
     s_scribe_pre_buf = static_cast<uint8_t *>(psram_alloc(SCRIBE_RT_PRE_BYTES));
@@ -1670,6 +1692,12 @@ static void scribe_realtime_cleanup(void)
      * may still touch them, so freeing here could race it. */
     if (s_scribe_transcript) {
         s_scribe_transcript[0] = '\0';
+    }
+    /* Drop any partial message: a fragment left over from this turn must
+     * not pollute the next turn's first message. */
+    s_scribe_msg_len = 0;
+    if (s_scribe_msg) {
+        s_scribe_msg[0] = '\0';
     }
 }
 
