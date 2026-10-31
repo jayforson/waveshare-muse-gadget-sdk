@@ -1495,7 +1495,8 @@ static void scribe_ws_handler(void *arg, esp_event_base_t base, int32_t event_id
         return;
     }
     auto *ev = static_cast<esp_websocket_event_data_t *>(event_data);
-    if (!ev || ev->op_code != 1 /* text */ || !ev->data_ptr || ev->data_len == 0) {
+    if (!ev || (ev->op_code != 1 && ev->op_code != 2) /* text or binary JSON */ ||
+        !ev->data_ptr || ev->data_len == 0) {
         return;
     }
     if (!s_scribe_msg || !s_scribe_transcript) {
@@ -1508,6 +1509,10 @@ static void scribe_ws_handler(void *arg, esp_event_base_t base, int32_t event_id
     s_scribe_msg[n] = '\0';
     cJSON *msg = cJSON_Parse(s_scribe_msg);
     if (!msg) {
+        /* Log it: a non-JSON (or truncated) server message would otherwise
+         * vanish silently, which is exactly how the missing-SessionStarted
+         * failure hid. Truncated to keep the log readable. */
+        ESP_LOGW(TAG, "scribe: unparseable msg: %.*s", (int)(n < 200 ? n : 200), s_scribe_msg);
         return;
     }
     const char *mt = cJSON_GetStringValue(cJSON_GetObjectItem(msg, "message_type"));
@@ -1549,8 +1554,25 @@ static void scribe_ws_handler(void *arg, esp_event_base_t base, int32_t event_id
             }
             s_scribe_error.store(code);
             ESP_LOGW(TAG, "scribe: error %s", mt);
+        } else if (!strcmp(mt, "PartialTranscript") || !strcmp(mt, "partial_transcript")) {
+            /* Partials are not posted; they only prove the session is live. */
+        } else {
+            /* Unknown type: log it (truncated) so the next failure shows
+             * what the server actually sends, instead of vanishing. */
+            ESP_LOGW(TAG, "scribe: unrecognized msg type %s: %.*s", mt,
+                     (int)(n < 200 ? n : 200), s_scribe_msg);
         }
-        /* PartialTranscript and anything else: ignored (partials are not posted). */
+    } else {
+        /* No message_type field: log it so a differently-shaped server
+         * message is visible instead of silently ignored. */
+        ESP_LOGW(TAG, "scribe: msg without type: %.*s", (int)(n < 200 ? n : 200), s_scribe_msg);
+    }
+    /* Any parseable non-error message proves the session is live, so it
+     * counts as ready even if it is not literally SessionStarted: the
+     * exact SessionStarted wire name turned out to be unreliable (the
+     * server connected but never produced a recognized one). */
+    if (s_scribe_error.load() == 0) {
+        s_scribe_session_ready.store(true);
     }
     cJSON_Delete(msg);
 }
