@@ -2446,6 +2446,46 @@ static void tts_task(void *arg)
 }
 
 /* Hands the text to the fetch task. False: speak nothing, show the text. */
+/* Drop a trailing partial UTF-8 character, if any. A message's text is
+ * capped at TEXT_MAX bytes (strlcat/strlcpy cut by bytes), so a long
+ * reply can end in the middle of a multi-byte character; ElevenLabs
+ * rejects that as invalid UTF-8 (HTTP 400 invalid_unicode) and the
+ * whole message goes silent. Trimming here is safe because the text
+ * is final at this point (no more pages will complete the character:
+ * its remaining bytes were lost to the cap). */
+static void utf8_trim_tail(char *s)
+{
+    size_t len = strlen(s);
+    if (!len) {
+        return;
+    }
+    size_t i = len;
+    while (i > 0 && ((unsigned char)s[i - 1] & 0xc0) == 0x80) {
+        i--;
+    }
+    if (i == 0) {
+        s[0] = '\0';
+        return;
+    }
+    unsigned char lead = (unsigned char)s[i - 1];
+    size_t need;
+    if (lead < 0x80) {
+        return;
+    } else if ((lead & 0xe0) == 0xc0) {
+        need = 2;
+    } else if ((lead & 0xf0) == 0xe0) {
+        need = 3;
+    } else if ((lead & 0xf8) == 0xf0) {
+        need = 4;
+    } else {
+        s[i - 1] = '\0';
+        return;
+    }
+    if (len - (i - 1) < need) {
+        s[i - 1] = '\0';
+    }
+}
+
 static bool tts_start(const char *text)
 {
     if (!s_tts_jobs) {
@@ -2461,6 +2501,7 @@ static bool tts_start(const char *text)
     static tts_job_t j;
     j.job = ++s_tts_job;
     strlcpy(j.text, text, sizeof(j.text));
+    utf8_trim_tail(j.text);
     xStreamBufferReset(s_tts_rx);
     s_tts_ok = false;
     s_tts_busy = true;
