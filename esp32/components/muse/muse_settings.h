@@ -76,10 +76,6 @@ bool muse_settings_speaker_on(void);    /* off: replies are shown, not played */
 bool muse_settings_speak_all(void);     /* on: every push is spoken; off (default): only
                                         * current-conversation content is spoken, automatic
                                         * pushes are dropped before any TTS or decode */
-bool muse_settings_scribe_stt(void);    /* on (default): a voice note is transcribed by
-                                        * ElevenLabs Scribe first (Chinese hint), and the
-                                        * text is sent as a voice turn; off: the note is
-                                        * streamed to Muse as before, server transcribes */
 int muse_settings_tts_fail_reason(void);  /* TTS_FAIL_* above, 0 = none */
 int muse_settings_tts_fail_status(void);  /* HTTP status for TTS_FAIL_STATUS, else 0 */
 void muse_settings_tts_fail_text(char *buf, size_t cap);  /* "—" when none */
@@ -101,7 +97,6 @@ size_t muse_settings_hatch_token_len(void);
 void muse_settings_set_volume(int pct);
 void muse_settings_set_speaker_on(bool on);
 void muse_settings_set_speak_all(bool on);
-void muse_settings_set_scribe_stt(bool on);  /* no listener notify: the session reads it live */
 void muse_settings_set_tts_fail(int reason, int status);  /* diagnostic only, no notify */
 void muse_settings_set_wake_on_battery(bool on);
 void muse_settings_set_mic_gain(int db);

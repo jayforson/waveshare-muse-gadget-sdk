@@ -53,6 +53,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
+#include "esp_websocket_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -125,12 +126,6 @@ static const char *TAG = "muse_chat_session";
 #define VOICE_NOTE 1
 #define NOTE_MAX_BYTES (MIC_RATE * 2 * 32) /* 32 s of 16 kHz PCM; device stops at 30 */
 #define NOTE_PART_BYTES (DICT_CHUNK_BYTES / 4 * 3)   /* staged PCM that base64s to one body chunk */
-/* Scribe first: a note that fits in this PSRAM buffer (8 s of 16 kHz PCM)
- * is transcribed by Scribe instead of streamed to Muse. Longer notes, and
- * any Scribe failure, fall back to the streamed voice note, so the cap is
- * a scope limit, not a length limit. */
-#define SCRIBE_CAP_BYTES (256 * 1024)
-
 #define MAX_MSGS 8
 
 /* ---- Voice task <-> session task ---- */
@@ -230,9 +225,6 @@ struct turn_t {
     size_t chunk_len;
     uint8_t *note;           /* NOTE_PART_BYTES of 16 kHz PCM waiting for base64 */
     size_t note_len;
-    uint8_t *scribe_buf;     /* SCRIBE_CAP_BYTES of 16 kHz PCM, Scribe-first turns */
-    size_t scribe_len;
-    bool scribe_streaming;   /* Scribe gave up mid-note: stream the rest as usual */
     size_t pcm_bytes;        /* the note so far */
     size_t body_sent;
     char *texts;             /* MAX_MSGS * TEXT_MAX: each message's text */
@@ -267,8 +259,8 @@ static int64_t s_marks[M_COUNT];
 static char s_reply_shown[EV_TEXT];   /* the pre-speech caption last sent */
 
 static void mark(mark_t m);
-static bool open_note(void);
-static bool scribe_transcribe(const uint8_t *pcm, size_t pcm_len, char *out, size_t out_cap);
+static bool scribe_realtime_start(void);
+static void scribe_realtime_cleanup(void);
 static void log_marks(void);
 static int16_t *s_pcm;       /* MINIMP3_MAX_SAMPLES_PER_FRAME */
 static int16_t *s_pcm16;     /* resampled output */
@@ -1130,15 +1122,9 @@ static void turn_finish(void)
     s_turn.tts_msg = -1;
     s_turn.silent = false;
     s_turn.mp3_len = 0;
-    /* The Scribe buffer is per-turn: free it before the heap line, so the
-     * line never reports it as a leak. turn_start's reset zeroes the (NULL)
-     * pointer afterwards, so a stale pointer cannot survive. */
-    if (s_turn.scribe_buf) {
-        heap_caps_free(s_turn.scribe_buf);
-        s_turn.scribe_buf = nullptr;
-        s_turn.scribe_len = 0;
-        s_turn.scribe_streaming = false;
-    }
+    /* Scribe realtime is per-turn: close it before the heap line, so a
+     * still-open socket or session buffer never reads as a leak. */
+    scribe_realtime_cleanup();
     ESP_LOGI(TAG, "heap internal free %u largest %u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
@@ -1219,16 +1205,12 @@ static void turn_begin(uint32_t gen)
         return;
     }
     if (VOICE_NOTE) {
-        if (!muse_settings_scribe_stt()) {
-            /* Scribe off: stream the note to Muse as before. */
-            if (!open_note()) {
-                disconnect("chat open failed");
-                turn_fail("CAN'T REACH MUSE");
-                return;
-            }
+        /* v4: ElevenLabs realtime only. The Muse note stream is not opened;
+         * if Scribe cannot start, the turn fails (no fallback). */
+        if (!scribe_realtime_start()) {
+            turn_fail("SCRIBE ERROR");
+            return;
         }
-        /* Scribe on: the note stream opens only on fallback (record_note_scribe
-         * opens it when Scribe fails or the note outgrows SCRIBE_CAP_BYTES). */
         s_turn.phase = P_LISTEN;
         return;
     }
@@ -1298,7 +1280,9 @@ static bool pump_mic(void)
 /* ---- Turn: voice note ---- */
 
 /* Base64-encodes the staged PCM into one body chunk; `last` pads and closes the request. */
-static bool send_note_part(bool last)
+/* Unused in v4 (ElevenLabs realtime only): the Muse voice-note path,
+ * retained so it can be restored by changing the dispatcher. */
+bool send_note_part(bool last)
 {
     char *o = reinterpret_cast<char *>(s_turn.chunk);
     o += muse_hatch_base64(s_turn.note, s_turn.note_len, o);
@@ -1318,7 +1302,7 @@ static bool send_note_part(bool last)
  * isn't known until the end, so the WAV header gives the streaming "unknown"
  * size and the server reads to the end of the data.
  */
-static bool open_note(void)
+bool open_note(void)
 {
     s_turn.chat_id = open_stream(K_CHAT, "POST", "/chat/stream", "application/json", nullptr, nullptr, false);
     if (!s_turn.chat_id) {
@@ -1334,7 +1318,7 @@ static bool open_note(void)
 }
 
 /* Moves the mic into the note request; on release, sends the rest and waits for the reply. */
-static bool record_note(void)
+bool record_note(void)
 {
     for (;;) {
         size_t room = NOTE_PART_BYTES - s_turn.note_len;
@@ -1439,109 +1423,327 @@ static void text_begin(const char *text)
 }
 
 /*
- * Feeds the Scribe buffer through the note staging buffer as a streamed
- * voice note. last=true marks the final chunk (release case); false leaves
- * the stream open for the rest of the recording (cap case).
+ * Scribe realtime (v4, ElevenLabs only, no Muse fallback). A voice turn
+ * opens one WebSocket to ElevenLabs Scribe realtime, streams mic PCM
+ * (16 kHz mono, base64) as input_audio_chunk messages, commits on
+ * release, and sends the committed transcript as a voice turn
+ * (post_chat), so the reply is spoken as usual. There is no Muse
+ * voice-note path in v4: if Scribe fails, the turn fails and the user
+ * retries; rolling back means reflashing v3-final.
+ *
+ * Session config is in the connection URL (the API takes no other
+ * client message): model scribe_v2_realtime, language zh (the Chinese
+ * hint), manual commit (the gadget commits on release, it does not
+ * rely on server VAD), audio pcm_16000. Auth is the xi-api-key header
+ * (same key the TTS fetch uses). The server answers SessionStarted,
+ * PartialTranscript (ignored), CommittedTranscript (the final text),
+ * and error messages; both snake_case and PascalCase committed names
+ * are accepted, since the spec lists them in both cases. The 30 s turn
+ * cap (end_requested / NOTE_MAX_BYTES, as in v3) still applies; Scribe
+ * realtime itself has no length cap inside the turn.
+ *
+ * The session usually starts in under a second, but the rising chirp
+ * plays at P_LISTEN (before the session is confirmed), so mic audio
+ * arriving before SessionStarted is held in a 5 s PSRAM pre-buffer and
+ * sent first once the session is ready. If the session is still not
+ * ready when the buffer fills (5 s of audio), the turn fails rather
+ * than transcribing a clip that is missing its start.
  */
-static bool scribe_feed_buffer(bool last)
+#define SCRIBE_RT_URL "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&language_code=zh&commit_strategy=manual&audio_format=pcm_16000"
+#define SCRIBE_RT_PRE_BYTES (160 * 1024)  /* 5 s of 16 kHz PCM, session-start buffer */
+#define SCRIBE_RT_SESSION_TIMEOUT_US (5 * 1000000LL)
+#define SCRIBE_RT_COMMIT_TIMEOUT_US (15 * 1000000LL)
+
+static esp_websocket_client_handle_t s_scribe_ws;
+static std::atomic<bool> s_scribe_session_ready{false};
+static std::atomic<bool> s_scribe_committed{false};
+static std::atomic<int> s_scribe_error{0};  /* 0 none, 1 auth, 2 quota, 3 other, 4 dropped */
+static int64_t s_scribe_start_us;
+static uint8_t *s_scribe_pre_buf;
+static size_t s_scribe_pre_len;
+static bool s_scribe_pre_sent;
+/* Large buffers live in PSRAM (EXT_RAM_ATTR), not internal DRAM, which
+ * is tight on this board; the handler runs on the websocket task, whose
+ * stack is small, so these must not be stack buffers either. */
+static EXT_RAM_ATTR char s_scribe_msg[4096];
+static EXT_RAM_ATTR char s_scribe_transcript[2048];
+static EXT_RAM_ATTR char s_scribe_json[16384];
+static char s_scribe_headers[128];  /* static: the websocket task reads it after start returns */
+
+static void scribe_ws_handler(void *arg, esp_event_base_t base, int32_t event_id, void *event_data)
 {
-    size_t off = 0;
-    while (off < s_turn.scribe_len) {
-        size_t chunk = s_turn.scribe_len - off < NOTE_PART_BYTES ? s_turn.scribe_len - off : NOTE_PART_BYTES;
-        memcpy(s_turn.note, s_turn.scribe_buf + off, chunk);
-        s_turn.note_len = chunk;
-        bool final = last && (off + chunk == s_turn.scribe_len);
-        if (!send_note_part(final)) {
-            return false;
+    (void)arg;
+    (void)base;
+    if (event_id == WEBSOCKET_EVENT_CONNECTED) {
+        ESP_LOGI(TAG, "scribe: connected");
+        return;
+    }
+    if (event_id == WEBSOCKET_EVENT_DISCONNECTED || event_id == WEBSOCKET_EVENT_ERROR) {
+        ESP_LOGW(TAG, "scribe: websocket dropped");
+        if (!s_scribe_committed.load()) {
+            s_scribe_error.store(4);
         }
-        off += chunk;
+        return;
+    }
+    if (event_id != WEBSOCKET_EVENT_DATA) {
+        return;
+    }
+    auto *ev = static_cast<esp_websocket_event_data_t *>(event_data);
+    if (!ev || ev->op_code != 1 /* text */ || !ev->data_ptr || ev->data_len == 0) {
+        return;
+    }
+    size_t n = ev->data_len < (int)sizeof(s_scribe_msg) - 1
+                   ? (size_t)ev->data_len
+                   : sizeof(s_scribe_msg) - 1;
+    memcpy(s_scribe_msg, ev->data_ptr, n);
+    s_scribe_msg[n] = '\0';
+    cJSON *msg = cJSON_Parse(s_scribe_msg);
+    if (!msg) {
+        return;
+    }
+    const char *mt = cJSON_GetStringValue(cJSON_GetObjectItem(msg, "message_type"));
+    if (mt) {
+        if (!strcmp(mt, "SessionStarted") || !strcmp(mt, "session_started")) {
+            s_scribe_session_ready.store(true);
+            ESP_LOGI(TAG, "scribe: session started");
+        } else if (!strcmp(mt, "CommittedTranscript") || !strcmp(mt, "committed_transcript") ||
+                   !strcmp(mt, "CommittedTranscriptWithTimestamps") ||
+                   !strcmp(mt, "committed_transcript_with_timestamps")) {
+            const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(msg, "text"));
+            if (text) {
+                while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') {
+                    text++;
+                }
+                size_t len = strlen(text);
+                while (len > 0 && (text[len - 1] == ' ' || text[len - 1] == '\t' ||
+                                   text[len - 1] == '\r' || text[len - 1] == '\n')) {
+                    len--;
+                }
+                if (len >= sizeof(s_scribe_transcript)) {
+                    len = sizeof(s_scribe_transcript) - 1;
+                }
+                memcpy(s_scribe_transcript, text, len);
+                s_scribe_transcript[len] = '\0';
+                s_scribe_committed.store(true);
+                ESP_LOGI(TAG, "scribe: committed transcript %u chars", (unsigned)len);
+            } else {
+                /* Committed but empty: the audio had no speech. */
+                s_scribe_transcript[0] = '\0';
+                s_scribe_committed.store(true);
+            }
+        } else if (strstr(mt, "Error") || strstr(mt, "error")) {
+            int code = 3;
+            if (strstr(mt, "Auth")) {
+                code = 1;
+            } else if (strstr(mt, "Quota")) {
+                code = 2;
+            }
+            s_scribe_error.store(code);
+            ESP_LOGW(TAG, "scribe: error %s", mt);
+        }
+        /* PartialTranscript and anything else: ignored (partials are not posted). */
+    }
+    cJSON_Delete(msg);
+}
+
+static bool scribe_realtime_start(void)
+{
+    s_scribe_session_ready.store(false);
+    s_scribe_committed.store(false);
+    s_scribe_error.store(0);
+    s_scribe_transcript[0] = '\0';
+    s_scribe_start_us = now_us();
+    s_scribe_pre_buf = static_cast<uint8_t *>(psram_alloc(SCRIBE_RT_PRE_BYTES));
+    s_scribe_pre_len = 0;
+    s_scribe_pre_sent = false;
+    if (!s_scribe_pre_buf) {
+        ESP_LOGW(TAG, "scribe: no room for session buffer");
+        return false;
+    }
+    snprintf(s_scribe_headers, sizeof(s_scribe_headers), "xi-api-key: %s",
+             CONFIG_MUSE_ELEVENLABS_API_KEY);
+    esp_websocket_client_config_t cfg = {};
+    cfg.uri = SCRIBE_RT_URL;
+    cfg.headers = s_scribe_headers;
+    cfg.buffer_size = 16384;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    s_scribe_ws = esp_websocket_client_init(&cfg);
+    if (!s_scribe_ws) {
+        ESP_LOGW(TAG, "scribe: websocket init failed");
+        heap_caps_free(s_scribe_pre_buf);
+        s_scribe_pre_buf = nullptr;
+        return false;
+    }
+    esp_websocket_register_events(s_scribe_ws, WEBSOCKET_EVENT_ANY, scribe_ws_handler, nullptr);
+    if (esp_websocket_client_start(s_scribe_ws) != ESP_OK) {
+        ESP_LOGW(TAG, "scribe: websocket start failed");
+        esp_websocket_client_destroy(s_scribe_ws);
+        s_scribe_ws = nullptr;
+        heap_caps_free(s_scribe_pre_buf);
+        s_scribe_pre_buf = nullptr;
+        return false;
     }
     return true;
 }
 
-static void scribe_free_buffer(void)
+static void scribe_realtime_cleanup(void)
 {
-    if (s_turn.scribe_buf) {
-        heap_caps_free(s_turn.scribe_buf);
-        s_turn.scribe_buf = nullptr;
-        s_turn.scribe_len = 0;
+    if (s_scribe_ws) {
+        esp_websocket_client_stop(s_scribe_ws);
+        esp_websocket_client_destroy(s_scribe_ws);
+        s_scribe_ws = nullptr;
+    }
+    if (s_scribe_pre_buf) {
+        heap_caps_free(s_scribe_pre_buf);
+        s_scribe_pre_buf = nullptr;
+        s_scribe_pre_len = 0;
+        s_scribe_pre_sent = false;
+    }
+    s_scribe_session_ready.store(false);
+    s_scribe_committed.store(false);
+    s_scribe_error.store(0);
+    s_scribe_transcript[0] = '\0';
+}
+
+static const char *scribe_error_caption(void)
+{
+    switch (s_scribe_error.load()) {
+        case 1: return "SCRIBE AUTH FAILED";
+        case 2: return "SCRIBE QUOTA";
+        case 4: return "SCRIBE DROPPED";
+        default: return "SCRIBE ERROR";
     }
 }
 
-/*
- * Scribe-first note recording. Mirrors record_note's loop, but buffers the
- * mic into s_turn.scribe_buf instead of streaming it to Muse, so Scribe
- * gets a complete file. The note stream to Muse opens only on fallback, so
- * a Scribe turn never sends the note at all.
- *
- * Fallback, two cases:
- * - release (note complete, Scribe failed): feed the buffered note as a
- *   streamed voice note, then run record_note's final block (same log and
- *   state). The streaming path itself is untouched.
- * - cap (note outgrew SCRIBE_CAP_BYTES mid-recording): feed the buffered
- *   prefix (not final), mark scribe_streaming, and hand the rest of the
- *   recording to record_note, which streams it as usual.
- */
-static bool record_note_scribe(void)
+static bool scribe_send_chunk(const uint8_t *pcm, size_t pcm_len, bool commit)
 {
-    if (!s_turn.scribe_buf) {
-        s_turn.scribe_buf = static_cast<uint8_t *>(psram_alloc(SCRIBE_CAP_BYTES));
-        s_turn.scribe_len = 0;
-        if (!s_turn.scribe_buf) {
-            /* No room for the buffer: stream as usual for this turn. */
-            s_turn.scribe_streaming = true;
-            return record_note();
-        }
+    char *o = s_scribe_json;
+    o += snprintf(o, sizeof(s_scribe_json) - (size_t)(o - s_scribe_json),
+                  "{\"message_type\":\"input_audio_chunk\",\"audio_base_64\":\"");
+    o += muse_hatch_base64(pcm, pcm_len, o);
+    o += snprintf(o, sizeof(s_scribe_json) - (size_t)(o - s_scribe_json),
+                  "\",\"commit\":%s,\"sample_rate\":16000}", commit ? "true" : "false");
+    size_t len = (size_t)(o - s_scribe_json);
+    if (len >= sizeof(s_scribe_json)) {
+        return false;
     }
-    for (;;) {
-        size_t room = SCRIBE_CAP_BYTES - s_turn.scribe_len;
-        size_t left = NOTE_MAX_BYTES - s_turn.pcm_bytes;
-        room = (room < left ? room : left) & ~(size_t)1;
-        size_t got = room ? xStreamBufferReceive(s_in, s_turn.scribe_buf + s_turn.scribe_len, room, 0) : 0;
-        if (!got) {
-            break;
+    int sent = esp_websocket_client_send_text(s_scribe_ws, s_scribe_json, (int)len,
+                                              pdMS_TO_TICKS(5000));
+    return sent == (int)len;
+}
+
+static bool scribe_send_prebuffer(void)
+{
+    size_t off = 0;
+    while (off < s_scribe_pre_len) {
+        size_t chunk = s_scribe_pre_len - off;
+        if (chunk > NOTE_PART_BYTES) {
+            chunk = NOTE_PART_BYTES;
         }
-        s_turn.scribe_len += got;
+        if (!scribe_send_chunk(s_scribe_pre_buf + off, chunk, false)) {
+            return false;
+        }
+        off += chunk;
+    }
+    heap_caps_free(s_scribe_pre_buf);
+    s_scribe_pre_buf = nullptr;
+    s_scribe_pre_len = 0;
+    s_scribe_pre_sent = true;
+    return true;
+}
+
+static bool record_scribe_realtime(void)
+{
+    if (!s_turn.note) {
+        turn_fail("SCRIBE ERROR");
+        return false;
+    }
+    if (s_scribe_error.load() != 0) {
+        turn_fail(scribe_error_caption());
+        return false;
+    }
+    size_t room = NOTE_PART_BYTES;
+    size_t left = NOTE_MAX_BYTES - s_turn.pcm_bytes;
+    if (room > left) {
+        room = left;
+    }
+    room &= ~(size_t)1;
+    size_t got = room ? xStreamBufferReceive(s_in, s_turn.note, room, 0) : 0;
+    if (got > 0) {
         s_turn.pcm_bytes += got;
-        if (s_turn.scribe_len == SCRIBE_CAP_BYTES) {
-            if (!open_note() || !scribe_feed_buffer(false)) {
-                scribe_free_buffer();
+        if (!s_scribe_session_ready.load()) {
+            /* Session not confirmed yet: hold the audio, do not drop it. */
+            if (s_scribe_pre_len + got > SCRIBE_RT_PRE_BYTES) {
+                ESP_LOGW(TAG, "scribe: session not ready after 5 s of audio");
+                turn_fail("SCRIBE SESSION TIMEOUT");
                 return false;
             }
-            scribe_free_buffer();
-            s_turn.scribe_streaming = true;
-            return record_note();
+            memcpy(s_scribe_pre_buf + s_scribe_pre_len, s_turn.note, got);
+            s_scribe_pre_len += got;
+        } else {
+            if (!s_scribe_pre_sent && s_scribe_pre_len > 0 && !scribe_send_prebuffer()) {
+                turn_fail(s_scribe_error.load() != 0 ? scribe_error_caption() : "SCRIBE ERROR");
+                return false;
+            }
+            if (!scribe_send_chunk(s_turn.note, got, false)) {
+                turn_fail(s_scribe_error.load() != 0 ? scribe_error_caption() : "SCRIBE ERROR");
+                return false;
+            }
         }
     }
     if (!s_turn.end_requested && s_turn.pcm_bytes < NOTE_MAX_BYTES) {
         return true;
     }
-    mark(M_RELEASE);
+    /* Release (or the turn cap): commit and wait for the final transcript. */
     double secs = (double)s_turn.pcm_bytes / (MIC_RATE * 2);
     if (secs < 0.3) {
-        scribe_free_buffer();
         turn_fail("DIDN'T CATCH THAT");
-        return true;
-    }
-    char transcript[1024];
-    if (scribe_transcribe(s_turn.scribe_buf, s_turn.scribe_len, transcript, sizeof(transcript))) {
-        scribe_free_buffer();
-        post_chat(transcript);
-        return true;
-    }
-    ESP_LOGW(TAG, "scribe: fallback to voice note");
-    if (!open_note() || !scribe_feed_buffer(true)) {
-        scribe_free_buffer();
         return false;
     }
-    scribe_free_buffer();
-    /* record_note's final block, duplicated so the streaming path stays untouched. */
-    ESP_LOGI(TAG, "voice note: %.2fs, %u byte request", secs, (unsigned)s_turn.body_sent);
-    mark(M_SENT);
-    s_turn.chat_posted = true;
-    s_turn.chat_us = s_turn.last_event_us = now_us();
-    s_turn.phase = P_WAIT_REPLY;
-    conv_timer_reset();
+    while (!s_scribe_session_ready.load()) {
+        if (s_scribe_error.load() != 0) {
+            turn_fail(scribe_error_caption());
+            return false;
+        }
+        if (now_us() > s_scribe_start_us + SCRIBE_RT_SESSION_TIMEOUT_US) {
+            ESP_LOGW(TAG, "scribe: session never started");
+            turn_fail("SCRIBE SESSION TIMEOUT");
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (!s_scribe_pre_sent && s_scribe_pre_len > 0 && !scribe_send_prebuffer()) {
+        turn_fail(s_scribe_error.load() != 0 ? scribe_error_caption() : "SCRIBE ERROR");
+        return false;
+    }
+    if (!scribe_send_chunk(reinterpret_cast<const uint8_t *>(""), 0, true)) {
+        turn_fail(s_scribe_error.load() != 0 ? scribe_error_caption() : "SCRIBE ERROR");
+        return false;
+    }
+    int64_t commit_us = now_us();
+    while (!s_scribe_committed.load()) {
+        if (s_scribe_error.load() != 0) {
+            turn_fail(scribe_error_caption());
+            return false;
+        }
+        if (now_us() > commit_us + SCRIBE_RT_COMMIT_TIMEOUT_US) {
+            ESP_LOGW(TAG, "scribe: no committed transcript after commit");
+            turn_fail("SCRIBE TIMEOUT");
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (s_scribe_transcript[0] == '\0') {
+        turn_fail("NO SPEECH");
+        return false;
+    }
+    if (!post_chat(s_scribe_transcript)) {
+        turn_fail("CAN'T REACH MUSE");
+        return false;
+    }
+    /* The transcript is sent; Scribe is done. Close it before waiting for
+     * Muse's reply, so a later idle close cannot log a spurious error. */
+    scribe_realtime_cleanup();
     return true;
 }
 
@@ -2159,170 +2361,6 @@ static bool tts_fetch(const tts_job_t &j)
         esp_http_client_cleanup(c);
     }
     cJSON_free(body);
-    return ok;
-}
-
-/* A 44-byte WAV header for 16 kHz mono 16-bit PCM, with the real data size
- * (unlike the streaming header open_note writes, which leaves it unknown). */
-static void scribe_wav_header(uint8_t *b, size_t pcm_len)
-{
-    auto put32 = [&](size_t off, uint32_t v) {
-        b[off] = v & 0xff;
-        b[off + 1] = (v >> 8) & 0xff;
-        b[off + 2] = (v >> 16) & 0xff;
-        b[off + 3] = (v >> 24) & 0xff;
-    };
-    auto put16 = [&](size_t off, uint16_t v) {
-        b[off] = v & 0xff;
-        b[off + 1] = (v >> 8) & 0xff;
-    };
-    memcpy(b, "RIFF", 4);
-    put32(4, 36 + (uint32_t)pcm_len);
-    memcpy(b + 8, "WAVE", 4);
-    memcpy(b + 12, "fmt ", 4);
-    put32(16, 16);
-    put16(20, 1);
-    put16(22, 1);
-    put32(24, MIC_RATE);
-    put32(28, MIC_RATE * 2);
-    put16(32, 2);
-    put16(34, 16);
-    memcpy(b + 36, "data", 4);
-    put32(40, (uint32_t)pcm_len);
-}
-
-/*
- * Transcribes one complete note with ElevenLabs Scribe (batch API). The
- * request is minimal on purpose -- file, model_id, language_code only --
- * so a wrong optional field cannot 400 the whole call. The language hint
- * is the point: "zh" tells Scribe the audio is Chinese instead of leaving
- * it to auto-detect, which is what the server path gets wrong. The same
- * ElevenLabs key the TTS fetch already uses authenticates it; nothing new
- * is stored on the device. Any failure returns false and the caller falls
- * back to the streamed voice note, so Scribe can never break a turn.
- */
-static bool scribe_transcribe(const uint8_t *pcm, size_t pcm_len, char *out, size_t out_cap)
-{
-    static const char *kBoundary = "----MuseScribeBoundary";
-    /* The file part comes last: its binary body follows its blank line. */
-    char pre[512];
-    int pre_len = snprintf(pre, sizeof(pre),
-        "--%s\r\n"
-        "Content-Disposition: form-data; name=\"model_id\"\r\n\r\n"
-        "scribe_v2\r\n"
-        "--%s\r\n"
-        "Content-Disposition: form-data; name=\"language_code\"\r\n\r\n"
-        "zh\r\n"
-        "--%s\r\n"
-        "Content-Disposition: form-data; name=\"file\"; filename=\"note.wav\"\r\n"
-        "Content-Type: audio/wav\r\n\r\n",
-        kBoundary, kBoundary, kBoundary);
-    char post[64];
-    int post_len = snprintf(post, sizeof(post), "\r\n--%s--\r\n", kBoundary);
-    if (pre_len <= 0 || pre_len >= (int)sizeof(pre) || post_len <= 0) {
-        return false;
-    }
-    char content_type[128];
-    snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", kBoundary);
-    int64_t total = (int64_t)pre_len + 44 + (int64_t)pcm_len + post_len;
-
-    esp_http_client_config_t cfg = {};
-    cfg.url = "https://api.elevenlabs.io/v1/speech-to-text";
-    cfg.method = HTTP_METHOD_POST;
-    cfg.timeout_ms = 15000;
-    cfg.buffer_size = 4096;
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    esp_http_client_handle_t c = esp_http_client_init(&cfg);
-    if (!c) {
-        ESP_LOGW(TAG, "scribe: can't reach ElevenLabs");
-        return false;
-    }
-    esp_http_client_set_header(c, "xi-api-key", CONFIG_MUSE_ELEVENLABS_API_KEY);
-    esp_http_client_set_header(c, "Content-Type", content_type);
-    esp_http_client_set_header(c, "Accept", "application/json");
-    bool ok = false;
-    uint8_t wav[44];
-    scribe_wav_header(wav, pcm_len);
-    auto write_all = [&](const void *p, size_t n) {
-        return esp_http_client_write(c, (const char *)p, (int)n) == (int)n;
-    };
-    if (esp_http_client_open(c, (int)total) != ESP_OK || !write_all(pre, pre_len) ||
-        !write_all(wav, sizeof(wav))) {
-        ESP_LOGW(TAG, "scribe: can't reach ElevenLabs");
-    } else {
-        bool sent = true;
-        size_t off = 0;
-        while (off < pcm_len) {
-            size_t chunk = pcm_len - off < 4096 ? pcm_len - off : 4096;
-            if (!write_all(pcm + off, chunk)) {
-                sent = false;
-                break;
-            }
-            off += chunk;
-        }
-        if (!sent || !write_all(post, post_len)) {
-            ESP_LOGW(TAG, "scribe: can't reach ElevenLabs");
-        } else {
-            esp_http_client_fetch_headers(c);
-            int status = esp_http_client_get_status_code(c);
-            static uint8_t resp[8192];
-            if (status != 200) {
-                int n = esp_http_client_read(c, (char *)resp, sizeof(resp) - 1);
-                resp[n > 0 ? n : 0] = '\0';
-                ESP_LOGW(TAG, "scribe: ElevenLabs HTTP %d %s", status, (char *)resp);
-            } else {
-                size_t got = 0;
-                bool over = false;
-                for (;;) {
-                    int n = esp_http_client_read(c, (char *)resp + got, (int)(sizeof(resp) - 1 - got));
-                    if (n <= 0) {
-                        break;
-                    }
-                    got += (size_t)n;
-                    if (got >= sizeof(resp) - 1) {
-                        over = true;
-                        break;
-                    }
-                }
-                if (over) {
-                    ESP_LOGW(TAG, "scribe: response too large");
-                } else {
-                    resp[got] = '\0';
-                    cJSON *parsed = cJSON_Parse((const char *)resp);
-                    if (!parsed) {
-                        ESP_LOGW(TAG, "scribe: bad JSON");
-                    } else {
-                        const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(parsed, "text"));
-                        const char *lang = cJSON_GetStringValue(cJSON_GetObjectItem(parsed, "language_code"));
-                        if (text) {
-                            while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') {
-                                text++;
-                            }
-                            size_t len = strlen(text);
-                            while (len > 0 && (text[len - 1] == ' ' || text[len - 1] == '\t' ||
-                                               text[len - 1] == '\r' || text[len - 1] == '\n')) {
-                                len--;
-                            }
-                            if (len > 0 && len < out_cap) {
-                                memcpy(out, text, len);
-                                out[len] = '\0';
-                                ok = true;
-                                ESP_LOGI(TAG, "scribe: transcript %u chars%s%s", (unsigned)len,
-                                         lang ? ", language " : "", lang ? lang : "");
-                            } else {
-                                ESP_LOGW(TAG, "scribe: empty transcript");
-                            }
-                        } else {
-                            ESP_LOGW(TAG, "scribe: no text field");
-                        }
-                        cJSON_Delete(parsed);
-                    }
-                }
-            }
-        }
-    }
-    esp_http_client_close(c);
-    esp_http_client_cleanup(c);
     return ok;
 }
 
@@ -2985,11 +3023,7 @@ static void hatch_task(void *arg)
         }
         bool sent = true;
         if (s_turn.phase == P_LISTEN) {
-            if (VOICE_NOTE && muse_settings_scribe_stt() && !s_turn.scribe_streaming) {
-                sent = record_note_scribe();
-            } else {
-                sent = VOICE_NOTE ? record_note() : pump_mic();
-            }
+            sent = VOICE_NOTE ? record_scribe_realtime() : pump_mic();
         }
         if (!sent) {
             drop_connection("send failed");

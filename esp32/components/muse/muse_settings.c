@@ -35,7 +35,6 @@ static struct {
     uint8_t volume;
     bool speaker_on;
     bool speak_all;
-    bool scribe_stt;
     int tts_fail_reason;
     int tts_fail_status;
     bool wake_on_battery;
@@ -56,8 +55,6 @@ static struct {
     .speaker_on = true,
     /* speak_all defaults off: only current-conversation content is spoken,
      * automatic pushes are dropped before any TTS or decode. */
-    /* scribe_stt defaults on: Scribe first, voice-note stream on failure. */
-    .scribe_stt = true,
     .mic_gain = 30,
     .sw_gain = 2,
     .silence_s = MUSE_SILENCE_S_DEFAULT,
@@ -134,9 +131,6 @@ esp_err_t muse_settings_init(void)
     if (nvs_get_u8(s_nvs, "speak_all", &b) == ESP_OK) {
         s.speak_all = b;
     }
-    if (nvs_get_u8(s_nvs, "scribe_stt", &b) == ESP_OK) {
-        s.scribe_stt = b;
-    }
     if (nvs_get_u8(s_nvs, "tts_fail", &b) == ESP_OK) {
         s.tts_fail_reason = b;
     }
@@ -170,7 +164,6 @@ esp_err_t muse_settings_init(void)
     s.silence_s = clampi(s.silence_s, MUSE_SILENCE_S_MIN, MUSE_SILENCE_S_MAX);
     s.brightness = clampi(s.brightness, 10, 100);
     ESP_LOGI(TAG, "speak all pushes %s", s.speak_all ? "on" : "off");
-    ESP_LOGI(TAG, "scribe transcription %s", s.scribe_stt ? "on" : "off");
     if (s.tts_fail_reason) {
         ESP_LOGI(TAG, "last speech failure %d status %d", s.tts_fail_reason, s.tts_fail_status);
     }
@@ -188,7 +181,6 @@ void muse_settings_set_listener(muse_setting_cb_t cb)
 int muse_settings_volume(void) { return s.volume; }
 bool muse_settings_speaker_on(void) { return s.speaker_on; }
 bool muse_settings_speak_all(void) { return s.speak_all; }
-bool muse_settings_scribe_stt(void) { return s.scribe_stt; }
 int muse_settings_tts_fail_reason(void) { return s.tts_fail_reason; }
 int muse_settings_tts_fail_status(void) { return s.tts_fail_status; }
 
@@ -272,12 +264,6 @@ void muse_settings_set_speak_all(bool on)
     s.speak_all = on;
     save_u8("speak_all", on);
     notify(MUSE_SETTING_SPEAK_ALL);
-}
-
-void muse_settings_set_scribe_stt(bool on)
-{
-    s.scribe_stt = on;
-    save_u8("scribe_stt", on);
 }
 
 /* Diagnostic only: no listener notification, since no hardware applies it. */

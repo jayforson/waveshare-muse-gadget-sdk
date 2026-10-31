@@ -125,7 +125,7 @@ set(muse_priv_requires
     bt esp-tls mbedtls esp_app_format esp_http_client
     noise_core minimp3
     esp_lcd esp_adc esp_driver_i2s esp_driver_ledc esp_driver_spi esp_driver_uart esp_wifi
-    esp_driver_pcnt)
+    esp_driver_pcnt esp_websocket_client)
 if(CONFIG_MUSE_BOARD_WAVESHARE_S3_185B)
     list(APPEND muse_priv_requires esp_netif)   # face-tile clock: esp_netif_sntp
 endif()
