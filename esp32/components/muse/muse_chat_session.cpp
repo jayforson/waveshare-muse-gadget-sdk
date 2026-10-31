@@ -125,6 +125,11 @@ static const char *TAG = "muse_chat_session";
 #define VOICE_NOTE 1
 #define NOTE_MAX_BYTES (MIC_RATE * 2 * 32) /* 32 s of 16 kHz PCM; device stops at 30 */
 #define NOTE_PART_BYTES (DICT_CHUNK_BYTES / 4 * 3)   /* staged PCM that base64s to one body chunk */
+/* Scribe first: a note that fits in this PSRAM buffer (8 s of 16 kHz PCM)
+ * is transcribed by Scribe instead of streamed to Muse. Longer notes, and
+ * any Scribe failure, fall back to the streamed voice note, so the cap is
+ * a scope limit, not a length limit. */
+#define SCRIBE_CAP_BYTES (256 * 1024)
 
 #define MAX_MSGS 8
 
@@ -225,6 +230,9 @@ struct turn_t {
     size_t chunk_len;
     uint8_t *note;           /* NOTE_PART_BYTES of 16 kHz PCM waiting for base64 */
     size_t note_len;
+    uint8_t *scribe_buf;     /* SCRIBE_CAP_BYTES of 16 kHz PCM, Scribe-first turns */
+    size_t scribe_len;
+    bool scribe_streaming;   /* Scribe gave up mid-note: stream the rest as usual */
     size_t pcm_bytes;        /* the note so far */
     size_t body_sent;
     char *texts;             /* MAX_MSGS * TEXT_MAX: each message's text */
@@ -260,6 +268,7 @@ static char s_reply_shown[EV_TEXT];   /* the pre-speech caption last sent */
 
 static void mark(mark_t m);
 static bool open_note(void);
+static bool scribe_transcribe(const uint8_t *pcm, size_t pcm_len, char *out, size_t out_cap);
 static void log_marks(void);
 static int16_t *s_pcm;       /* MINIMP3_MAX_SAMPLES_PER_FRAME */
 static int16_t *s_pcm16;     /* resampled output */
@@ -1121,6 +1130,15 @@ static void turn_finish(void)
     s_turn.tts_msg = -1;
     s_turn.silent = false;
     s_turn.mp3_len = 0;
+    /* The Scribe buffer is per-turn: free it before the heap line, so the
+     * line never reports it as a leak. turn_start's reset zeroes the (NULL)
+     * pointer afterwards, so a stale pointer cannot survive. */
+    if (s_turn.scribe_buf) {
+        heap_caps_free(s_turn.scribe_buf);
+        s_turn.scribe_buf = nullptr;
+        s_turn.scribe_len = 0;
+        s_turn.scribe_streaming = false;
+    }
     ESP_LOGI(TAG, "heap internal free %u largest %u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
@@ -1201,11 +1219,16 @@ static void turn_begin(uint32_t gen)
         return;
     }
     if (VOICE_NOTE) {
-        if (!open_note()) {
-            disconnect("chat open failed");
-            turn_fail("CAN'T REACH MUSE");
-            return;
+        if (!muse_settings_scribe_stt()) {
+            /* Scribe off: stream the note to Muse as before. */
+            if (!open_note()) {
+                disconnect("chat open failed");
+                turn_fail("CAN'T REACH MUSE");
+                return;
+            }
         }
+        /* Scribe on: the note stream opens only on fallback (record_note_scribe
+         * opens it when Scribe fails or the note outgrows SCRIBE_CAP_BYTES). */
         s_turn.phase = P_LISTEN;
         return;
     }
@@ -1413,6 +1436,113 @@ static void text_begin(const char *text)
         mark(M_SENT);
         muse_hatch_console("sent", nullptr, "\"bytes\":%u", (unsigned)strlen(text));
     }
+}
+
+/*
+ * Feeds the Scribe buffer through the note staging buffer as a streamed
+ * voice note. last=true marks the final chunk (release case); false leaves
+ * the stream open for the rest of the recording (cap case).
+ */
+static bool scribe_feed_buffer(bool last)
+{
+    size_t off = 0;
+    while (off < s_turn.scribe_len) {
+        size_t chunk = s_turn.scribe_len - off < NOTE_PART_BYTES ? s_turn.scribe_len - off : NOTE_PART_BYTES;
+        memcpy(s_turn.note, s_turn.scribe_buf + off, chunk);
+        s_turn.note_len = chunk;
+        bool final = last && (off + chunk == s_turn.scribe_len);
+        if (!send_note_part(final)) {
+            return false;
+        }
+        off += chunk;
+    }
+    return true;
+}
+
+static void scribe_free_buffer(void)
+{
+    if (s_turn.scribe_buf) {
+        heap_caps_free(s_turn.scribe_buf);
+        s_turn.scribe_buf = nullptr;
+        s_turn.scribe_len = 0;
+    }
+}
+
+/*
+ * Scribe-first note recording. Mirrors record_note's loop, but buffers the
+ * mic into s_turn.scribe_buf instead of streaming it to Muse, so Scribe
+ * gets a complete file. The note stream to Muse opens only on fallback, so
+ * a Scribe turn never sends the note at all.
+ *
+ * Fallback, two cases:
+ * - release (note complete, Scribe failed): feed the buffered note as a
+ *   streamed voice note, then run record_note's final block (same log and
+ *   state). The streaming path itself is untouched.
+ * - cap (note outgrew SCRIBE_CAP_BYTES mid-recording): feed the buffered
+ *   prefix (not final), mark scribe_streaming, and hand the rest of the
+ *   recording to record_note, which streams it as usual.
+ */
+static bool record_note_scribe(void)
+{
+    if (!s_turn.scribe_buf) {
+        s_turn.scribe_buf = static_cast<uint8_t *>(psram_alloc(SCRIBE_CAP_BYTES));
+        s_turn.scribe_len = 0;
+        if (!s_turn.scribe_buf) {
+            /* No room for the buffer: stream as usual for this turn. */
+            s_turn.scribe_streaming = true;
+            return record_note();
+        }
+    }
+    for (;;) {
+        size_t room = SCRIBE_CAP_BYTES - s_turn.scribe_len;
+        size_t left = NOTE_MAX_BYTES - s_turn.pcm_bytes;
+        room = (room < left ? room : left) & ~(size_t)1;
+        size_t got = room ? xStreamBufferReceive(s_in, s_turn.scribe_buf + s_turn.scribe_len, room, 0) : 0;
+        if (!got) {
+            break;
+        }
+        s_turn.scribe_len += got;
+        s_turn.pcm_bytes += got;
+        if (s_turn.scribe_len == SCRIBE_CAP_BYTES) {
+            if (!open_note() || !scribe_feed_buffer(false)) {
+                scribe_free_buffer();
+                return false;
+            }
+            scribe_free_buffer();
+            s_turn.scribe_streaming = true;
+            return record_note();
+        }
+    }
+    if (!s_turn.end_requested && s_turn.pcm_bytes < NOTE_MAX_BYTES) {
+        return true;
+    }
+    mark(M_RELEASE);
+    double secs = (double)s_turn.pcm_bytes / (MIC_RATE * 2);
+    if (secs < 0.3) {
+        scribe_free_buffer();
+        turn_fail("DIDN'T CATCH THAT");
+        return true;
+    }
+    char transcript[1024];
+    if (scribe_transcribe(s_turn.scribe_buf, s_turn.scribe_len, transcript, sizeof(transcript))) {
+        scribe_free_buffer();
+        post_chat(transcript);
+        return true;
+    }
+    ESP_LOGW(TAG, "scribe: fallback to voice note");
+    if (!open_note() || !scribe_feed_buffer(true)) {
+        scribe_free_buffer();
+        return false;
+    }
+    scribe_free_buffer();
+    /* record_note's final block, duplicated so the streaming path stays untouched. */
+    ESP_LOGI(TAG, "voice note: %.2fs, %u byte request", secs, (unsigned)s_turn.body_sent);
+    mark(M_SENT);
+    s_turn.chat_posted = true;
+    s_turn.chat_us = s_turn.last_event_us = now_us();
+    s_turn.phase = P_WAIT_REPLY;
+    conv_timer_reset();
+    return true;
 }
 
 static void on_dictation_line(cJSON *line)
@@ -2029,6 +2159,170 @@ static bool tts_fetch(const tts_job_t &j)
         esp_http_client_cleanup(c);
     }
     cJSON_free(body);
+    return ok;
+}
+
+/* A 44-byte WAV header for 16 kHz mono 16-bit PCM, with the real data size
+ * (unlike the streaming header open_note writes, which leaves it unknown). */
+static void scribe_wav_header(uint8_t *b, size_t pcm_len)
+{
+    auto put32 = [&](size_t off, uint32_t v) {
+        b[off] = v & 0xff;
+        b[off + 1] = (v >> 8) & 0xff;
+        b[off + 2] = (v >> 16) & 0xff;
+        b[off + 3] = (v >> 24) & 0xff;
+    };
+    auto put16 = [&](size_t off, uint16_t v) {
+        b[off] = v & 0xff;
+        b[off + 1] = (v >> 8) & 0xff;
+    };
+    memcpy(b, "RIFF", 4);
+    put32(4, 36 + (uint32_t)pcm_len);
+    memcpy(b + 8, "WAVE", 4);
+    memcpy(b + 12, "fmt ", 4);
+    put32(16, 16);
+    put16(20, 1);
+    put16(22, 1);
+    put32(24, MIC_RATE);
+    put32(28, MIC_RATE * 2);
+    put16(32, 2);
+    put16(34, 16);
+    memcpy(b + 36, "data", 4);
+    put32(40, (uint32_t)pcm_len);
+}
+
+/*
+ * Transcribes one complete note with ElevenLabs Scribe (batch API). The
+ * request is minimal on purpose -- file, model_id, language_code only --
+ * so a wrong optional field cannot 400 the whole call. The language hint
+ * is the point: "zh" tells Scribe the audio is Chinese instead of leaving
+ * it to auto-detect, which is what the server path gets wrong. The same
+ * ElevenLabs key the TTS fetch already uses authenticates it; nothing new
+ * is stored on the device. Any failure returns false and the caller falls
+ * back to the streamed voice note, so Scribe can never break a turn.
+ */
+static bool scribe_transcribe(const uint8_t *pcm, size_t pcm_len, char *out, size_t out_cap)
+{
+    static const char *kBoundary = "----MuseScribeBoundary";
+    /* The file part comes last: its binary body follows its blank line. */
+    char pre[512];
+    int pre_len = snprintf(pre, sizeof(pre),
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"model_id\"\r\n\r\n"
+        "scribe_v2\r\n"
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"language_code\"\r\n\r\n"
+        "zh\r\n"
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=\"note.wav\"\r\n"
+        "Content-Type: audio/wav\r\n\r\n",
+        kBoundary, kBoundary, kBoundary);
+    char post[64];
+    int post_len = snprintf(post, sizeof(post), "\r\n--%s--\r\n", kBoundary);
+    if (pre_len <= 0 || pre_len >= (int)sizeof(pre) || post_len <= 0) {
+        return false;
+    }
+    char content_type[128];
+    snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", kBoundary);
+    int64_t total = (int64_t)pre_len + 44 + (int64_t)pcm_len + post_len;
+
+    esp_http_client_config_t cfg = {};
+    cfg.url = "https://api.elevenlabs.io/v1/speech-to-text";
+    cfg.method = HTTP_METHOD_POST;
+    cfg.timeout_ms = 15000;
+    cfg.buffer_size = 4096;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (!c) {
+        ESP_LOGW(TAG, "scribe: can't reach ElevenLabs");
+        return false;
+    }
+    esp_http_client_set_header(c, "xi-api-key", CONFIG_MUSE_ELEVENLABS_API_KEY);
+    esp_http_client_set_header(c, "Content-Type", content_type);
+    esp_http_client_set_header(c, "Accept", "application/json");
+    bool ok = false;
+    uint8_t wav[44];
+    scribe_wav_header(wav, pcm_len);
+    auto write_all = [&](const void *p, size_t n) {
+        return esp_http_client_write(c, (const char *)p, (int)n) == (int)n;
+    };
+    if (esp_http_client_open(c, (int)total) != ESP_OK || !write_all(pre, pre_len) ||
+        !write_all(wav, sizeof(wav))) {
+        ESP_LOGW(TAG, "scribe: can't reach ElevenLabs");
+    } else {
+        bool sent = true;
+        size_t off = 0;
+        while (off < pcm_len) {
+            size_t chunk = pcm_len - off < 4096 ? pcm_len - off : 4096;
+            if (!write_all(pcm + off, chunk)) {
+                sent = false;
+                break;
+            }
+            off += chunk;
+        }
+        if (!sent || !write_all(post, post_len)) {
+            ESP_LOGW(TAG, "scribe: can't reach ElevenLabs");
+        } else {
+            esp_http_client_fetch_headers(c);
+            int status = esp_http_client_get_status_code(c);
+            static uint8_t resp[8192];
+            if (status != 200) {
+                int n = esp_http_client_read(c, (char *)resp, sizeof(resp) - 1);
+                resp[n > 0 ? n : 0] = '\0';
+                ESP_LOGW(TAG, "scribe: ElevenLabs HTTP %d %s", status, (char *)resp);
+            } else {
+                size_t got = 0;
+                bool over = false;
+                for (;;) {
+                    int n = esp_http_client_read(c, (char *)resp + got, (int)(sizeof(resp) - 1 - got));
+                    if (n <= 0) {
+                        break;
+                    }
+                    got += (size_t)n;
+                    if (got >= sizeof(resp) - 1) {
+                        over = true;
+                        break;
+                    }
+                }
+                if (over) {
+                    ESP_LOGW(TAG, "scribe: response too large");
+                } else {
+                    resp[got] = '\0';
+                    cJSON *parsed = cJSON_Parse((const char *)resp);
+                    if (!parsed) {
+                        ESP_LOGW(TAG, "scribe: bad JSON");
+                    } else {
+                        const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(parsed, "text"));
+                        const char *lang = cJSON_GetStringValue(cJSON_GetObjectItem(parsed, "language_code"));
+                        if (text) {
+                            while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') {
+                                text++;
+                            }
+                            size_t len = strlen(text);
+                            while (len > 0 && (text[len - 1] == ' ' || text[len - 1] == '\t' ||
+                                               text[len - 1] == '\r' || text[len - 1] == '\n')) {
+                                len--;
+                            }
+                            if (len > 0 && len < out_cap) {
+                                memcpy(out, text, len);
+                                out[len] = '\0';
+                                ok = true;
+                                ESP_LOGI(TAG, "scribe: transcript %u chars%s%s", (unsigned)len,
+                                         lang ? ", language " : "", lang ? lang : "");
+                            } else {
+                                ESP_LOGW(TAG, "scribe: empty transcript");
+                            }
+                        } else {
+                            ESP_LOGW(TAG, "scribe: no text field");
+                        }
+                        cJSON_Delete(parsed);
+                    }
+                }
+            }
+        }
+    }
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
     return ok;
 }
 
@@ -2691,7 +2985,11 @@ static void hatch_task(void *arg)
         }
         bool sent = true;
         if (s_turn.phase == P_LISTEN) {
-            sent = VOICE_NOTE ? record_note() : pump_mic();
+            if (VOICE_NOTE && muse_settings_scribe_stt() && !s_turn.scribe_streaming) {
+                sent = record_note_scribe();
+            } else {
+                sent = VOICE_NOTE ? record_note() : pump_mic();
+            }
         }
         if (!sent) {
             drop_connection("send failed");
