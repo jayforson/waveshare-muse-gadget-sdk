@@ -1422,10 +1422,17 @@ static void dlg_flush_block(lv_obj_t *container, uint32_t color)
 
 /* Render one message as rich blocks inside its container: headings in
  * bold, lists with bullets, quotes dimmed and indented, fenced code
- * verbatim and dimmed, paragraphs joined. A divider line closes every
- * message; there is no speaker prefix, speakers differ by brightness. */
+ * verbatim and dimmed, paragraphs joined. No divider line and no speaker
+ * prefix: speakers differ by bubble background (user blue, Muse
+ * grey-white, both black text, matching the app). */
 static void dlg_render_blocks(lv_obj_t *container, const char *text, uint32_t color)
 {
+    /* Dialog bubbles are light, so all dialog text is black. The face
+     * caption (dark background) does not use this path and keeps its
+     * light color. */
+    if (color == COLOR_CAPTION || color == COLOR_DIM) {
+        color = 0x000000;
+    }
     s_dlg_kind = 0;
     s_dlg_block[0] = '\0';
     s_dlg_blocks = 0;
@@ -1591,12 +1598,6 @@ static void dlg_render_blocks(lv_obj_t *container, const char *text, uint32_t co
             s_dlg_blocks++;
         }
     }
-    dlg_block_spacer(container, 2);
-    lv_obj_t *div = lv_obj_create(container);
-    lv_obj_remove_style_all(div);
-    lv_obj_set_size(div, s_w - 104, 1);
-    lv_obj_set_style_bg_color(div, lv_color_hex(COLOR_DIM), 0);
-    lv_obj_set_style_bg_opa(div, LV_OPA_COVER, 0);
 }
 
 static lv_obj_t *dlg_add(const char *text, uint32_t color)
@@ -1638,9 +1639,10 @@ static lv_obj_t *dlg_add(const char *text, uint32_t color)
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(cont, 0, 0);
     lv_obj_set_style_pad_row(cont, 4, 0);
-    /* User messages (COLOR_DIM) get a light-blue bubble so they stand out
-     * from Muse's black-background messages; dark text for contrast on
-     * the light background (dim text on light blue would wash out). */
+    /* User messages (COLOR_DIM) get a light-blue bubble, Muse messages a
+     * grey-white one, both black text, matching the app. The bubble is
+     * content-width (no divider forcing it full-width), so short
+     * messages hug their text instead of stretching across the tile. */
     uint32_t text_color = color;
     if (is_user) {
         lv_obj_set_style_bg_color(cont, lv_color_hex(0xBDD7EE), 0);
@@ -1648,6 +1650,11 @@ static lv_obj_t *dlg_add(const char *text, uint32_t color)
         lv_obj_set_style_radius(cont, 8, 0);
         lv_obj_set_style_pad_all(cont, 8, 0);
         text_color = 0x000000;
+    } else {
+        lv_obj_set_style_bg_color(cont, lv_color_hex(0xE8E8E8), 0);
+        lv_obj_set_style_bg_opa(cont, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(cont, 8, 0);
+        lv_obj_set_style_pad_all(cont, 8, 0);
     }
     dlg_render_blocks(cont, text, text_color);
     s_dlg_msgs[s_dlg_n++] = row;
@@ -1910,6 +1917,59 @@ static size_t dlg_overlap(const char *acc, size_t acc_len, const char *text, siz
     return best;
 }
 
+/* Longest suffix of acc matching a prefix of text, at any character
+ * position (for wrapped-line windows, which have no newline to anchor
+ * on: a long reply is one line in the text, wrapped by the screen, so
+ * a sliding window overlaps mid-line). Requires at least 16 bytes, so
+ * a coincidental shared word cannot trigger it; a window overlap is
+ * far longer. Checked longest-first, so the first match is the one to
+ * skip; mismatches fail on the first differing byte, so the scan is
+ * cheap in practice. */
+static size_t dlg_overlap_char(const char *acc, size_t acc_len, const char *text, size_t text_len)
+{
+    size_t maxk = acc_len < text_len ? acc_len : text_len;
+    for (size_t k = maxk; k >= 16; k--) {
+        bool ok = true;
+        for (size_t i = 0; i < k; i++) {
+            char a = acc[acc_len - k + i];
+            char b = text[i];
+            if (a != b && !((a == ' ' || a == '\n' || a == '\t') &&
+                            (b == ' ' || b == '\n' || b == '\t'))) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            return k;
+        }
+        if (k == 16) {
+            break;
+        }
+    }
+    return 0;
+}
+
+/* Whether joining acc and the remainder needs a space between them.
+ * Only between two ASCII words, or after ASCII sentence punctuation
+ * before an ASCII word. Chinese (multibyte) and Chinese punctuation
+ * need no space; joining with one leaves a visible gap in Chinese
+ * text, which is the common case here. */
+static bool dlg_need_join_space(const char *acc, const char *rem)
+{
+    if (acc[0] == '\0' || rem[0] == '\0') {
+        return false;
+    }
+    size_t alen = strlen(acc);
+    unsigned char last = (unsigned char)acc[alen - 1];
+    unsigned char first = (unsigned char)rem[0];
+    bool last_word = (last >= 'a' && last <= 'z') || (last >= 'A' && last <= 'Z') ||
+                     (last >= '0' && last <= '9');
+    bool last_punct = (last == '.' || last == '!' || last == '?');
+    bool first_word = (first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') ||
+                      (first >= '0' && first <= '9');
+    return first_word && (last_word || last_punct);
+}
+
 /* Append a caption to an accumulated message, skipping whatever is
  * already there. Two shapes, both seen on device:
  *  - Extension: the new caption continues the previous one on the same
@@ -1969,11 +2029,13 @@ static void dlg_accumulate(char *acc, size_t acc_size, const char *caption, cons
             return;
         }
     }
-    size_t skip = dlg_overlap(acc, have, caption, strlen(caption));
+    size_t skip_line = dlg_overlap(acc, have, caption, strlen(caption));
+    size_t skip_char = dlg_overlap_char(acc, have, caption, strlen(caption));
+    size_t skip = skip_line > skip_char ? skip_line : skip_char;
     const char *append = caption + skip;
     size_t room = acc_size - have - 1;
     if (room > 0 && append[0] != '\0') {
-        if (have > 0) {
+        if (have > 0 && dlg_need_join_space(acc, append)) {
             strncat(acc, " ", room);
             room = acc_size - strlen(acc) - 1;
         }
