@@ -1828,23 +1828,11 @@ static void dlg_restore(void)
     nvs_close(h);
 }
 
-/* The dialog tile is fixed (no swipe away): tapping its title goes back
- * to the avatar tile. */
-static void on_dlg_title_clicked(lv_event_t *e)
-{
-    (void)e;
-    if (s_tv && s_face) {
-        lv_tileview_set_tile(s_tv, s_face, LV_ANIM_ON);
-    }
-}
-
 static void build_dialog_tile(lv_obj_t *tile)
 {
     lv_obj_t *title = make_label(tile, &lv_font_montserrat_14, COLOR_DIM);
     lv_label_set_text(title, "MUSE");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
-    lv_obj_add_flag(title, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(title, on_dlg_title_clicked, LV_EVENT_CLICKED, NULL);
     s_dlg_list = lv_obj_create(tile);
     lv_obj_remove_style_all(s_dlg_list);
     /* Round screen: a full-width column runs past the circle at the top
@@ -1860,6 +1848,19 @@ static void build_dialog_tile(lv_obj_t *tile)
     lv_obj_add_flag(s_dlg_list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(s_dlg_list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_dlg_list, LV_SCROLLBAR_MODE_OFF);
+    /* Drags on the message list must not slide the dialog box: the list
+     * is vertical-only, so a horizontal drag on it would otherwise chain
+     * to the tileview and move the whole tile. Clearing the horizontal
+     * chain keeps the dialog box fixed under the finger (vertical drags
+     * still scroll the list), while swipes starting outside the list
+     * (title, margins) still reach the tileview and switch pages, as
+     * before. LVGL 9 split the chain flag by direction; LVGL 8 has the
+     * single flag. */
+#if defined(LVGL_VERSION_MAJOR) && LVGL_VERSION_MAJOR >= 9
+    lv_obj_clear_flag(s_dlg_list, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
+#else
+    lv_obj_clear_flag(s_dlg_list, LV_OBJ_FLAG_SCROLL_CHAIN);
+#endif
     s_dlg_empty = make_label(s_dlg_list, caption_font(), COLOR_DIM);
     lv_obj_set_style_text_align(s_dlg_empty, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_style_text_line_space(s_dlg_empty, 0, 0);
@@ -2906,15 +2907,7 @@ static void update_chrome(float now)
         lv_obj_t *active = lv_tileview_get_tile_active(s_tv);
         bool on_settings = (active == s_settings);
         bool subpage = muse_settings_ui_in_subpage();
-        /* The dialog tile is fixed: swiping on it must not slide it
-         * left/right (the message list is already vertical-only, but a
-         * horizontal drag on it would otherwise propagate to the
-         * tileview and move the whole tile). Tapping the title goes
-         * back to the avatar tile; a new conversation also jumps
-         * there. Polled every 0.25 s, so the tile locks almost as soon
-         * as it becomes active. */
-        bool on_dialog = (active == s_dialog);
-        bool swipe = (!on_settings || !subpage) && !on_dialog;
+        bool swipe = !on_settings || !subpage;
         if (swipe != lv_obj_has_flag(s_tv, LV_OBJ_FLAG_SCROLLABLE)) {
             lv_obj_set_flag(s_tv, LV_OBJ_FLAG_SCROLLABLE, swipe);
         }

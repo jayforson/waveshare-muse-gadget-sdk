@@ -527,6 +527,7 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
     static const int16_t silence[MUSE_AUDIO_CHUNK];
     char text[96];
     static char page[MUSE_CAPTION_MAX];
+    static char sent[MUSE_CAPTION_MAX];
     bool done = false, speaking = false, replied = false;
     size_t played = 0;
     int64_t t0 = esp_timer_get_time();
@@ -544,7 +545,19 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
             case MUSE_HATCH_EV_SENT:
                 *delivered = true;
                 if (!speaking && !replied) {
-                    muse_state_set_caption("WAITING RESPONSE FROM MUSE");
+                    /* Scribe turns: show the sent transcript in full on
+                     * the face (like replies show in full), instead of a
+                     * generic waiting caption over tail-words. The face
+                     * caption caps at MUSE_CAPTION_MAX (400 bytes, about
+                     * 130 Chinese chars); longer transcripts show from
+                     * the head, with the full text in the dialog.
+                     * Non-Scribe turns have no session transcript, so
+                     * they keep the waiting caption. */
+                    if (muse_hatch_last_transcript(sent, sizeof(sent))) {
+                        muse_state_set_caption("%s", sent);
+                    } else {
+                        muse_state_set_caption("WAITING RESPONSE FROM MUSE");
+                    }
                 }
                 break;
             case MUSE_HATCH_EV_REPLY:
