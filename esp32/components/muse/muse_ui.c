@@ -542,8 +542,10 @@ static const lv_font_t *font_pick(const lv_font_t *full, const lv_font_t *compac
 
 #if CONFIG_MUSE_CJK_FONT
 LV_FONT_DECLARE(muse_font_cjk_16)
+LV_FONT_DECLARE(muse_font_noto_sc_14)
 LV_FONT_DECLARE(muse_font_noto_sc_16)
 LV_FONT_DECLARE(muse_font_noto_sc_16_bold)
+LV_FONT_DECLARE(muse_font_noto_sc_20)
 #endif
 
 /* Noto Sans SC 16 for captions and replies; with CONFIG_MUSE_CJK_FONT, a copy
@@ -584,6 +586,58 @@ static const lv_font_t *caption_font_bold(void)
         font.base_line = 5;
     }
     return &font;
+#else
+    return &lv_font_unscii_16;
+#endif
+}
+
+/* Dialog text font, by the DIALOG FONT setting (Settings -> SOUND).
+ * Medium is the caption font (16 px, unchanged); small/large are the
+ * same Noto Sans SC subset at 14/20 px, falling back to the 16 px
+ * Unifont for rare characters (no 14/20 px fallback exists, so a rare
+ * character renders at 16 px among 14/20 px text). The face keeps
+ * caption_font() (16 px): its paging is sized for it. Line height
+ * scales like the caption font's (1.5x size); base line scales with
+ * size (16 px -> 5). */
+static const lv_font_t *dlg_font(void)
+{
+#if CONFIG_MUSE_CJK_FONT
+    static lv_font_t font14, font20;
+    int size = muse_settings_dlg_font();
+    if (size == MUSE_DLG_FONT_SMALL) {
+        if (!font14.get_glyph_dsc) {
+            font14 = muse_font_noto_sc_14;
+            font14.fallback = &muse_font_cjk_16;
+            font14.line_height = 21;
+            font14.base_line = 4;
+        }
+        return &font14;
+    }
+    if (size == MUSE_DLG_FONT_LARGE) {
+        if (!font20.get_glyph_dsc) {
+            font20 = muse_font_noto_sc_20;
+            font20.fallback = &muse_font_cjk_16;
+            font20.line_height = 30;
+            font20.base_line = 6;
+        }
+        return &font20;
+    }
+    return caption_font();
+#else
+    return &lv_font_unscii_16;
+#endif
+}
+
+/* Bold companion of dlg_font, for dialog headings. There are no
+ * 14/20 px bold fonts (flash), so small/large headings use the
+ * regular font at that size: they keep their underline, not bold. */
+static const lv_font_t *dlg_font_bold(void)
+{
+#if CONFIG_MUSE_CJK_FONT
+    if (muse_settings_dlg_font() == MUSE_DLG_FONT_MEDIUM) {
+        return caption_font_bold();
+    }
+    return dlg_font();
 #else
     return &lv_font_unscii_16;
 #endif
@@ -1435,7 +1489,7 @@ static void dlg_flush_block(lv_obj_t *container, uint32_t color)
         return;
     }
     dlg_fix_tail(s_dlg_block);
-    const lv_font_t *font = caption_font();
+    const lv_font_t *font = dlg_font();
     uint32_t c = color;
     if (s_dlg_kind == DLG_KIND_QUOTE || s_dlg_kind == DLG_KIND_CODE) {
         c = COLOR_DIM;
@@ -1537,7 +1591,7 @@ static void dlg_render_blocks(lv_obj_t *container, const char *text, uint32_t co
                     if (s_dlg_blocks > 0) {
                         dlg_block_spacer(container, 8);
                     }
-                    dlg_block_label(container, s_dlg_line, caption_font_bold(), color);
+                    dlg_block_label(container, s_dlg_line, dlg_font_bold(), color);
                     s_dlg_blocks++;
                 }
                 continue;
@@ -1620,7 +1674,7 @@ static void dlg_render_blocks(lv_obj_t *container, const char *text, uint32_t co
     if (s_dlg_blocks == 0) {
         dlg_strip_markdown(s_dlg_stripped, DLG_MSG_MAX, text);
         if (s_dlg_stripped[0] != '\0') {
-            dlg_block_label(container, s_dlg_stripped, caption_font(), color);
+            dlg_block_label(container, s_dlg_stripped, dlg_font(), color);
             s_dlg_blocks++;
         }
     }
@@ -1931,7 +1985,7 @@ static void build_dialog_tile(lv_obj_t *tile)
      * SCROLLABLE on its rows and bubbles (dlg_add), not by breaking
      * the chain here: breaking it would stop page switching from
      * swipes starting on messages, which is the complaint. */
-    s_dlg_empty = make_label(s_dlg_list, caption_font(), COLOR_DIM);
+    s_dlg_empty = make_label(s_dlg_list, dlg_font(), COLOR_DIM);
     lv_obj_set_style_text_align(s_dlg_empty, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_style_text_line_space(s_dlg_empty, 0, 0);
     lv_obj_set_style_text_letter_space(s_dlg_empty, 1, 0);
@@ -2197,6 +2251,39 @@ static bool dlg_is_session_transcript(const char *caption)
     return nlen >= 24 && strstr(s_dlg_guard, s_dlg_norm) != NULL;
 }
 
+/* True when a caption is part of the current turn's user text (the
+ * full transcript, set directly at THINKING entry). Used only for the
+ * single SPEAKING-entry poll, to tell a stale SENT page from the
+ * reply's opening page. Unlike the old guard, there is no length
+ * floor: the reference is the exact current-turn transcript, and a
+ * reply page is essentially never a substring of it, while any SENT
+ * page -- even a short last page -- is. s_dlg_tmp holds the stripped
+ * transcript copy (free here: the SPEAKING-entry user block below
+ * fetches into it only after this check); s_dlg_user itself is left
+ * untouched. */
+static bool dlg_caption_in_user(const char *caption)
+{
+    if (!s_dlg_user[0]) {
+        return false;
+    }
+    if (!s_dlg_norm) {
+        s_dlg_norm = heap_caps_malloc_prefer(MUSE_CAPTION_MAX, 2,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);
+        if (!s_dlg_norm) {
+            return false;
+        }
+    }
+    snprintf(s_dlg_norm, MUSE_CAPTION_MAX, "%s", caption);
+    if (dlg_strip_ws(s_dlg_norm) == 0) {
+        return true;
+    }
+    dlg_copy_trunc(s_dlg_tmp, DLG_MSG_MAX, s_dlg_user);
+    if (dlg_strip_ws(s_dlg_tmp) == 0) {
+        return false;
+    }
+    return strstr(s_dlg_tmp, s_dlg_norm) != NULL;
+}
+
 static void dlg_reply_page(const char *caption)
 {
     if (strcmp(caption, s_dlg_last_page) == 0) {
@@ -2233,6 +2320,22 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
     if ((mode == MUSE_MODE_LISTENING || mode == MUSE_MODE_SPEAKING) && mode != s_dlg_prev_mode &&
         lv_tileview_get_tile_active(s_tv) != s_face) {
         lv_tileview_set_tile(s_tv, s_face, LV_ANIM_ON);
+    }
+    /* Scribe turns: the user row comes directly from the session
+     * transcript the moment the turn reaches THINKING (i.e. right
+     * after sending), whole -- not reconstructed from caption pages.
+     * Non-Scribe turns have no session transcript, so the fetch fails
+     * and the caption path below (listening/quoted) still builds the
+     * user row as before. The row is live: the SPEAKING-entry block
+     * below refreshes it (no duplicate), and the finalize block saves
+     * it when the turn ends. */
+    if (mode == MUSE_MODE_THINKING && s_dlg_prev_mode != MUSE_MODE_THINKING) {
+        if (muse_hatch_last_transcript(s_dlg_tmp, DLG_MSG_MAX)) {
+            dlg_copy_trunc(s_dlg_user, DLG_MSG_MAX, s_dlg_tmp);
+            s_dlg_last_user_page[0] = '\0';
+            dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
+            dlg_copy_trunc(s_dlg_save_user, DLG_MSG_MAX, s_dlg_user);
+        }
     }
     if (caption && caption[0]) {
         if (mode == MUSE_MODE_LISTENING) {
@@ -2272,18 +2375,43 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
                 } else {
                     dlg_user_page(s_dlg_tmp);
                 }
-            } else if (!dlg_is_session_transcript(caption) &&
-                       !dlg_is_status(caption)) {
-                /* A reply shown before playback (speaker off, or text
-                 * arriving early): same stream as the speaking pages.
-                 * The SENT transcript is excluded above: it is user
-                 * text, not a reply page. */
-                dlg_reply_page(caption);
+            } else if (!dlg_is_status(caption)) {
+                /* Speaker on (the normal path): THINKING captions never
+                 * reach the reply row. SENT pages are user text (the
+                 * user row is already set directly from the transcript
+                 * at THINKING entry, above), and early reply pages are
+                 * not lost: the opening page persists into SPEAKING
+                 * and is picked up there. Routing SENT pages here by
+                 * matching their text (the old guard) misrouted short
+                 * last pages (under the guard's 24-byte floor),
+                 * prepending the user's own tail words to the reply.
+                 * Speaker off keeps the old path: with no SPEAKING
+                 * phase, reply text shown during THINKING is the only
+                 * reply stream. */
+                if (!muse_settings_speaker_on() &&
+                    !dlg_is_session_transcript(caption)) {
+                    dlg_reply_page(caption);
+                }
             }
         } else if (mode == MUSE_MODE_SPEAKING) {
-            /* Same exclusion at SPEAKING entry, in case the poll runs
-             * before the reply page caption replaces the SENT one. */
-            if (!dlg_is_session_transcript(caption)) {
+            if (dlg_is_status(caption)) {
+                /* Status captions (e.g. speaker toggles) are not reply pages. */
+            } else if (s_dlg_prev_mode == MUSE_MODE_THINKING && s_dlg_user[0]) {
+                /* Entry from THINKING: the poll may run before the reply
+                 * page caption replaces the last SENT page. The user row
+                 * already holds the full transcript (set at THINKING
+                 * entry), so a caption that is part of it (any length,
+                 * no floor -- short last pages are exactly the ones the
+                 * old guard missed) is that stale SENT page: skip it.
+                 * Anything else is the reply's opening page: route it.
+                 * The next poll's caption is a new (reply) caption, so
+                 * skipping here loses nothing. */
+                if (!dlg_caption_in_user(caption)) {
+                    dlg_reply_page(caption);
+                }
+            } else {
+                /* Already speaking, or opened late: captions are reply
+                 * pages by mode. */
                 dlg_reply_page(caption);
             }
         }

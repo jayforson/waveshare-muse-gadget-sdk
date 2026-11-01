@@ -561,15 +561,19 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
                     /* Scribe turns: show the sent transcript on the
                      * face, paged like replies (see the timer block
                      * below), instead of a generic waiting caption over
-                     * tail-words. The face caption is shared with the
-                     * dialog, so the dialog ignores this caption when
-                     * it equals the session transcript
-                     * (dlg_is_session_transcript); it is user text,
-                     * not a reply page. Non-Scribe turns have no
-                     * session transcript, so they keep the waiting
-                     * caption. Single-page transcripts show statically
-                     * (no timer re-sets, no flicker); only multi-page
-                     * ones page (last page differing from the first). */
+                     * tail-words. The dialog does not reconstruct the
+                     * user row from these pages: it sets the row
+                     * directly from the session transcript at THINKING
+                     * entry, and THINKING captions never reach the
+                     * reply row while the speaker is on (the reply's
+                     * opening page is picked up once speaking starts;
+                     * speaker off still routes early reply text via
+                     * the session-transcript guard). Non-Scribe turns
+                     * have no session transcript, so they keep the
+                     * waiting caption. Single-page transcripts show
+                     * statically (no timer re-sets, no flicker); only
+                     * multi-page ones page (last page differing from
+                     * the first). */
                     if (!sent_full) {
                         sent_full = heap_caps_malloc_prefer(2048, 2,
                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);

@@ -95,7 +95,7 @@ static int64_t s_link_reset_armed_us;
 static lv_obj_t *s_ble_sw, *s_ble_status;
 
 /* Sound page. */
-static lv_obj_t *s_spk_sw, *s_vol_val, *s_vol_sl, *s_gain_val, *s_gain_sl, *s_sw_val, *s_sw_sl, *s_sil_val, *s_sil_sl, *s_bright_val, *s_bright_sl, *s_mic_bar, *s_mic_val, *s_speech_err;
+static lv_obj_t *s_spk_sw, *s_vol_val, *s_vol_sl, *s_gain_val, *s_gain_sl, *s_sw_val, *s_sw_sl, *s_sil_val, *s_sil_sl, *s_bright_val, *s_bright_sl, *s_dlg_font_val, *s_dlg_font_sl, *s_mic_bar, *s_mic_val, *s_speech_err;
 
 /* Sleep page. */
 static const int SLEEP_CHOICES[] = { 0, 30, 60, 120, 300, 600 };
@@ -1041,6 +1041,27 @@ static void on_bright(lv_event_t *e)
     }
 }
 
+static const char *dlg_font_name(int size)
+{
+    switch (size) {
+    case MUSE_DLG_FONT_SMALL:
+        return "Small";
+    case MUSE_DLG_FONT_LARGE:
+        return "Large";
+    default:
+        return "Medium";
+    }
+}
+
+static void on_dlg_font(lv_event_t *e)
+{
+    int size = lv_slider_get_value(s_dlg_font_sl);
+    set_text(s_dlg_font_val, dlg_font_name(size));
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+        muse_settings_set_dlg_font(size);
+    }
+}
+
 static void build_sound_page(lv_obj_t *tile)
 {
     lv_obj_t *list;
@@ -1068,12 +1089,14 @@ static void build_sound_page(lv_obj_t *tile)
     note(list, "Talk at arm's length: the bar should reach green (-30 to -15 dBFS) without going orange.");
 
     s_bright_sl = slider(list, "Brightness", 10, 100, muse_settings_brightness(), &s_bright_val, on_bright);
+    s_dlg_font_sl = slider(list, "Dialog font", MUSE_DLG_FONT_MIN, MUSE_DLG_FONT_MAX, muse_settings_dlg_font(), &s_dlg_font_val, on_dlg_font);
 
     set_val(s_vol_val, "%d%%", muse_settings_volume());
     set_val(s_gain_val, "%d dB", muse_settings_mic_gain() / 3 * 3);
     set_val(s_sw_val, "x%d", muse_settings_sw_gain());
     set_val(s_sil_val, "%ds", muse_settings_silence_s());
     set_val(s_bright_val, "%d%%", muse_settings_brightness());
+    set_text(s_dlg_font_val, dlg_font_name(muse_settings_dlg_font()));
 
     /* Last speech failure, if any: "—" means speech last worked. Cleared by
      * the next successful speech fetch. */
