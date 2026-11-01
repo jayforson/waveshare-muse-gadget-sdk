@@ -1362,7 +1362,12 @@ static void dlg_block_label(lv_obj_t *container, const char *text, const lv_font
     lv_obj_set_style_text_line_space(lbl, 0, 0);
     lv_obj_set_style_text_letter_space(lbl, 1, 0);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(lbl, s_w - 104);
+    /* Must fit inside the bubble's content area (bubble max width
+     * minus 8 px padding on each side). The old width (s_w - 104,
+     * the full row width) overflowed the bubble by 8 px on the right,
+     * so full wrapped lines were clipped at the bubble edge and their
+     * last character looked half-cut. */
+    lv_obj_set_width(lbl, s_w - 128);
     lv_label_set_text(lbl, text);
 }
 
@@ -1370,7 +1375,7 @@ static void dlg_block_spacer(lv_obj_t *container, int h)
 {
     lv_obj_t *sp = lv_obj_create(container);
     lv_obj_remove_style_all(sp);
-    lv_obj_set_size(sp, s_w - 104, h);
+    lv_obj_set_size(sp, s_w - 128, h);
 }
 
 static void dlg_copy_span(char *dst, size_t dst_n, const char *src, size_t len)
@@ -1641,6 +1646,11 @@ static lv_obj_t *dlg_add(const char *text, uint32_t color)
     lv_obj_set_height(row, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_all(row, 0, 0);
+    /* Leave a little space on the right: right-aligned (user) bubbles
+     * sit at the row's end, so without this their right edge touches
+     * the row edge. Left-aligned (Muse) bubbles are unaffected (left
+     * padding stays 0). */
+    lv_obj_set_style_pad_right(row, 8, 0);
     lv_obj_set_style_pad_column(row, 0, 0);
     lv_obj_set_flex_align(row, is_user ? LV_FLEX_ALIGN_END : LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -1648,7 +1658,10 @@ static lv_obj_t *dlg_add(const char *text, uint32_t color)
     lv_obj_remove_style_all(cont);
     lv_obj_remove_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_width(cont, LV_SIZE_CONTENT);
-    lv_obj_set_style_max_width(cont, s_w - 104, 0);
+    /* 8 px narrower than the row (plus the row's 8 px right padding,
+     * full-width bubbles end 16 px before the row's right edge, so
+     * text never touches the dialog's right border). */
+    lv_obj_set_style_max_width(cont, s_w - 112, 0);
     lv_obj_set_height(cont, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(cont, 0, 0);
