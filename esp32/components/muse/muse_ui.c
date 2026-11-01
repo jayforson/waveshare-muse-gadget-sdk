@@ -939,11 +939,14 @@ static lv_obj_t *s_dlg_msgs[DLG_MAX_MSGS];
 static int s_dlg_n;
 static lv_obj_t *s_dlg_live_user;
 static lv_obj_t *s_dlg_live_muse;
-static char s_dlg_reply[DLG_MSG_MAX];
-static char s_dlg_last_page[DLG_MSG_MAX];
-static char s_dlg_user[DLG_MSG_MAX];
-static char s_dlg_last_user_page[DLG_MSG_MAX];
+static char *s_dlg_reply = NULL;
+static char *s_dlg_last_page = NULL;
+static char *s_dlg_user = NULL;
+static char *s_dlg_last_user_page = NULL;
 static muse_mode_t s_dlg_prev_mode = MUSE_MODE_BOOT;
+
+/* Defined after the dialog buffers; allocates them from PSRAM. */
+static void dlg_ensure_psram(void);
 
 static bool dlg_is_status(const char *s)
 {
@@ -997,17 +1000,17 @@ static void dlg_copy_trunc(char *dst, size_t dst_n, const char *src)
 /* Scratch buffers for dialog formatting. Static, not stack: a 2000-char
  * message plus its prefix does not belong in a UI-task stack frame, and
  * LVGL calls here all run on the one UI task. */
-static char s_dlg_stripped[DLG_MSG_MAX];
-static char s_dlg_tmp[DLG_MSG_MAX];
+static char *s_dlg_stripped = NULL;
+static char *s_dlg_tmp = NULL;
 /* Normalized caption copy for the session-transcript guard. Must live
  * in PSRAM, not BSS, for the same reason as sent_full in muse_voice.c:
  * internal heap is critically tight, and even a 400-byte BSS buffer
  * counts against the margin that Scribe TLS setup needs. Allocated
  * once, never freed. */
 static char *s_dlg_norm = NULL;
-static char s_dlg_raw[DLG_MSG_MAX];
-static char s_dlg_line[DLG_MSG_MAX];
-static char s_dlg_block[DLG_MSG_MAX];
+static char *s_dlg_raw = NULL;
+static char *s_dlg_line = NULL;
+static char *s_dlg_block = NULL;
 
 /* Strip Markdown to plain text for the small dialog screen: the backend
  * replies in Markdown, but LVGL labels render it verbatim, so "**bold**"
@@ -1403,7 +1406,7 @@ static void dlg_copy_span(char *dst, size_t dst_n, const char *src, size_t len)
 static void dlg_block_append(const char *add, size_t add_n, char sep)
 {
     size_t have = strlen(s_dlg_block);
-    size_t room = sizeof(s_dlg_block) - have - 1;
+    size_t room = DLG_MSG_MAX - have - 1;
     if (room == 0) {
         return;
     }
@@ -1524,8 +1527,8 @@ static void dlg_render_blocks(lv_obj_t *container, const char *text, uint32_t co
                     k++;
                 }
                 dlg_flush_block(container, color);
-                dlg_copy_span(s_dlg_raw, sizeof(s_dlg_raw), &text[k], le - k);
-                dlg_strip_inline(s_dlg_line, sizeof(s_dlg_line), s_dlg_raw);
+                dlg_copy_span(s_dlg_raw, DLG_MSG_MAX, &text[k], le - k);
+                dlg_strip_inline(s_dlg_line, DLG_MSG_MAX, s_dlg_raw);
                 if (s_dlg_line[0] != '\0') {
                     if (s_dlg_blocks > 0) {
                         dlg_block_spacer(container, 8);
@@ -1546,8 +1549,8 @@ static void dlg_render_blocks(lv_obj_t *container, const char *text, uint32_t co
                 s_dlg_kind = DLG_KIND_QUOTE;
                 s_dlg_block[0] = '\0';
             }
-            dlg_copy_span(s_dlg_raw, sizeof(s_dlg_raw), &text[k], le - k);
-            dlg_strip_inline(s_dlg_line, sizeof(s_dlg_line), s_dlg_raw);
+            dlg_copy_span(s_dlg_raw, DLG_MSG_MAX, &text[k], le - k);
+            dlg_strip_inline(s_dlg_line, DLG_MSG_MAX, s_dlg_raw);
             dlg_block_append("  ", 2, s_dlg_block[0] != '\0' ? '\n' : '\0');
             dlg_block_append(s_dlg_line, strlen(s_dlg_line), '\0');
             continue;
@@ -1563,8 +1566,8 @@ static void dlg_render_blocks(lv_obj_t *container, const char *text, uint32_t co
                 s_dlg_kind = DLG_KIND_LIST;
                 s_dlg_block[0] = '\0';
             }
-            dlg_copy_span(s_dlg_raw, sizeof(s_dlg_raw), &text[k], le - k);
-            dlg_strip_inline(s_dlg_line, sizeof(s_dlg_line), s_dlg_raw);
+            dlg_copy_span(s_dlg_raw, DLG_MSG_MAX, &text[k], le - k);
+            dlg_strip_inline(s_dlg_line, DLG_MSG_MAX, s_dlg_raw);
             dlg_block_append("• ", 4, s_dlg_block[0] != '\0' ? '\n' : '\0');
             dlg_block_append(s_dlg_line, strlen(s_dlg_line), '\0');
             continue;
@@ -1585,8 +1588,8 @@ static void dlg_render_blocks(lv_obj_t *container, const char *text, uint32_t co
                     s_dlg_kind = DLG_KIND_LIST;
                     s_dlg_block[0] = '\0';
                 }
-                dlg_copy_span(s_dlg_raw, sizeof(s_dlg_raw), &text[c], le - c);
-                dlg_strip_inline(s_dlg_line, sizeof(s_dlg_line), s_dlg_raw);
+                dlg_copy_span(s_dlg_raw, DLG_MSG_MAX, &text[c], le - c);
+                dlg_strip_inline(s_dlg_line, DLG_MSG_MAX, s_dlg_raw);
                 char pfx[16];
                 size_t plen = num_end - s;
                 if (plen >= sizeof(pfx) - 1) {
@@ -1605,13 +1608,13 @@ static void dlg_render_blocks(lv_obj_t *container, const char *text, uint32_t co
             s_dlg_kind = DLG_KIND_PARA;
             s_dlg_block[0] = '\0';
         }
-        dlg_copy_span(s_dlg_raw, sizeof(s_dlg_raw), &text[s], le - s);
-        dlg_strip_inline(s_dlg_line, sizeof(s_dlg_line), s_dlg_raw);
+        dlg_copy_span(s_dlg_raw, DLG_MSG_MAX, &text[s], le - s);
+        dlg_strip_inline(s_dlg_line, DLG_MSG_MAX, s_dlg_raw);
         dlg_block_append(s_dlg_line, strlen(s_dlg_line), ' ');
     }
     dlg_flush_block(container, color);
     if (s_dlg_blocks == 0) {
-        dlg_strip_markdown(s_dlg_stripped, sizeof(s_dlg_stripped), text);
+        dlg_strip_markdown(s_dlg_stripped, DLG_MSG_MAX, text);
         if (s_dlg_stripped[0] != '\0') {
             dlg_block_label(container, s_dlg_stripped, caption_font(), color);
             s_dlg_blocks++;
@@ -1624,6 +1627,7 @@ static lv_obj_t *dlg_add(const char *text, uint32_t color)
     if (!s_dlg_list) {
         return NULL;
     }
+    dlg_ensure_psram();
     if (s_dlg_n >= DLG_MAX_MSGS) {
         lv_obj_del(s_dlg_msgs[0]);
         for (int i = 1; i < s_dlg_n; i++) {
@@ -1741,10 +1745,41 @@ static void dlg_live(lv_obj_t **slot, const char *text, uint32_t color)
 #define DLG_STORE_NS "dlg"
 #define DLG_STORE_MAX_BYTES 8192
 #define DLG_STORE_TEXT_MAX 1500
-static char s_dlg_save_user[DLG_MSG_MAX];
+static char *s_dlg_save_user = NULL;
 static bool s_dlg_restored;
-static char s_dlg_store_read[2048];
-static char s_dlg_store_write[1536];
+static char *s_dlg_store_read = NULL;
+static char *s_dlg_store_write = NULL;
+
+/* Dialog scratch buffers live in PSRAM, not BSS: together they are
+ * ~23 KB (ten 2000-byte message buffers plus 2048 + 1536 bytes of
+ * NVS scratch), and internal heap is critically tight (about 14 KB
+ * free with a 7 KB largest block, while Scribe TLS setup needs more
+ * than 6 KB). Allocated once on first dialog use, zeroed like BSS,
+ * never freed -- the same rule as the Scribe buffers. */
+static void dlg_ensure_psram(void)
+{
+#define DLG_PSRAM(ptr, size) do { \
+        if (!(ptr)) { \
+            (ptr) = heap_caps_malloc_prefer((size), 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT); \
+            if ((ptr)) { \
+                memset((ptr), 0, (size)); \
+            } \
+        } \
+    } while (0)
+    DLG_PSRAM(s_dlg_reply, DLG_MSG_MAX);
+    DLG_PSRAM(s_dlg_last_page, DLG_MSG_MAX);
+    DLG_PSRAM(s_dlg_user, DLG_MSG_MAX);
+    DLG_PSRAM(s_dlg_last_user_page, DLG_MSG_MAX);
+    DLG_PSRAM(s_dlg_stripped, DLG_MSG_MAX);
+    DLG_PSRAM(s_dlg_tmp, DLG_MSG_MAX);
+    DLG_PSRAM(s_dlg_raw, DLG_MSG_MAX);
+    DLG_PSRAM(s_dlg_line, DLG_MSG_MAX);
+    DLG_PSRAM(s_dlg_block, DLG_MSG_MAX);
+    DLG_PSRAM(s_dlg_save_user, DLG_MSG_MAX);
+    DLG_PSRAM(s_dlg_store_read, 2048);
+    DLG_PSRAM(s_dlg_store_write, 1536);
+#undef DLG_PSRAM
+}
 
 static bool dlg_store_blank(const char *s)
 {
@@ -1759,6 +1794,7 @@ static void dlg_store_save(bool is_muse, const char *text)
     if (!text || dlg_store_blank(text)) {
         return;
     }
+    dlg_ensure_psram();
     nvs_handle_t h;
     if (nvs_open(DLG_STORE_NS, NVS_READWRITE, &h) != ESP_OK) {
         ESP_LOGW(TAG, "dlg store: nvs_open failed, message not saved");
@@ -1772,7 +1808,7 @@ static void dlg_store_save(bool is_muse, const char *text)
     uint32_t seq = 0;
     nvs_get_u32(h, "dlg_seq", &seq); /* missing -> 0 */
     /* %.1500s cuts the text, then the tail fix drops a split character. */
-    snprintf(s_dlg_store_write, sizeof(s_dlg_store_write), "%u|%c|%.1500s", (unsigned)seq,
+    snprintf(s_dlg_store_write, 1536, "%u|%c|%.1500s", (unsigned)seq,
              is_muse ? 'M' : 'U', text);
     dlg_fix_tail(s_dlg_store_write);
     size_t new_len = strlen(s_dlg_store_write);
@@ -1784,7 +1820,7 @@ static void dlg_store_save(bool is_muse, const char *text)
             snprintf(key, sizeof(key), "dlg_%d", i);
             size_t len = 0;
             if (nvs_get_str(h, key, NULL, &len) == ESP_OK && len > 0 &&
-                len <= sizeof(s_dlg_store_read)) {
+                len <= 2048) {
                 total += len - 1; /* len includes NUL */
             }
         }
@@ -1795,7 +1831,7 @@ static void dlg_store_save(bool is_muse, const char *text)
             char src[16], dst[16];
             snprintf(src, sizeof(src), "dlg_%d", i);
             snprintf(dst, sizeof(dst), "dlg_%d", i - 1);
-            size_t len = sizeof(s_dlg_store_read);
+            size_t len = 2048;
             if (nvs_get_str(h, src, s_dlg_store_read, &len) == ESP_OK) {
                 nvs_set_str(h, dst, s_dlg_store_read);
             } else {
@@ -1821,6 +1857,7 @@ static void dlg_restore(void)
     if (s_dlg_restored || !s_dlg_list) {
         return;
     }
+    dlg_ensure_psram();
     s_dlg_restored = true;
     nvs_handle_t h;
     if (nvs_open(DLG_STORE_NS, NVS_READONLY, &h) != ESP_OK) {
@@ -1839,10 +1876,10 @@ static void dlg_restore(void)
         snprintf(key, sizeof(key), "dlg_%d", i);
         size_t len = 0;
         if (nvs_get_str(h, key, NULL, &len) != ESP_OK || len == 0 ||
-            len > sizeof(s_dlg_store_read)) {
+            len > 2048) {
             continue;
         }
-        len = sizeof(s_dlg_store_read);
+        len = 2048;
         if (nvs_get_str(h, key, s_dlg_store_read, &len) != ESP_OK) {
             continue;
         }
@@ -2122,7 +2159,7 @@ static size_t dlg_strip_ws(char *s)
  * of s_dlg_tmp is in the mutually exclusive if-branch). */
 static bool dlg_is_session_transcript(const char *caption)
 {
-    if (!muse_hatch_last_transcript(s_dlg_tmp, sizeof(s_dlg_tmp))) {
+    if (!muse_hatch_last_transcript(s_dlg_tmp, DLG_MSG_MAX)) {
         return false;
     }
     if (dlg_strip_ws(s_dlg_tmp) == 0) {
@@ -2151,8 +2188,8 @@ static void dlg_reply_page(const char *caption)
     if (strcmp(caption, s_dlg_last_page) == 0) {
         return;
     }
-    dlg_accumulate(s_dlg_reply, sizeof(s_dlg_reply), caption, s_dlg_last_page);
-    dlg_copy_trunc(s_dlg_last_page, sizeof(s_dlg_last_page), caption);
+    dlg_accumulate(s_dlg_reply, DLG_MSG_MAX, caption, s_dlg_last_page);
+    dlg_copy_trunc(s_dlg_last_page, DLG_MSG_MAX, caption);
     dlg_live(&s_dlg_live_muse, s_dlg_reply, COLOR_CAPTION);
 }
 
@@ -2165,10 +2202,10 @@ static void dlg_user_page(const char *caption)
     if (strcmp(caption, s_dlg_last_user_page) == 0) {
         return;
     }
-    dlg_accumulate(s_dlg_user, sizeof(s_dlg_user), caption, s_dlg_last_user_page);
-    dlg_copy_trunc(s_dlg_last_user_page, sizeof(s_dlg_last_user_page), caption);
+    dlg_accumulate(s_dlg_user, DLG_MSG_MAX, caption, s_dlg_last_user_page);
+    dlg_copy_trunc(s_dlg_last_user_page, DLG_MSG_MAX, caption);
     dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
-    dlg_copy_trunc(s_dlg_save_user, sizeof(s_dlg_save_user), s_dlg_user);
+    dlg_copy_trunc(s_dlg_save_user, DLG_MSG_MAX, s_dlg_user);
 }
 
 static void dialog_poll(muse_mode_t mode, const char *caption)
@@ -2176,6 +2213,7 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
     if (!s_dialog) {
         return;
     }
+    dlg_ensure_psram();
     /* A conversation starting jumps to the avatar tile, not the dialog:
      * talking is watched on the face; history is read by swiping. */
     if ((mode == MUSE_MODE_LISTENING || mode == MUSE_MODE_SPEAKING) && mode != s_dlg_prev_mode &&
@@ -2191,7 +2229,7 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
             size_t n = strlen(caption);
             if (n > 2 && caption[0] == '"' && caption[n - 1] == '"') {
                 /* Final transcript, quoted: refresh the user turn. */
-                size_t inner = n - 2 < sizeof(s_dlg_tmp) - 1 ? n - 2 : sizeof(s_dlg_tmp) - 1;
+                size_t inner = n - 2 < DLG_MSG_MAX - 1 ? n - 2 : DLG_MSG_MAX - 1;
                 memcpy(s_dlg_tmp, caption + 1, inner);
                 s_dlg_tmp[inner] = '\0';
                 /* A quoted caption is a HEARD event's tail words, not
@@ -2207,16 +2245,16 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
                 if (acc_len > 0 && strcmp(s_dlg_tmp, s_dlg_user) == 0) {
                     /* Identical: already shown, nothing to do. */
                 } else if (acc_len == 0) {
-                    dlg_copy_trunc(s_dlg_user, sizeof(s_dlg_user), s_dlg_tmp);
+                    dlg_copy_trunc(s_dlg_user, DLG_MSG_MAX, s_dlg_tmp);
                     s_dlg_last_user_page[0] = '\0';
                     dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
-                    dlg_copy_trunc(s_dlg_save_user, sizeof(s_dlg_save_user), s_dlg_user);
+                    dlg_copy_trunc(s_dlg_save_user, DLG_MSG_MAX, s_dlg_user);
                 } else if (strlen(s_dlg_tmp) > acc_len &&
                            strncmp(s_dlg_tmp, s_dlg_user, acc_len) == 0) {
-                    dlg_copy_trunc(s_dlg_user, sizeof(s_dlg_user), s_dlg_tmp);
+                    dlg_copy_trunc(s_dlg_user, DLG_MSG_MAX, s_dlg_tmp);
                     s_dlg_last_user_page[0] = '\0';
                     dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
-                    dlg_copy_trunc(s_dlg_save_user, sizeof(s_dlg_save_user), s_dlg_user);
+                    dlg_copy_trunc(s_dlg_save_user, DLG_MSG_MAX, s_dlg_user);
                 } else {
                     dlg_user_page(s_dlg_tmp);
                 }
@@ -2244,10 +2282,10 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
      * directly. No-op when the session has no transcript (non-Scribe
      * turns, failed turns), so caption-based turns are untouched. */
     if (mode == MUSE_MODE_SPEAKING && s_dlg_prev_mode != MUSE_MODE_SPEAKING) {
-        if (muse_hatch_last_transcript(s_dlg_tmp, sizeof(s_dlg_tmp))) {
+        if (muse_hatch_last_transcript(s_dlg_tmp, DLG_MSG_MAX)) {
             if (s_dlg_live_user) {
                 dlg_live(&s_dlg_live_user, s_dlg_tmp, COLOR_DIM);
-                dlg_copy_trunc(s_dlg_save_user, sizeof(s_dlg_save_user), s_dlg_tmp);
+                dlg_copy_trunc(s_dlg_save_user, DLG_MSG_MAX, s_dlg_tmp);
             } else {
                 dlg_add(s_dlg_tmp, COLOR_DIM);
                 dlg_store_save(false, s_dlg_tmp);
