@@ -2079,10 +2079,18 @@ static void append_text(msg_t &m, const char *text)
         strlcat(full, text, TEXT_MAX);
         /* Dialog reply row, direct: exactly the bytes that landed in the
          * reply buffer (capped at TEXT_MAX, like speech and the face),
-         * so the row always matches what is spoken and shown. */
+         * so the row always matches what is spoken and shown. fix28: a
+         * message's first delta replaces the dialog staging (old_len
+         * == 0); later deltas append. Without the replace, staging
+         * would keep the previous message and the new one would be
+         * concatenated onto it (staging is never cleared otherwise). */
         size_t new_len = strlen(full);
         if (new_len > old_len) {
-            muse_ui_dialog_reply_append(full + old_len, new_len - old_len);
+            if (old_len == 0) {
+                muse_ui_dialog_reply_set(full);
+            } else {
+                muse_ui_dialog_reply_append(full + old_len, new_len - old_len);
+            }
         }
     }
     m.len += add;

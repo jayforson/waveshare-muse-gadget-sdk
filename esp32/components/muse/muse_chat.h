@@ -116,12 +116,15 @@ bool muse_hatch_turn_caption(size_t played, char *out, size_t cap);
  */
 bool muse_hatch_last_transcript(char *out, size_t cap);
 
-/* Dialog direct routing (fix27): the dialog no longer reconstructs
- * messages from face captions. The chat session calls these at the
- * moments the text is known: user when a message is sent, reply append
- * as deltas arrive, reply set to correct a message whose pieces did not
- * add up, reply done to store a completed message. No-ops until the
- * dialog tile exists.
+/* Dialog direct routing (fix27, thread-safe since fix28): the dialog no
+ * longer reconstructs messages from face captions. The chat session
+ * calls these at the moments the text is known: user when a message is
+ * sent, reply append as deltas arrive, reply set to correct a message
+ * whose pieces did not add up, reply done to store a completed message.
+ * No-ops until the dialog tile exists. fix28: these only stage text
+ * (safe from the session task); the display task applies them, so they
+ * must never call LVGL or NVS directly. A message's first delta uses
+ * reply_set (it replaces staging); later deltas use reply_append.
  */
 void muse_ui_dialog_user(const char *text);
 void muse_ui_dialog_reply_append(const char *text, size_t len);

@@ -956,6 +956,23 @@ static lv_obj_t *s_dlg_live_muse;
 static char *s_dlg_reply = NULL;
 static char *s_dlg_user = NULL;
 
+/* fix28 staging: the chat session runs on its own task, LVGL only on
+ * the display task, and there is no LVGL lock in this component.
+ * Calling dlg_live (lv_obj_clean + render) from the session task races
+ * the display task's layout/event handling and crashed inside
+ * lv_event_mark_deleted (LoadProhibited). So the session only writes
+ * staging text + pending flags here, under this mutex, and the display
+ * task (frame_tick -> update_status -> dlg_apply_pending) copies them
+ * to the live buffers and does all LVGL/NVS work. Live buffers stay
+ * display-task-only; staging is session-owned (allocated under the
+ * mutex, read by the display task only for the copy). */
+static char *s_dlg_stage_user = NULL;
+static char *s_dlg_stage_reply = NULL;
+static SemaphoreHandle_t s_dlg_lock = NULL;
+static bool s_dlg_user_pending = false;
+static bool s_dlg_reply_pending = false;
+static bool s_dlg_reply_done_pending = false;
+
 /* Defined after the dialog buffers; allocates them from PSRAM. */
 static void dlg_ensure_psram(void);
 
@@ -1910,7 +1927,7 @@ static void dlg_restore(void)
     nvs_close(h);
 }
 
-/* ---- Dialog direct routing (fix27) ----
+/* ---- Dialog direct routing (fix27, made thread-safe in fix28) ----
  * The dialog no longer reconstructs messages from face captions (sliding
  * windows that needed overlap dedup, guards and substring matching to
  * tell sent pages from reply pages). The chat session calls these
@@ -1918,72 +1935,160 @@ static void dlg_restore(void)
  *   user  -> when a message is sent (post_chat / text_begin)
  *   reply -> as reply deltas arrive (append_text) and when a message
  *            completes (message_done, correcting any skipped piece)
- * User rows are stored at send (the sent text is complete then); Muse
- * rows are stored at message_done (the reply is complete then, never a
- * partial: a cancelled reply stays live but is not stored, matching the
+ * fix28: these run on the chat session's task, but LVGL objects may only
+ * be touched on the display task (frame_tick runs lv_timer_handler; no
+ * LVGL lock exists here). fix27 called dlg_live straight from the
+ * session task and crashed in lv_event_mark_deleted while the display
+ * task was laying out the same label. So these functions now only write
+ * staging text + pending flags under s_dlg_lock, and dlg_apply_pending
+ * (display task, called at the end of update_status) copies staging to
+ * the live buffers and does the LVGL/NVS work. User rows are stored at
+ * send (the sent text is complete then); Muse rows are stored at
+ * message_done (the reply is complete then, never a partial: a
+ * cancelled reply stays live but is not stored, matching the
  * finalized-only store below). Muse live rows clear at message done
  * (the row stays as history, so a later message in the same turn starts
  * fresh); user live rows clear at the next user send (which also covers
  * a cancelled reply with no done). */
+/* Allocates the staging buffers if needed. Caller must hold s_dlg_lock:
+ * staging is session-owned, and the display task only reads it under the
+ * same lock (dlg_apply_pending's copy), so no allocation race exists. */
+static void dlg_stage_alloc(void)
+{
+    if (!s_dlg_stage_user) {
+        s_dlg_stage_user = heap_caps_malloc_prefer(DLG_MSG_MAX, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);
+        if (s_dlg_stage_user) {
+            memset(s_dlg_stage_user, 0, DLG_MSG_MAX);
+        }
+    }
+    if (!s_dlg_stage_reply) {
+        s_dlg_stage_reply = heap_caps_malloc_prefer(DLG_MSG_MAX, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);
+        if (s_dlg_stage_reply) {
+            memset(s_dlg_stage_reply, 0, DLG_MSG_MAX);
+        }
+    }
+}
+
 void muse_ui_dialog_user(const char *text)
 {
-    if (!s_dialog || !text) {
+    if (!s_dialog || !text || !s_dlg_lock) {
         return;
     }
-    dlg_ensure_psram();
-    /* A new turn finalizes the previous one: its rows stay in the list
-     * as history, but they are no longer live (a new message must not
-     * append to them). Both were already stored (user at send, Muse at
-     * done); clearing here stores nothing again, and covers a cancelled
-     * reply that never reached done. */
-    s_dlg_live_user = NULL;
-    s_dlg_live_muse = NULL;
-    dlg_copy_trunc(s_dlg_user, DLG_MSG_MAX, text);
-    dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
-    dlg_store_save(false, s_dlg_user);
+    if (xSemaphoreTake(s_dlg_lock, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    dlg_stage_alloc();
+    if (s_dlg_stage_user) {
+        dlg_copy_trunc(s_dlg_stage_user, DLG_MSG_MAX, text);
+        s_dlg_user_pending = true;
+    }
+    xSemaphoreGive(s_dlg_lock);
 }
 
 void muse_ui_dialog_reply_append(const char *text, size_t len)
 {
-    if (!s_dialog || !text || len == 0) {
+    if (!s_dialog || !text || len == 0 || !s_dlg_lock) {
         return;
     }
-    dlg_ensure_psram();
-    size_t have = strlen(s_dlg_reply);
-    size_t room = have < DLG_MSG_MAX - 1 ? DLG_MSG_MAX - 1 - have : 0;
-    if (room == 0) {
+    if (xSemaphoreTake(s_dlg_lock, portMAX_DELAY) != pdTRUE) {
         return;
     }
-    size_t add = len < room ? len : room;
-    memcpy(s_dlg_reply + have, text, add);
-    s_dlg_reply[have + add] = '\0';
-    dlg_live(&s_dlg_live_muse, s_dlg_reply, COLOR_CAPTION);
+    dlg_stage_alloc();
+    if (s_dlg_stage_reply) {
+        size_t have = strlen(s_dlg_stage_reply);
+        size_t room = have < DLG_MSG_MAX - 1 ? DLG_MSG_MAX - 1 - have : 0;
+        if (room > 0) {
+            size_t add = len < room ? len : room;
+            memcpy(s_dlg_stage_reply + have, text, add);
+            s_dlg_stage_reply[have + add] = '\0';
+            s_dlg_reply_pending = true;
+        }
+    }
+    xSemaphoreGive(s_dlg_lock);
 }
 
 void muse_ui_dialog_reply_set(const char *text)
 {
-    if (!s_dialog || !text) {
+    if (!s_dialog || !text || !s_dlg_lock) {
         return;
     }
-    dlg_ensure_psram();
-    dlg_copy_trunc(s_dlg_reply, DLG_MSG_MAX, text);
-    dlg_live(&s_dlg_live_muse, s_dlg_reply, COLOR_CAPTION);
+    if (xSemaphoreTake(s_dlg_lock, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    dlg_stage_alloc();
+    if (s_dlg_stage_reply) {
+        dlg_copy_trunc(s_dlg_stage_reply, DLG_MSG_MAX, text);
+        s_dlg_reply_pending = true;
+    }
+    xSemaphoreGive(s_dlg_lock);
 }
 
 void muse_ui_dialog_reply_done(void)
 {
-    if (!s_dialog) {
+    if (!s_dialog || !s_dlg_lock) {
         return;
     }
-    dlg_ensure_psram();
-    if (s_dlg_reply[0]) {
-        dlg_store_save(true, s_dlg_reply);
+    if (xSemaphoreTake(s_dlg_lock, portMAX_DELAY) != pdTRUE) {
+        return;
     }
-    /* The row object stays in the list (visible during speech); only the
-     * live pointer clears, so a later message in the same turn starts a
-     * fresh row instead of appending to this one. A cancelled reply with
-     * no done is cleared by the next user send instead. */
-    s_dlg_live_muse = NULL;
+    s_dlg_reply_done_pending = true;
+    xSemaphoreGive(s_dlg_lock);
+}
+
+/* Applies pending dialog updates on the display task (frame_tick ->
+ * update_status). Copies staging to the live buffers under the lock,
+ * then does all LVGL/NVS work lock-free: the session never touches the
+ * live buffers or LVGL objects, so no cross-task object race remains.
+ * Order matters: user first (clears the previous turn's live pointers),
+ * then reply (a fresh row, since user cleared the live Muse pointer),
+ * then done (stores the just-rendered reply, clears its live pointer). */
+static void dlg_apply_pending(void)
+{
+    if (!s_dialog || !s_dlg_lock) {
+        return;
+    }
+    bool user_p = false, reply_p = false, done_p = false;
+    dlg_ensure_psram();
+    if (xSemaphoreTake(s_dlg_lock, portMAX_DELAY) == pdTRUE) {
+        if (s_dlg_user_pending && s_dlg_stage_user) {
+            user_p = true;
+            dlg_copy_trunc(s_dlg_user, DLG_MSG_MAX, s_dlg_stage_user);
+        }
+        s_dlg_user_pending = false;
+        if (s_dlg_reply_pending && s_dlg_stage_reply) {
+            reply_p = true;
+            dlg_copy_trunc(s_dlg_reply, DLG_MSG_MAX, s_dlg_stage_reply);
+        }
+        s_dlg_reply_pending = false;
+        done_p = s_dlg_reply_done_pending;
+        s_dlg_reply_done_pending = false;
+        xSemaphoreGive(s_dlg_lock);
+    }
+    if (user_p) {
+        /* A new turn finalizes the previous one: its rows stay in the
+         * list as history, but they are no longer live (a new message
+         * must not append to them). Both were already stored (user at
+         * send, Muse at done); clearing here stores nothing again, and
+         * covers a cancelled reply that never reached done. */
+        s_dlg_live_user = NULL;
+        s_dlg_live_muse = NULL;
+        dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
+        dlg_store_save(false, s_dlg_user);
+    }
+    if (reply_p) {
+        dlg_live(&s_dlg_live_muse, s_dlg_reply, COLOR_CAPTION);
+    }
+    if (done_p) {
+        if (s_dlg_reply[0]) {
+            dlg_store_save(true, s_dlg_reply);
+        }
+        /* The row object stays in the list (visible during speech);
+         * only the live pointer clears, so a later message in the same
+         * turn starts a fresh row instead of appending to this one. A
+         * cancelled reply with no done is cleared by the next user
+         * send instead. */
+        s_dlg_live_muse = NULL;
+    }
 }
 
 static void build_dialog_tile(lv_obj_t *tile)
@@ -2034,6 +2139,11 @@ static void build_dialog_tile(lv_obj_t *tile)
 
 static void build_screen(void)
 {
+    /* fix28: the dialog staging lock, created before s_dialog so a
+     * non-NULL s_dialog always implies a usable lock. */
+    if (!s_dlg_lock) {
+        s_dlg_lock = xSemaphoreCreateMutex();
+    }
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -3106,6 +3216,9 @@ static void update_status(muse_mode_t mode, float now)
         }
     }
 #endif
+    /* fix28: apply pending dialog updates (display task only; see
+     * dlg_apply_pending). This is where dialog_poll ran before fix27. */
+    dlg_apply_pending();
     update_power(now);
 }
 
