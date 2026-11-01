@@ -1497,6 +1497,13 @@ static bool s_scribe_pre_sent;
 static char *s_scribe_msg;
 static size_t s_scribe_msg_len;  /* bytes accumulated in s_scribe_msg for the message being reassembled */
 static char *s_scribe_transcript;
+/* The just-finished Scribe turn's transcript, kept for the dialog: Scribe
+ * turns emit no HEARD captions (unlike server dictation), so without this
+ * the dialog would have no user message at all for them. Set at post_chat,
+ * cleared at the next Scribe turn's start (so a failed turn cannot show a
+ * stale transcript). Cleared by scribe_realtime_cleanup's transcript reset
+ * only for the working buffer, not for this copy. */
+static char s_last_transcript[SCRIBE_RT_TRANSCRIPT_BYTES];
 static char *s_scribe_json;
 static char s_scribe_headers[128];  /* static: the websocket task reads it after start returns */
 
@@ -1773,6 +1780,7 @@ static bool scribe_send_prebuffer(void)
 
 static bool record_scribe_realtime(void)
 {
+    s_last_transcript[0] = '\0';
     if (!s_turn.note) {
         turn_fail("SCRIBE ERROR");
         return false;
@@ -1859,6 +1867,7 @@ static bool record_scribe_realtime(void)
     /* post_chat returns void (same as the Muse-note path): there is no
      * synchronous send-failure signal. A failed send surfaces through
      * the reply wait timeout, exactly as it does for a Muse note. */
+    strlcpy(s_last_transcript, s_scribe_transcript, sizeof(s_last_transcript));
     post_chat(s_scribe_transcript);
     /* The transcript is sent; Scribe is done. Close it before waiting for
      * Muse's reply, so a later idle close cannot log a spurious error. */
@@ -3368,6 +3377,19 @@ extern "C" muse_hatch_ev_t muse_hatch_turn_event(char *text, size_t cap)
         }
     }
     return MUSE_HATCH_EV_NONE;
+}
+
+/* The just-finished Scribe turn's full transcript, for the dialog's user
+ * message (Scribe turns have no HEARD captions to accumulate from).
+ * False when there is none (a turn that never posted, or a non-Scribe
+ * turn), so callers fall back to whatever captions they accumulated. */
+extern "C" bool muse_hatch_last_transcript(char *out, size_t cap)
+{
+    if (!out || cap == 0 || s_last_transcript[0] == '\0') {
+        return false;
+    }
+    strlcpy(out, s_last_transcript, cap);
+    return true;
 }
 
 extern "C" bool muse_hatch_turn_caption(size_t played, char *out, size_t cap)

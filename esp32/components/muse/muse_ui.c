@@ -1613,9 +1613,11 @@ static lv_obj_t *dlg_add(const char *text, uint32_t color)
         s_dlg_n--;
     }
     /* Chat layout: each message is a full-width row holding a
-     * content-width bubble. A growing spacer before a user bubble
-     * pushes it right (user messages right-aligned); Muse bubbles
-     * have no spacer, so they stay left. The row is what the list
+     * content-width bubble. User rows justify their bubble to the end
+     * (right-aligned); Muse rows justify to the start (left). No
+     * spacer: a spacer is an empty flex item whose default size can
+     * inflate the row's height, leaving a gap below user messages
+     * only (Muse rows have no spacer). The row is what the list
      * tracks (so overflow deletion removes the whole row); the
      * bubble is returned, so live updates render into it. */
     bool is_user = (color == COLOR_DIM);
@@ -1626,11 +1628,8 @@ static lv_obj_t *dlg_add(const char *text, uint32_t color)
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_all(row, 0, 0);
     lv_obj_set_style_pad_column(row, 0, 0);
-    if (is_user) {
-        lv_obj_t *spacer = lv_obj_create(row);
-        lv_obj_remove_style_all(spacer);
-        lv_obj_set_style_flex_grow(spacer, 1, 0);
-    }
+    lv_obj_set_flex_align(row, is_user ? LV_FLEX_ALIGN_END : LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_t *cont = lv_obj_create(row);
     lv_obj_remove_style_all(cont);
     lv_obj_set_width(cont, LV_SIZE_CONTENT);
@@ -2094,10 +2093,32 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
                 size_t inner = n - 2 < sizeof(s_dlg_tmp) - 1 ? n - 2 : sizeof(s_dlg_tmp) - 1;
                 memcpy(s_dlg_tmp, caption + 1, inner);
                 s_dlg_tmp[inner] = '\0';
-                dlg_copy_trunc(s_dlg_user, sizeof(s_dlg_user), s_dlg_tmp);
-                s_dlg_last_user_page[0] = '\0';
-                dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
-                dlg_copy_trunc(s_dlg_save_user, sizeof(s_dlg_save_user), s_dlg_user);
+                /* A quoted caption is a HEARD event's tail words, not
+                 * necessarily the full transcript (emit() keeps only
+                 * tail words for HEARD). Replacing the accumulation
+                 * with it would cut the front off. Replace only when
+                 * it extends the accumulation (the full transcript,
+                 * longer and starting with what was accumulated), or
+                 * when there is no accumulation yet; otherwise
+                 * accumulate it (overlap makes a contained window a
+                 * no-op, so a tail window cannot shrink the text). */
+                size_t acc_len = strlen(s_dlg_user);
+                if (acc_len > 0 && strcmp(s_dlg_tmp, s_dlg_user) == 0) {
+                    /* Identical: already shown, nothing to do. */
+                } else if (acc_len == 0) {
+                    dlg_copy_trunc(s_dlg_user, sizeof(s_dlg_user), s_dlg_tmp);
+                    s_dlg_last_user_page[0] = '\0';
+                    dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
+                    dlg_copy_trunc(s_dlg_save_user, sizeof(s_dlg_save_user), s_dlg_user);
+                } else if (strlen(s_dlg_tmp) > acc_len &&
+                           strncmp(s_dlg_tmp, s_dlg_user, acc_len) == 0) {
+                    dlg_copy_trunc(s_dlg_user, sizeof(s_dlg_user), s_dlg_tmp);
+                    s_dlg_last_user_page[0] = '\0';
+                    dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
+                    dlg_copy_trunc(s_dlg_save_user, sizeof(s_dlg_save_user), s_dlg_user);
+                } else {
+                    dlg_user_page(s_dlg_tmp);
+                }
             } else if (!dlg_is_status(caption)) {
                 /* A reply shown before playback (speaker off, or text
                  * arriving early): same stream as the speaking pages. */
@@ -2105,6 +2126,27 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
             }
         } else if (mode == MUSE_MODE_SPEAKING) {
             dlg_reply_page(caption);
+        }
+    }
+    /* Scribe turns provide no transcript captions, so their user message
+     * comes from the session's last transcript at the turn's end (when
+     * speaking starts). If a live user row exists, refresh it to the
+     * full transcript and let the finalize block below save it; if
+     * none exists (the usual Scribe case), create the row and save it
+     * directly. No-op when the session has no transcript (non-Scribe
+     * turns, failed turns), so caption-based turns are untouched. */
+    if (mode == MUSE_MODE_SPEAKING && s_dlg_prev_mode != MUSE_MODE_SPEAKING) {
+        if (muse_hatch_last_transcript(s_dlg_tmp, sizeof(s_dlg_tmp))) {
+            if (s_dlg_live_user) {
+                dlg_live(&s_dlg_live_user, s_dlg_tmp, COLOR_DIM);
+                dlg_copy_trunc(s_dlg_save_user, sizeof(s_dlg_save_user), s_dlg_tmp);
+            } else {
+                dlg_add(s_dlg_tmp, COLOR_DIM);
+                dlg_store_save(false, s_dlg_tmp);
+                s_dlg_user[0] = '\0';
+                s_dlg_last_user_page[0] = '\0';
+                s_dlg_save_user[0] = '\0';
+            }
         }
     }
     /* A live entry survives only while its turn runs; the label stays. */
