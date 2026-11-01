@@ -74,6 +74,7 @@ extern "C" {
 #include "muse_state.h"
 #include "muse_wifi.h"
 }
+#include "muse_chat.h"
 #include "muse_chat_priv.h"
 
 #include <xplat/noise/core/ClientSession.h>
@@ -1428,6 +1429,9 @@ static void post_chat(const char *text)
     }
     ESP_LOGI(TAG, "heard: \"%s\"", text);
     emit(MUSE_HATCH_EV_HEARD, text);
+    /* Dialog user row, direct at the send moment: this text is the sent
+     * text, whole -- no caption reconstruction. */
+    muse_ui_dialog_user(text);
     send_chat_marked(text, "text");
 }
 
@@ -1438,6 +1442,7 @@ static void text_begin(const char *text)
         return;
     }
     ESP_LOGI(TAG, "typed turn: %u bytes", (unsigned)strlen(text));
+    muse_ui_dialog_user(text);
     send_chat_marked(text, "text");
     if (s_turn.phase == P_WAIT_REPLY) {
         mark(M_SENT);
@@ -1497,9 +1502,9 @@ static bool s_scribe_pre_sent;
 static char *s_scribe_msg;
 static size_t s_scribe_msg_len;  /* bytes accumulated in s_scribe_msg for the message being reassembled */
 static char *s_scribe_transcript;
-/* The just-finished Scribe turn's transcript, kept for the dialog: Scribe
- * turns emit no HEARD captions (unlike server dictation), so without this
- * the dialog would have no user message at all for them. Set at post_chat,
+/* The just-finished Scribe turn's transcript, kept for the face's SENT
+ * caption: Scribe turns emit no HEARD captions (unlike server dictation),
+ * so without this the face would have no sent transcript to page. Set at post_chat,
  * cleared at the next Scribe turn's start (so a failed turn cannot show a
  * stale transcript). Cleared by scribe_realtime_cleanup's transcript reset
  * only for the working buffer, not for this copy. */
@@ -2070,7 +2075,15 @@ static void append_text(msg_t &m, const char *text)
         if (!m.len) {
             full[0] = '\0';
         }
+        size_t old_len = strlen(full);
         strlcat(full, text, TEXT_MAX);
+        /* Dialog reply row, direct: exactly the bytes that landed in the
+         * reply buffer (capped at TEXT_MAX, like speech and the face),
+         * so the row always matches what is spoken and shown. */
+        size_t new_len = strlen(full);
+        if (new_len > old_len) {
+            muse_ui_dialog_reply_append(full + old_len, new_len - old_len);
+        }
     }
     m.len += add;
     size_t have = strlen(m.tail);
@@ -2120,9 +2133,16 @@ static void message_done(int i, const char *final_text)
         if (final_text && final_text[0] && strlen(final_text) != m.len) {
             n = strlen(final_text);
             muse_hatch_console("final", final_text, "\"msg\":%d", i);
+            /* Dialog correction: the appended row is missing a piece, so
+             * replace it with the complete text, capped at TEXT_MAX like
+             * speech and the face. */
+            char capped[TEXT_MAX];
+            strlcpy(capped, final_text, sizeof(capped));
+            muse_ui_dialog_reply_set(capped);
         }
         muse_hatch_console("message_done", nullptr, "\"msg\":%d,\"bytes\":%u", i, (unsigned)n);
         ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)n);
+        muse_ui_dialog_reply_done();
         return;
     }
     if (!m.len && final_text && final_text[0]) {
@@ -2132,6 +2152,7 @@ static void message_done(int i, const char *final_text)
         m.tts = TTS_QUEUED;
     }
     ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)m.len);
+    muse_ui_dialog_reply_done();
 }
 
 static const char *msg_id(cJSON *payload, cJSON *event)

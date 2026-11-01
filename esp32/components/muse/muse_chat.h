@@ -111,9 +111,22 @@ muse_hatch_ev_t muse_hatch_turn_event(char *text, size_t cap);
  */
 bool muse_hatch_turn_caption(size_t played, char *out, size_t cap);
 
-/* The just-finished Scribe turn's full transcript, for the dialog's user
- * message. False when there is none. */
+/* The just-finished Scribe turn's full transcript, for the face's SENT
+ * caption. False when there is none.
+ */
 bool muse_hatch_last_transcript(char *out, size_t cap);
+
+/* Dialog direct routing (fix27): the dialog no longer reconstructs
+ * messages from face captions. The chat session calls these at the
+ * moments the text is known: user when a message is sent, reply append
+ * as deltas arrive, reply set to correct a message whose pieces did not
+ * add up, reply done to store a completed message. No-ops until the
+ * dialog tile exists.
+ */
+void muse_ui_dialog_user(const char *text);
+void muse_ui_dialog_reply_append(const char *text, size_t len);
+void muse_ui_dialog_reply_set(const char *text);
+void muse_ui_dialog_reply_done(void);
 
 /* Reply speech as 16 kHz mono. Waits up to wait_ms for some; returns frames read. */
 size_t muse_hatch_turn_read(int16_t *pcm, size_t frames, int wait_ms);

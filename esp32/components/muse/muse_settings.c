@@ -41,7 +41,6 @@ static struct {
     uint8_t mic_gain;
     uint8_t sw_gain;
     uint8_t silence_s;
-    uint8_t dlg_font;
     uint8_t brightness;
     uint16_t sleep_s;
     bool wifi_on;
@@ -59,7 +58,6 @@ static struct {
     .mic_gain = 30,
     .sw_gain = 2,
     .silence_s = MUSE_SILENCE_S_DEFAULT,
-    .dlg_font = MUSE_DLG_FONT_DEFAULT,
     .brightness = 100,
     .sleep_s = 120,
     .wifi_on = true,
@@ -146,7 +144,6 @@ esp_err_t muse_settings_init(void)
     load_u8("mic_gain", &s.mic_gain);
     load_u8("sw_gain", &s.sw_gain);
     load_u8("silence_s", &s.silence_s);
-    load_u8("dlgfont", &s.dlg_font);
     load_u8("bright", &s.brightness);
     nvs_get_u16(s_nvs, "sleep_s", &s.sleep_s);
     if (nvs_get_u8(s_nvs, "wifi_on", &b) == ESP_OK) {
@@ -165,7 +162,6 @@ esp_err_t muse_settings_init(void)
     s.mic_gain = clampi(s.mic_gain, 0, MUSE_MIC_GAIN_MAX);
     s.sw_gain = clampi(s.sw_gain, 1, MUSE_SW_GAIN_MAX);
     s.silence_s = clampi(s.silence_s, MUSE_SILENCE_S_MIN, MUSE_SILENCE_S_MAX);
-    s.dlg_font = clampi(s.dlg_font, MUSE_DLG_FONT_MIN, MUSE_DLG_FONT_MAX);
     s.brightness = clampi(s.brightness, 10, 100);
     ESP_LOGI(TAG, "speak all pushes %s", s.speak_all ? "on" : "off");
     if (s.tts_fail_reason) {
@@ -208,7 +204,6 @@ bool muse_settings_wake_on_battery(void) { return s.wake_on_battery; }
 int muse_settings_mic_gain(void) { return s.mic_gain; }
 int muse_settings_sw_gain(void) { return s.sw_gain; }
 int muse_settings_silence_s(void) { return s.silence_s; }
-int muse_settings_dlg_font(void) { return s.dlg_font; }
 int muse_settings_brightness(void) { return s.brightness; }
 int muse_settings_sleep_s(void) { return s.sleep_s; }
 bool muse_settings_wifi_on(void) { return s.wifi_on; }
@@ -308,14 +303,6 @@ void muse_settings_set_silence_s(int secs)
 {
     s.silence_s = clampi(secs, MUSE_SILENCE_S_MIN, MUSE_SILENCE_S_MAX);
     save_u8("silence_s", s.silence_s);
-}
-
-/* No notify: the dialog polls the getter when it builds each label,
- * so a change applies to the next opened dialog without a hardware update. */
-void muse_settings_set_dlg_font(int size)
-{
-    s.dlg_font = clampi(size, MUSE_DLG_FONT_MIN, MUSE_DLG_FONT_MAX);
-    save_u8("dlgfont", s.dlg_font);
 }
 
 void muse_settings_set_brightness(int pct)

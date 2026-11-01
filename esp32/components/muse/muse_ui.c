@@ -542,10 +542,8 @@ static const lv_font_t *font_pick(const lv_font_t *full, const lv_font_t *compac
 
 #if CONFIG_MUSE_CJK_FONT
 LV_FONT_DECLARE(muse_font_cjk_16)
-LV_FONT_DECLARE(muse_font_noto_sc_14)
 LV_FONT_DECLARE(muse_font_noto_sc_16)
 LV_FONT_DECLARE(muse_font_noto_sc_16_bold)
-LV_FONT_DECLARE(muse_font_noto_sc_20)
 #endif
 
 /* Noto Sans SC 16 for captions and replies; with CONFIG_MUSE_CJK_FONT, a copy
@@ -591,56 +589,18 @@ static const lv_font_t *caption_font_bold(void)
 #endif
 }
 
-/* Dialog text font, by the DIALOG FONT setting (Settings -> SOUND).
- * Medium is the caption font (16 px, unchanged); small/large are the
- * same Noto Sans SC subset at 14/20 px, falling back to the 16 px
- * Unifont for rare characters (no 14/20 px fallback exists, so a rare
- * character renders at 16 px among 14/20 px text). The face keeps
- * caption_font() (16 px): its paging is sized for it. Line height
- * scales like the caption font's (1.5x size); base line scales with
- * size (16 px -> 5). */
+/* Dialog text uses the caption font (16 px CJK). The small/large size
+ * option (14/20 px fonts) was reverted (fix27): the extra fonts cost
+ * ~1 MB of PSRAM and broke wake calls on this board's ~2 MB heap. */
 static const lv_font_t *dlg_font(void)
 {
-#if CONFIG_MUSE_CJK_FONT
-    static lv_font_t font14, font20;
-    int size = muse_settings_dlg_font();
-    if (size == MUSE_DLG_FONT_SMALL) {
-        if (!font14.get_glyph_dsc) {
-            font14 = muse_font_noto_sc_14;
-            font14.fallback = &muse_font_cjk_16;
-            font14.line_height = 21;
-            font14.base_line = 4;
-        }
-        return &font14;
-    }
-    if (size == MUSE_DLG_FONT_LARGE) {
-        if (!font20.get_glyph_dsc) {
-            font20 = muse_font_noto_sc_20;
-            font20.fallback = &muse_font_cjk_16;
-            font20.line_height = 30;
-            font20.base_line = 6;
-        }
-        return &font20;
-    }
     return caption_font();
-#else
-    return &lv_font_unscii_16;
-#endif
 }
 
-/* Bold companion of dlg_font, for dialog headings. There are no
- * 14/20 px bold fonts (flash), so small/large headings use the
- * regular font at that size: they keep their underline, not bold. */
+/* Bold companion of dlg_font, for dialog headings. */
 static const lv_font_t *dlg_font_bold(void)
 {
-#if CONFIG_MUSE_CJK_FONT
-    if (muse_settings_dlg_font() == MUSE_DLG_FONT_MEDIUM) {
-        return caption_font_bold();
-    }
-    return dlg_font();
-#else
-    return &lv_font_unscii_16;
-#endif
+    return caption_font_bold();
 }
 
 static lv_obj_t *make_label(lv_obj_t *parent, const lv_font_t *font, uint32_t color)
@@ -994,10 +954,7 @@ static int s_dlg_n;
 static lv_obj_t *s_dlg_live_user;
 static lv_obj_t *s_dlg_live_muse;
 static char *s_dlg_reply = NULL;
-static char *s_dlg_last_page = NULL;
 static char *s_dlg_user = NULL;
-static char *s_dlg_last_user_page = NULL;
-static muse_mode_t s_dlg_prev_mode = MUSE_MODE_BOOT;
 
 /* Defined after the dialog buffers; allocates them from PSRAM. */
 static void dlg_ensure_psram(void);
@@ -1061,11 +1018,9 @@ static char *s_dlg_tmp = NULL;
  * internal heap is critically tight, and even a 400-byte BSS buffer
  * counts against the margin that Scribe TLS setup needs. Allocated
  * once, never freed. */
-static char *s_dlg_norm = NULL;
 /* Guard transcript fetch: 2048 bytes to hold a full Scribe transcript
  * (2047 max) without truncating, so the last page stays a substring
  * and does not leak into the reply. */
-static char *s_dlg_guard = NULL;
 static char *s_dlg_raw = NULL;
 static char *s_dlg_line = NULL;
 static char *s_dlg_block = NULL;
@@ -1793,9 +1748,9 @@ static void dlg_live(lv_obj_t **slot, const char *text, uint32_t color)
 }
 
 /* ---- Dialog text history on NVS (voice waits for an SD card) ----
- * Finalized messages only: the user turn is saved when Muse starts
- * speaking, the Muse turn when it ends; a live message lost to a restart
- * mid-turn is not saved. Stored as "<seq>|M|<text>" / "<seq>|U|<text>",
+ * Finalized messages only: the user turn is saved when it is sent,
+ * the Muse turn when its message completes; a live message lost to a
+ * restart mid-turn (or a cancelled, partial reply) is not saved. Stored as "<seq>|M|<text>" / "<seq>|U|<text>",
  * newest 10, ~8 KB total, each text cut to 1500 bytes (the NVS per-value
  * limit is ~1984). The seq counter is shared with the future voice store
  * so text and voice interleave in order on restore. A missing or corrupt
@@ -1803,7 +1758,6 @@ static void dlg_live(lv_obj_t **slot, const char *text, uint32_t color)
 #define DLG_STORE_NS "dlg"
 #define DLG_STORE_MAX_BYTES 8192
 #define DLG_STORE_TEXT_MAX 1500
-static char *s_dlg_save_user = NULL;
 static bool s_dlg_restored;
 static char *s_dlg_store_read = NULL;
 static char *s_dlg_store_write = NULL;
@@ -1825,15 +1779,12 @@ static void dlg_ensure_psram(void)
         } \
     } while (0)
     DLG_PSRAM(s_dlg_reply, DLG_MSG_MAX);
-    DLG_PSRAM(s_dlg_last_page, DLG_MSG_MAX);
     DLG_PSRAM(s_dlg_user, DLG_MSG_MAX);
-    DLG_PSRAM(s_dlg_last_user_page, DLG_MSG_MAX);
     DLG_PSRAM(s_dlg_stripped, DLG_MSG_MAX);
     DLG_PSRAM(s_dlg_tmp, DLG_MSG_MAX);
     DLG_PSRAM(s_dlg_raw, DLG_MSG_MAX);
     DLG_PSRAM(s_dlg_line, DLG_MSG_MAX);
     DLG_PSRAM(s_dlg_block, DLG_MSG_MAX);
-    DLG_PSRAM(s_dlg_save_user, DLG_MSG_MAX);
     DLG_PSRAM(s_dlg_store_read, 2048);
     DLG_PSRAM(s_dlg_store_write, 1536);
 #undef DLG_PSRAM
@@ -1959,6 +1910,82 @@ static void dlg_restore(void)
     nvs_close(h);
 }
 
+/* ---- Dialog direct routing (fix27) ----
+ * The dialog no longer reconstructs messages from face captions (sliding
+ * windows that needed overlap dedup, guards and substring matching to
+ * tell sent pages from reply pages). The chat session calls these
+ * directly at the moments the text is known:
+ *   user  -> when a message is sent (post_chat / text_begin)
+ *   reply -> as reply deltas arrive (append_text) and when a message
+ *            completes (message_done, correcting any skipped piece)
+ * User rows are stored at send (the sent text is complete then); Muse
+ * rows are stored at message_done (the reply is complete then, never a
+ * partial: a cancelled reply stays live but is not stored, matching the
+ * finalized-only store below). Muse live rows clear at message done
+ * (the row stays as history, so a later message in the same turn starts
+ * fresh); user live rows clear at the next user send (which also covers
+ * a cancelled reply with no done). */
+void muse_ui_dialog_user(const char *text)
+{
+    if (!s_dialog || !text) {
+        return;
+    }
+    dlg_ensure_psram();
+    /* A new turn finalizes the previous one: its rows stay in the list
+     * as history, but they are no longer live (a new message must not
+     * append to them). Both were already stored (user at send, Muse at
+     * done); clearing here stores nothing again, and covers a cancelled
+     * reply that never reached done. */
+    s_dlg_live_user = NULL;
+    s_dlg_live_muse = NULL;
+    dlg_copy_trunc(s_dlg_user, DLG_MSG_MAX, text);
+    dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
+    dlg_store_save(false, s_dlg_user);
+}
+
+void muse_ui_dialog_reply_append(const char *text, size_t len)
+{
+    if (!s_dialog || !text || len == 0) {
+        return;
+    }
+    dlg_ensure_psram();
+    size_t have = strlen(s_dlg_reply);
+    size_t room = have < DLG_MSG_MAX - 1 ? DLG_MSG_MAX - 1 - have : 0;
+    if (room == 0) {
+        return;
+    }
+    size_t add = len < room ? len : room;
+    memcpy(s_dlg_reply + have, text, add);
+    s_dlg_reply[have + add] = '\0';
+    dlg_live(&s_dlg_live_muse, s_dlg_reply, COLOR_CAPTION);
+}
+
+void muse_ui_dialog_reply_set(const char *text)
+{
+    if (!s_dialog || !text) {
+        return;
+    }
+    dlg_ensure_psram();
+    dlg_copy_trunc(s_dlg_reply, DLG_MSG_MAX, text);
+    dlg_live(&s_dlg_live_muse, s_dlg_reply, COLOR_CAPTION);
+}
+
+void muse_ui_dialog_reply_done(void)
+{
+    if (!s_dialog) {
+        return;
+    }
+    dlg_ensure_psram();
+    if (s_dlg_reply[0]) {
+        dlg_store_save(true, s_dlg_reply);
+    }
+    /* The row object stays in the list (visible during speech); only the
+     * live pointer clears, so a later message in the same turn starts a
+     * fresh row instead of appending to this one. A cancelled reply with
+     * no done is cleared by the next user send instead. */
+    s_dlg_live_muse = NULL;
+}
+
 static void build_dialog_tile(lv_obj_t *tile)
 {
     lv_obj_t *title = make_label(tile, &lv_font_montserrat_14, COLOR_DIM);
@@ -1995,468 +2022,15 @@ static void build_dialog_tile(lv_obj_t *tile)
     dlg_restore();
 }
 
-/* Longest prefix of the new caption already present as a suffix of the
- * accumulated text, so appending it would repeat content. Captions are
- * sliding windows, not clean page turns: a new caption usually carries
- * most of the previous one (plus a few new words), and the old one-line
- * dedup only removed a single overlapping line, leaving the rest to pile
- * up into the repeated-sentence snowball seen on device. Overlaps happen
- * at line starts on both sides (a page join in the accumulation is a
- * space where the fresh caption has a newline, so ' ' and '\n' compare
- * equal here); requiring both boundaries keeps a coincidental shared
- * word from being mistaken for an overlap. Returns the skip length. */
-static size_t dlg_overlap(const char *acc, size_t acc_len, const char *text, size_t text_len)
-{
-    size_t best = 0;
-    for (size_t k = 0; k <= text_len;) {
-        /* Compare the prefix content, not the raw k chars: the
-         * accumulation ends without a trailing newline, while a text
-         * prefix ending at a line start carries one, so comparing raw
-         * slices is shifted by one and never matches. Strip that one
-         * newline for the comparison, but return k (the full skip,
-         * newline included) so the remainder starts at a line start. */
-        size_t clen = k;
-        if (clen > 0 && text[clen - 1] == '\n') {
-            clen--;
-        }
-        if (clen <= acc_len && k > best) {
-            size_t start = acc_len - clen;
-            bool boundary = (start == 0) || (acc[start - 1] == '\n') || (acc[start - 1] == ' ');
-            if (boundary) {
-                bool ok = true;
-                for (size_t i = 0; i < clen; i++) {
-                    char a = acc[start + i];
-                    char b = text[i];
-                    if (a != b && !((a == ' ' || a == '\n' || a == '\t') &&
-                                    (b == ' ' || b == '\n' || b == '\t'))) {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (ok) {
-                    best = k;
-                }
-            }
-        }
-        if (k >= text_len) {
-            break;
-        }
-        size_t nxt = k;
-        while (nxt < text_len && text[nxt] != '\n') {
-            nxt++;
-        }
-        if (nxt >= text_len) {
-            break;
-        }
-        k = nxt + 1;
-    }
-    return best;
-}
 
-/* Longest suffix of acc matching a prefix of text, at any character
- * position (for wrapped-line windows, which have no newline to anchor
- * on: a long reply is one line in the text, wrapped by the screen, so
- * a sliding window overlaps mid-line). Requires at least 16 bytes, so
- * a coincidental shared word cannot trigger it; a window overlap is
- * far longer. Checked longest-first, so the first match is the one to
- * skip; mismatches fail on the first differing byte, so the scan is
- * cheap in practice. */
-static size_t dlg_overlap_char(const char *acc, size_t acc_len, const char *text, size_t text_len)
-{
-    size_t maxk = acc_len < text_len ? acc_len : text_len;
-    for (size_t k = maxk; k >= 16; k--) {
-        bool ok = true;
-        for (size_t i = 0; i < k; i++) {
-            char a = acc[acc_len - k + i];
-            char b = text[i];
-            if (a != b && !((a == ' ' || a == '\n' || a == '\t') &&
-                            (b == ' ' || b == '\n' || b == '\t'))) {
-                ok = false;
-                break;
-            }
-        }
-        if (ok) {
-            return k;
-        }
-        if (k == 16) {
-            break;
-        }
-    }
-    return 0;
-}
 
-/* Whether joining acc and the remainder needs a space between them.
- * Only between two ASCII words, or after ASCII sentence punctuation
- * before an ASCII word. Chinese (multibyte) and Chinese punctuation
- * need no space; joining with one leaves a visible gap in Chinese
- * text, which is the common case here. */
-static bool dlg_need_join_space(const char *acc, const char *rem)
-{
-    if (acc[0] == '\0' || rem[0] == '\0') {
-        return false;
-    }
-    size_t alen = strlen(acc);
-    unsigned char last = (unsigned char)acc[alen - 1];
-    unsigned char first = (unsigned char)rem[0];
-    bool last_word = (last >= 'a' && last <= 'z') || (last >= 'A' && last <= 'Z') ||
-                     (last >= '0' && last <= '9');
-    bool last_punct = (last == '.' || last == '!' || last == '?');
-    bool first_word = (first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') ||
-                      (first >= '0' && first <= '9');
-    return first_word && (last_word || last_punct);
-}
 
-/* Append a caption to an accumulated message, skipping whatever is
- * already there. Two shapes, both seen on device:
- *  - Extension: the new caption continues the previous one on the same
- *    line (streaming grows a paragraph word by word, with no newline at
- *    the joint). Append only the extension, with no join space, since
- *    it is a direct continuation. A whitespace run in one side matches
- *    a run in the other, so a blank line versus a space cannot shift
- *    the cut by a character.
- *  - Window/page: the new caption is a sliding window over old content
- *    (see dlg_overlap). Append only past the longest line-start overlap.
- * Pages join with a space: wrapping consumes the boundary space, so
- * re-adding one can only ever add a harmless extra space, never join
- * words. */
-static void dlg_accumulate(char *acc, size_t acc_size, const char *caption, const char *last_page)
-{
-    size_t have = strlen(acc);
-    if (last_page[0] != '\0') {
-        size_t plen = strlen(last_page);
-        size_t clen = strlen(caption);
-        size_t li = 0;
-        size_t ci = 0;
-        bool prefix = true;
-        while (li < plen) {
-            if (ci >= clen) {
-                prefix = false;
-                break;
-            }
-            char a = last_page[li];
-            char b = caption[ci];
-            if (a == b) {
-                li++;
-                ci++;
-            } else if ((a == ' ' || a == '\n' || a == '\t') &&
-                       (b == ' ' || b == '\n' || b == '\t')) {
-                while (li < plen && (last_page[li] == ' ' || last_page[li] == '\n' ||
-                                     last_page[li] == '\t')) {
-                    li++;
-                }
-                while (ci < clen && (caption[ci] == ' ' || caption[ci] == '\n' ||
-                                     caption[ci] == '\t')) {
-                    ci++;
-                }
-            } else {
-                prefix = false;
-                break;
-            }
-        }
-        if (prefix && ci < clen) {
-            size_t room = acc_size - have - 1;
-            if (room > 0) {
-                strncat(acc, caption + ci, room);
-                dlg_fix_tail(acc);
-            }
-            return;
-        }
-        if (prefix) {
-            return;
-        }
-    }
-    size_t skip_line = dlg_overlap(acc, have, caption, strlen(caption));
-    size_t skip_char = dlg_overlap_char(acc, have, caption, strlen(caption));
-    size_t skip = skip_line > skip_char ? skip_line : skip_char;
-    const char *append = caption + skip;
-    size_t room = acc_size - have - 1;
-    if (room > 0 && append[0] != '\0') {
-        if (have > 0 && dlg_need_join_space(acc, append)) {
-            strncat(acc, " ", room);
-            room = acc_size - strlen(acc) - 1;
-        }
-        if (room > 0) {
-            strncat(acc, append, room);
-            dlg_fix_tail(acc);
-        }
-    }
-}
 
-/* Strip whitespace in place, so a caption page (which has wrap
- * newlines) can be compared against the raw session transcript
- * (which does not). Returns the compacted length. */
-static size_t dlg_strip_ws(char *s)
-{
-    size_t w = 0;
-    for (size_t r = 0; s[r]; r++) {
-        char c = s[r];
-        if (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
-            s[w++] = c;
-        }
-    }
-    s[w] = '\0';
-    return w;
-}
 
-/* True when this caption IS the session's sent transcript. The face
- * caption is shared with the dialog via the global caption, so the
- * SENT transcript (set on the face at SENT) also reaches dialog_poll
- * during THINKING (and, if the poll runs before the reply page
- * caption updates, at SPEAKING entry). Appending it to the Muse reply
- * would put user text in a grey Muse bubble and mix it into the
- * reply, which looks like the backgrounds switched. The dialog must
- * not append it: it is user text, already shown (or to be shown) as
- * the user row from the session transcript at SPEAKING entry.
- * Exact match, or a long (at least 24 bytes) substring, after
- * stripping whitespace; the length floor keeps genuine short replies
- * that merely echo user words (for example "好的") going through.
- * False when there is no session transcript (non-Scribe turns), so
- * caption-based turns are untouched. Uses s_dlg_guard for the transcript
- * fetch and s_dlg_norm for the caption copy; neither is used elsewhere
- * in these branches. */
-static bool dlg_is_session_transcript(const char *caption)
-{
-    /* Full Scribe transcript (up to 2047 bytes) in its own PSRAM
-     * buffer: the dialog buffer (2000 bytes) truncates long
-     * transcripts, so the last page straddling the cut failed the
-     * substring check and leaked into the reply in front of it. */
-    if (!s_dlg_guard) {
-        s_dlg_guard = heap_caps_malloc_prefer(2048, 2,
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);
-        if (!s_dlg_guard) {
-            return false;
-        }
-    }
-    if (!muse_hatch_last_transcript(s_dlg_guard, 2048)) {
-        return false;
-    }
-    if (dlg_strip_ws(s_dlg_guard) == 0) {
-        return false;
-    }
-    if (!s_dlg_norm) {
-        s_dlg_norm = heap_caps_malloc_prefer(MUSE_CAPTION_MAX, 2,
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);
-        if (!s_dlg_norm) {
-            return false;
-        }
-    }
-    snprintf(s_dlg_norm, MUSE_CAPTION_MAX, "%s", caption);
-    size_t nlen = dlg_strip_ws(s_dlg_norm);
-    if (nlen == 0) {
-        return false;
-    }
-    if (strcmp(s_dlg_guard, s_dlg_norm) == 0) {
-        return true;
-    }
-    return nlen >= 24 && strstr(s_dlg_guard, s_dlg_norm) != NULL;
-}
 
-/* True when a caption is part of the current turn's user text (the
- * full transcript, set directly at THINKING entry). Used only for the
- * single SPEAKING-entry poll, to tell a stale SENT page from the
- * reply's opening page. Unlike the old guard, there is no length
- * floor: the reference is the exact current-turn transcript, and a
- * reply page is essentially never a substring of it, while any SENT
- * page -- even a short last page -- is. s_dlg_tmp holds the stripped
- * transcript copy (free here: the SPEAKING-entry user block below
- * fetches into it only after this check); s_dlg_user itself is left
- * untouched. */
-static bool dlg_caption_in_user(const char *caption)
-{
-    if (!s_dlg_user[0]) {
-        return false;
-    }
-    if (!s_dlg_norm) {
-        s_dlg_norm = heap_caps_malloc_prefer(MUSE_CAPTION_MAX, 2,
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);
-        if (!s_dlg_norm) {
-            return false;
-        }
-    }
-    snprintf(s_dlg_norm, MUSE_CAPTION_MAX, "%s", caption);
-    if (dlg_strip_ws(s_dlg_norm) == 0) {
-        return true;
-    }
-    dlg_copy_trunc(s_dlg_tmp, DLG_MSG_MAX, s_dlg_user);
-    if (dlg_strip_ws(s_dlg_tmp) == 0) {
-        return false;
-    }
-    return strstr(s_dlg_tmp, s_dlg_norm) != NULL;
-}
 
-static void dlg_reply_page(const char *caption)
-{
-    if (strcmp(caption, s_dlg_last_page) == 0) {
-        return;
-    }
-    dlg_accumulate(s_dlg_reply, DLG_MSG_MAX, caption, s_dlg_last_page);
-    dlg_copy_trunc(s_dlg_last_page, DLG_MSG_MAX, caption);
-    dlg_live(&s_dlg_live_muse, s_dlg_reply, COLOR_CAPTION);
-}
 
-/* The user turn accumulates the same way: listening captions are windows
- * too, and overwriting the dialog entry with each window left only the
- * last few characters visible. The quoted final transcript (thinking)
- * replaces the accumulation outright, since it is authoritative. */
-static void dlg_user_page(const char *caption)
-{
-    if (strcmp(caption, s_dlg_last_user_page) == 0) {
-        return;
-    }
-    dlg_accumulate(s_dlg_user, DLG_MSG_MAX, caption, s_dlg_last_user_page);
-    dlg_copy_trunc(s_dlg_last_user_page, DLG_MSG_MAX, caption);
-    dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
-    dlg_copy_trunc(s_dlg_save_user, DLG_MSG_MAX, s_dlg_user);
-}
 
-static void dialog_poll(muse_mode_t mode, const char *caption)
-{
-    if (!s_dialog) {
-        return;
-    }
-    dlg_ensure_psram();
-    /* A conversation starting jumps to the avatar tile, not the dialog:
-     * talking is watched on the face; history is read by swiping. */
-    if ((mode == MUSE_MODE_LISTENING || mode == MUSE_MODE_SPEAKING) && mode != s_dlg_prev_mode &&
-        lv_tileview_get_tile_active(s_tv) != s_face) {
-        lv_tileview_set_tile(s_tv, s_face, LV_ANIM_ON);
-    }
-    /* Scribe turns: the user row comes directly from the session
-     * transcript the moment the turn reaches THINKING (i.e. right
-     * after sending), whole -- not reconstructed from caption pages.
-     * Non-Scribe turns have no session transcript, so the fetch fails
-     * and the caption path below (listening/quoted) still builds the
-     * user row as before. The row is live: the SPEAKING-entry block
-     * below refreshes it (no duplicate), and the finalize block saves
-     * it when the turn ends. */
-    if (mode == MUSE_MODE_THINKING && s_dlg_prev_mode != MUSE_MODE_THINKING) {
-        if (muse_hatch_last_transcript(s_dlg_tmp, DLG_MSG_MAX)) {
-            dlg_copy_trunc(s_dlg_user, DLG_MSG_MAX, s_dlg_tmp);
-            s_dlg_last_user_page[0] = '\0';
-            dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
-            dlg_copy_trunc(s_dlg_save_user, DLG_MSG_MAX, s_dlg_user);
-        }
-    }
-    if (caption && caption[0]) {
-        if (mode == MUSE_MODE_LISTENING) {
-            if (!dlg_is_status(caption)) {
-                dlg_user_page(caption);
-            }
-        } else if (mode == MUSE_MODE_THINKING) {
-            size_t n = strlen(caption);
-            if (n > 2 && caption[0] == '"' && caption[n - 1] == '"') {
-                /* Final transcript, quoted: refresh the user turn. */
-                size_t inner = n - 2 < DLG_MSG_MAX - 1 ? n - 2 : DLG_MSG_MAX - 1;
-                memcpy(s_dlg_tmp, caption + 1, inner);
-                s_dlg_tmp[inner] = '\0';
-                /* A quoted caption is a HEARD event's tail words, not
-                 * necessarily the full transcript (emit() keeps only
-                 * tail words for HEARD). Replacing the accumulation
-                 * with it would cut the front off. Replace only when
-                 * it extends the accumulation (the full transcript,
-                 * longer and starting with what was accumulated), or
-                 * when there is no accumulation yet; otherwise
-                 * accumulate it (overlap makes a contained window a
-                 * no-op, so a tail window cannot shrink the text). */
-                size_t acc_len = strlen(s_dlg_user);
-                if (acc_len > 0 && strcmp(s_dlg_tmp, s_dlg_user) == 0) {
-                    /* Identical: already shown, nothing to do. */
-                } else if (acc_len == 0) {
-                    dlg_copy_trunc(s_dlg_user, DLG_MSG_MAX, s_dlg_tmp);
-                    s_dlg_last_user_page[0] = '\0';
-                    dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
-                    dlg_copy_trunc(s_dlg_save_user, DLG_MSG_MAX, s_dlg_user);
-                } else if (strlen(s_dlg_tmp) > acc_len &&
-                           strncmp(s_dlg_tmp, s_dlg_user, acc_len) == 0) {
-                    dlg_copy_trunc(s_dlg_user, DLG_MSG_MAX, s_dlg_tmp);
-                    s_dlg_last_user_page[0] = '\0';
-                    dlg_live(&s_dlg_live_user, s_dlg_user, COLOR_DIM);
-                    dlg_copy_trunc(s_dlg_save_user, DLG_MSG_MAX, s_dlg_user);
-                } else {
-                    dlg_user_page(s_dlg_tmp);
-                }
-            } else if (!dlg_is_status(caption)) {
-                /* Speaker on (the normal path): THINKING captions never
-                 * reach the reply row. SENT pages are user text (the
-                 * user row is already set directly from the transcript
-                 * at THINKING entry, above), and early reply pages are
-                 * not lost: the opening page persists into SPEAKING
-                 * and is picked up there. Routing SENT pages here by
-                 * matching their text (the old guard) misrouted short
-                 * last pages (under the guard's 24-byte floor),
-                 * prepending the user's own tail words to the reply.
-                 * Speaker off keeps the old path: with no SPEAKING
-                 * phase, reply text shown during THINKING is the only
-                 * reply stream. */
-                if (!muse_settings_speaker_on() &&
-                    !dlg_is_session_transcript(caption)) {
-                    dlg_reply_page(caption);
-                }
-            }
-        } else if (mode == MUSE_MODE_SPEAKING) {
-            if (dlg_is_status(caption)) {
-                /* Status captions (e.g. speaker toggles) are not reply pages. */
-            } else if (s_dlg_prev_mode == MUSE_MODE_THINKING && s_dlg_user[0]) {
-                /* Entry from THINKING: the poll may run before the reply
-                 * page caption replaces the last SENT page. The user row
-                 * already holds the full transcript (set at THINKING
-                 * entry), so a caption that is part of it (any length,
-                 * no floor -- short last pages are exactly the ones the
-                 * old guard missed) is that stale SENT page: skip it.
-                 * Anything else is the reply's opening page: route it.
-                 * The next poll's caption is a new (reply) caption, so
-                 * skipping here loses nothing. */
-                if (!dlg_caption_in_user(caption)) {
-                    dlg_reply_page(caption);
-                }
-            } else {
-                /* Already speaking, or opened late: captions are reply
-                 * pages by mode. */
-                dlg_reply_page(caption);
-            }
-        }
-    }
-    /* Scribe turns provide no transcript captions, so their user message
-     * comes from the session's last transcript at the turn's end (when
-     * speaking starts). If a live user row exists, refresh it to the
-     * full transcript and let the finalize block below save it; if
-     * none exists (the usual Scribe case), create the row and save it
-     * directly. No-op when the session has no transcript (non-Scribe
-     * turns, failed turns), so caption-based turns are untouched. */
-    if (mode == MUSE_MODE_SPEAKING && s_dlg_prev_mode != MUSE_MODE_SPEAKING) {
-        if (muse_hatch_last_transcript(s_dlg_tmp, DLG_MSG_MAX)) {
-            if (s_dlg_live_user) {
-                dlg_live(&s_dlg_live_user, s_dlg_tmp, COLOR_DIM);
-                dlg_copy_trunc(s_dlg_save_user, DLG_MSG_MAX, s_dlg_tmp);
-            } else {
-                dlg_add(s_dlg_tmp, COLOR_DIM);
-                dlg_store_save(false, s_dlg_tmp);
-                s_dlg_user[0] = '\0';
-                s_dlg_last_user_page[0] = '\0';
-                s_dlg_save_user[0] = '\0';
-            }
-        }
-    }
-    /* A live entry survives only while its turn runs; the label stays. */
-    if (s_dlg_live_user && mode != MUSE_MODE_LISTENING && mode != MUSE_MODE_THINKING) {
-        if (s_dlg_save_user[0]) {
-            dlg_store_save(false, s_dlg_save_user);
-            s_dlg_save_user[0] = '\0';
-        }
-        s_dlg_user[0] = '\0';
-        s_dlg_last_user_page[0] = '\0';
-        s_dlg_live_user = NULL;
-    }
-    if (s_dlg_live_muse && mode != MUSE_MODE_SPEAKING && mode != MUSE_MODE_THINKING) {
-        if (s_dlg_reply[0]) {
-            dlg_store_save(true, s_dlg_reply);
-        }
-        s_dlg_live_muse = NULL;
-        s_dlg_reply[0] = '\0';
-        s_dlg_last_page[0] = '\0';
-    }
-    s_dlg_prev_mode = mode;
-}
 
 static void build_screen(void)
 {
@@ -3532,7 +3106,6 @@ static void update_status(muse_mode_t mode, float now)
         }
     }
 #endif
-    dialog_poll(mode, fresh ? caption : NULL);
     update_power(now);
 }
 
