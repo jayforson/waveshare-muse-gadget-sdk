@@ -1008,6 +1008,10 @@ static char *s_dlg_tmp = NULL;
  * counts against the margin that Scribe TLS setup needs. Allocated
  * once, never freed. */
 static char *s_dlg_norm = NULL;
+/* Guard transcript fetch: 2048 bytes to hold a full Scribe transcript
+ * (2047 max) without truncating, so the last page stays a substring
+ * and does not leak into the reply. */
+static char *s_dlg_guard = NULL;
 static char *s_dlg_raw = NULL;
 static char *s_dlg_line = NULL;
 static char *s_dlg_block = NULL;
@@ -2153,16 +2157,26 @@ static size_t dlg_strip_ws(char *s)
  * stripping whitespace; the length floor keeps genuine short replies
  * that merely echo user words (for example "好的") going through.
  * False when there is no session transcript (non-Scribe turns), so
- * caption-based turns are untouched. Uses s_dlg_tmp for the transcript
- * fetch and s_dlg_norm for the caption copy; both are free in the
- * THINKING non-quoted and SPEAKING branches (the quoted branch's use
- * of s_dlg_tmp is in the mutually exclusive if-branch). */
+ * caption-based turns are untouched. Uses s_dlg_guard for the transcript
+ * fetch and s_dlg_norm for the caption copy; neither is used elsewhere
+ * in these branches. */
 static bool dlg_is_session_transcript(const char *caption)
 {
-    if (!muse_hatch_last_transcript(s_dlg_tmp, DLG_MSG_MAX)) {
+    /* Full Scribe transcript (up to 2047 bytes) in its own PSRAM
+     * buffer: the dialog buffer (2000 bytes) truncates long
+     * transcripts, so the last page straddling the cut failed the
+     * substring check and leaked into the reply in front of it. */
+    if (!s_dlg_guard) {
+        s_dlg_guard = heap_caps_malloc_prefer(2048, 2,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);
+        if (!s_dlg_guard) {
+            return false;
+        }
+    }
+    if (!muse_hatch_last_transcript(s_dlg_guard, 2048)) {
         return false;
     }
-    if (dlg_strip_ws(s_dlg_tmp) == 0) {
+    if (dlg_strip_ws(s_dlg_guard) == 0) {
         return false;
     }
     if (!s_dlg_norm) {
@@ -2177,10 +2191,10 @@ static bool dlg_is_session_transcript(const char *caption)
     if (nlen == 0) {
         return false;
     }
-    if (strcmp(s_dlg_tmp, s_dlg_norm) == 0) {
+    if (strcmp(s_dlg_guard, s_dlg_norm) == 0) {
         return true;
     }
-    return nlen >= 24 && strstr(s_dlg_tmp, s_dlg_norm) != NULL;
+    return nlen >= 24 && strstr(s_dlg_guard, s_dlg_norm) != NULL;
 }
 
 static void dlg_reply_page(const char *caption)
