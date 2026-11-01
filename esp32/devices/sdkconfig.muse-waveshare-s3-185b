@@ -21,7 +21,15 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
-CONFIG_SPIRAM_RODATA=y
+# v4 fix26: rodata stays in flash (via cache) instead of PSRAM. With
+# RODATA=y, all const data (incl. the ~2.6 MB CJK font bitmaps) occupied
+# PSRAM statically, leaving only ~2 MB heap -- too small for the 960 KB
+# live record buffer plus the ~1.74 MB already used after link/session.
+# Flash image size is unchanged (rodata bytes are already stored in
+# flash; they are just accessed via cache now instead of copied to
+# PSRAM), and this frees ~3.6 MB of PSRAM for the heap. Reversible by
+# reflashing with RODATA=y again.
+# CONFIG_SPIRAM_RODATA is not set
 CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
