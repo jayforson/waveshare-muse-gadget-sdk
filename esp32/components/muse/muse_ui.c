@@ -991,6 +991,7 @@ static void dlg_copy_trunc(char *dst, size_t dst_n, const char *src)
  * LVGL calls here all run on the one UI task. */
 static char s_dlg_stripped[DLG_MSG_MAX];
 static char s_dlg_tmp[DLG_MSG_MAX];
+static char s_dlg_norm[MUSE_CAPTION_MAX];
 static char s_dlg_raw[DLG_MSG_MAX];
 static char s_dlg_line[DLG_MSG_MAX];
 static char s_dlg_block[DLG_MSG_MAX];
@@ -1623,6 +1624,14 @@ static lv_obj_t *dlg_add(const char *text, uint32_t color)
     bool is_user = (color == COLOR_DIM);
     lv_obj_t *row = lv_obj_create(s_dlg_list);
     lv_obj_remove_style_all(row);
+    /* Rows and bubbles must not scroll: LVGL objects are scrollable by
+     * default, so a horizontal drag on a message would slide the row
+     * (elastic, even with no overflow) instead of reaching the
+     * tileview, and the user could not switch pages from the dialog.
+     * Clearing the flag fixes the message box in place (vertical
+     * scrolling still comes from the list itself) and lets horizontal
+     * swipes propagate to the tileview and switch pages. */
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_width(row, s_w - 104);
     lv_obj_set_height(row, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
@@ -1632,6 +1641,7 @@ static lv_obj_t *dlg_add(const char *text, uint32_t color)
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_t *cont = lv_obj_create(row);
     lv_obj_remove_style_all(cont);
+    lv_obj_remove_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_width(cont, LV_SIZE_CONTENT);
     lv_obj_set_style_max_width(cont, s_w - 104, 0);
     lv_obj_set_height(cont, LV_SIZE_CONTENT);
@@ -1848,19 +1858,12 @@ static void build_dialog_tile(lv_obj_t *tile)
     lv_obj_add_flag(s_dlg_list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(s_dlg_list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_dlg_list, LV_SCROLLBAR_MODE_OFF);
-    /* Drags on the message list must not slide the dialog box: the list
-     * is vertical-only, so a horizontal drag on it would otherwise chain
-     * to the tileview and move the whole tile. Clearing the horizontal
-     * chain keeps the dialog box fixed under the finger (vertical drags
-     * still scroll the list), while swipes starting outside the list
-     * (title, margins) still reach the tileview and switch pages, as
-     * before. LVGL 9 split the chain flag by direction; LVGL 8 has the
-     * single flag. */
-#if defined(LVGL_VERSION_MAJOR) && LVGL_VERSION_MAJOR >= 9
-    lv_obj_clear_flag(s_dlg_list, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
-#else
-    lv_obj_clear_flag(s_dlg_list, LV_OBJ_FLAG_SCROLL_CHAIN);
-#endif
+    /* The list itself is vertical-only, so it never slides sideways;
+     * horizontal drags chain to the tileview (default) and switch
+     * pages, as the user wants. The dialog box is fixed by clearing
+     * SCROLLABLE on its rows and bubbles (dlg_add), not by breaking
+     * the chain here: breaking it would stop page switching from
+     * swipes starting on messages, which is the complaint. */
     s_dlg_empty = make_label(s_dlg_list, caption_font(), COLOR_DIM);
     lv_obj_set_style_text_align(s_dlg_empty, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_style_text_line_space(s_dlg_empty, 0, 0);
@@ -2058,6 +2061,58 @@ static void dlg_accumulate(char *acc, size_t acc_size, const char *caption, cons
     }
 }
 
+/* Strip whitespace in place, so a caption page (which has wrap
+ * newlines) can be compared against the raw session transcript
+ * (which does not). Returns the compacted length. */
+static size_t dlg_strip_ws(char *s)
+{
+    size_t w = 0;
+    for (size_t r = 0; s[r]; r++) {
+        char c = s[r];
+        if (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
+            s[w++] = c;
+        }
+    }
+    s[w] = '\0';
+    return w;
+}
+
+/* True when this caption IS the session's sent transcript. The face
+ * caption is shared with the dialog via the global caption, so the
+ * SENT transcript (set on the face at SENT) also reaches dialog_poll
+ * during THINKING (and, if the poll runs before the reply page
+ * caption updates, at SPEAKING entry). Appending it to the Muse reply
+ * would put user text in a grey Muse bubble and mix it into the
+ * reply, which looks like the backgrounds switched. The dialog must
+ * not append it: it is user text, already shown (or to be shown) as
+ * the user row from the session transcript at SPEAKING entry.
+ * Exact match, or a long (at least 24 bytes) substring, after
+ * stripping whitespace; the length floor keeps genuine short replies
+ * that merely echo user words (for example "好的") going through.
+ * False when there is no session transcript (non-Scribe turns), so
+ * caption-based turns are untouched. Uses s_dlg_tmp for the transcript
+ * fetch and s_dlg_norm for the caption copy; both are free in the
+ * THINKING non-quoted and SPEAKING branches (the quoted branch's use
+ * of s_dlg_tmp is in the mutually exclusive if-branch). */
+static bool dlg_is_session_transcript(const char *caption)
+{
+    if (!muse_hatch_last_transcript(s_dlg_tmp, sizeof(s_dlg_tmp))) {
+        return false;
+    }
+    if (dlg_strip_ws(s_dlg_tmp) == 0) {
+        return false;
+    }
+    snprintf(s_dlg_norm, sizeof(s_dlg_norm), "%s", caption);
+    size_t nlen = dlg_strip_ws(s_dlg_norm);
+    if (nlen == 0) {
+        return false;
+    }
+    if (strcmp(s_dlg_tmp, s_dlg_norm) == 0) {
+        return true;
+    }
+    return nlen >= 24 && strstr(s_dlg_tmp, s_dlg_norm) != NULL;
+}
+
 static void dlg_reply_page(const char *caption)
 {
     if (strcmp(caption, s_dlg_last_page) == 0) {
@@ -2132,13 +2187,20 @@ static void dialog_poll(muse_mode_t mode, const char *caption)
                 } else {
                     dlg_user_page(s_dlg_tmp);
                 }
-            } else if (!dlg_is_status(caption)) {
+            } else if (!dlg_is_session_transcript(caption) &&
+                       !dlg_is_status(caption)) {
                 /* A reply shown before playback (speaker off, or text
-                 * arriving early): same stream as the speaking pages. */
+                 * arriving early): same stream as the speaking pages.
+                 * The SENT transcript is excluded above: it is user
+                 * text, not a reply page. */
                 dlg_reply_page(caption);
             }
         } else if (mode == MUSE_MODE_SPEAKING) {
-            dlg_reply_page(caption);
+            /* Same exclusion at SPEAKING entry, in case the poll runs
+             * before the reply page caption replaces the SENT one. */
+            if (!dlg_is_session_transcript(caption)) {
+                dlg_reply_page(caption);
+            }
         }
     }
     /* Scribe turns provide no transcript captions, so their user message

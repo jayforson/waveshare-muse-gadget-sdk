@@ -33,6 +33,7 @@
 #include "muse_audio.h"
 #include "muse_board.h"
 #include "muse_chat.h"
+#include "muse_chat_priv.h"
 #include "muse_input.h"
 #include "muse_mem.h"
 #include "muse_settings.h"
@@ -528,7 +529,11 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
     char text[96];
     static char page[MUSE_CAPTION_MAX];
     static char sent[MUSE_CAPTION_MAX];
+    static char sent_full[2048];
     bool done = false, speaking = false, replied = false;
+    bool sent_paging = false;
+    size_t sent_at = 0;
+    int64_t sent_page_t = 0;
     size_t played = 0;
     int64_t t0 = esp_timer_get_time();
     *delivered = false;
@@ -545,16 +550,33 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
             case MUSE_HATCH_EV_SENT:
                 *delivered = true;
                 if (!speaking && !replied) {
-                    /* Scribe turns: show the sent transcript in full on
-                     * the face (like replies show in full), instead of a
-                     * generic waiting caption over tail-words. The face
-                     * caption caps at MUSE_CAPTION_MAX (400 bytes, about
-                     * 130 Chinese chars); longer transcripts show from
-                     * the head, with the full text in the dialog.
-                     * Non-Scribe turns have no session transcript, so
-                     * they keep the waiting caption. */
-                    if (muse_hatch_last_transcript(sent, sizeof(sent))) {
-                        muse_state_set_caption("%s", sent);
+                    /* Scribe turns: show the sent transcript on the
+                     * face, paged like replies (see the timer block
+                     * below), instead of a generic waiting caption over
+                     * tail-words. The face caption is shared with the
+                     * dialog, so the dialog ignores this caption when
+                     * it equals the session transcript
+                     * (dlg_is_session_transcript); it is user text,
+                     * not a reply page. Non-Scribe turns have no
+                     * session transcript, so they keep the waiting
+                     * caption. Single-page transcripts show statically
+                     * (no timer re-sets, no flicker); only multi-page
+                     * ones page (last page differing from the first). */
+                    if (muse_hatch_last_transcript(sent_full, sizeof(sent_full)) &&
+                        muse_hatch_caption_at(sent_full, 0, page, sizeof(page))) {
+                        size_t tlen = strlen(sent_full);
+                        bool multi = false;
+                        if (tlen > 0 &&
+                            muse_hatch_caption_at(sent_full, tlen - 1, sent, sizeof(sent)) &&
+                            strcmp(sent, page) != 0) {
+                            multi = true;
+                        }
+                        muse_state_set_caption("%s", page);
+                        if (multi) {
+                            sent_paging = true;
+                            sent_at = 0;
+                            sent_page_t = esp_timer_get_time();
+                        }
                     } else {
                         muse_state_set_caption("WAITING RESPONSE FROM MUSE");
                     }
@@ -617,6 +639,27 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
         /* The page being said, or before the speech the reply's opening page. */
         if ((speaking || replied) && muse_hatch_turn_caption(played, page, sizeof(page))) {
             muse_state_set_caption("%s", page);
+        }
+        /* Face transcript paging while waiting (Scribe turns, multi-page
+         * only): turn the sent transcript's pages on a timer, like
+         * replies page as they are spoken. After the last page, loop
+         * back to the first page. Stops when the reply starts
+         * (speaking/replied) or the turn ends (done), when reply pages
+         * take over. The loop iterates at least every 20 ms while
+         * waiting (audio read timeout), so the 2.5 s timer is prompt. */
+        if (sent_paging && !speaking && !replied && !done) {
+            int64_t now = esp_timer_get_time();
+            if (now - sent_page_t >= 2500 * 1000) {
+                sent_page_t = now;
+                size_t tlen = strlen(sent_full);
+                sent_at += strlen(page);
+                if (sent_at >= tlen) {
+                    sent_at = 0;
+                }
+                if (muse_hatch_caption_at(sent_full, sent_at, page, sizeof(page))) {
+                    muse_state_set_caption("%s", page);
+                }
+            }
         }
     }
     muse_state_set_level(0);
