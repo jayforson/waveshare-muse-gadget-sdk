@@ -1623,7 +1623,13 @@ static void voice_task(void *arg)
  * life of the device; held notes get their own exact-size copy. */
 void muse_voice_reserve_note_buffer(void)
 {
-#if HOLD_NOTES
+    /* Unconditional: s_rec is the LIVE record buffer every call needs,
+     * not only the saved-note buffer. HOLD_NOTES=0 (saved notes off)
+     * must not compile this reservation out: with it gone, s_rec is
+     * only tried at call time, after the UI/link have carved the heap
+     * apart, and a 960 KB contiguous block no longer fits. Reserved
+     * here (muse_app_run calls this first, before board/UI init) it
+     * is held forever and reused by every call. */
     if (!s_rec) {
         s_rec = heap_caps_malloc(MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (s_rec) {
@@ -1635,7 +1641,6 @@ void muse_voice_reserve_note_buffer(void)
             ESP_LOGW(TAG, "note buffer not reserved at start; each note will try again");
         }
     }
-#endif
 }
 
 esp_err_t muse_voice_start(QueueHandle_t queue)
