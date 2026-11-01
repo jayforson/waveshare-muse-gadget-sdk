@@ -842,8 +842,16 @@ static void build_answer(lv_obj_t *face, int ring_in)
     /* The widest page isn't the biggest: a round screen narrows towards the bottom. */
     for (int c = 12; c <= 24 && fits_across(c * cw, top, ring_in); c++) {
         int n = (reply_bottom(c * cw, ring_in) - top + CAPTION_LINE_SPACE) / pitch;
-        /* A third of the caption spare for characters wider than a byte. */
-        while ((c + 1) * n > MUSE_CAPTION_MAX * 2 / 3) {
+        /* Size pages for the CJK worst case (3 bytes per character):
+         * caption_at drops whole lines that would overflow its
+         * 400-byte buffer, so a page sized for ASCII (or for a third
+         * spare) loses its last lines for Chinese text -- and the
+         * transcript's last sentence, which lives on the last page's
+         * last lines, never shows on the face while the dialog (which
+         * is not paged) has it. A page of n lines at c chars/line is
+         * n * (3c + 1) bytes worst case (3 bytes per char plus the
+         * newline joins), so keep that under the caption buffer. */
+        while ((3 * c + 1) * n > MUSE_CAPTION_MAX) {
             n--;
         }
         if (c * n > l->cols * l->lines) {
