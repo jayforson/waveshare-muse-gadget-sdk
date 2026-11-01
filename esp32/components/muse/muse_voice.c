@@ -529,7 +529,15 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
     char text[96];
     static char page[MUSE_CAPTION_MAX];
     static char sent[MUSE_CAPTION_MAX];
-    static char sent_full[2048];
+    /* Full sent transcript for face paging. Must live in PSRAM, not
+     * BSS: internal heap is critically tight (about 12K free, 6K
+     * largest block at idle), and a 2K BSS buffer was enough to tip
+     * Scribe TLS setup into alloc failure (mbedtls_ssl_setup -0x008D,
+     * SCRIBE DROPPED). Allocated once, never freed (same rule as the
+     * Scribe buffers: the voice task may still reference it when a
+     * turn ends). PSRAM still has hundreds of KB free after call
+     * allocations, so 2K there is negligible. */
+    static char *sent_full = NULL;
     bool done = false, speaking = false, replied = false;
     bool sent_paging = false;
     size_t sent_at = 0;
@@ -562,7 +570,12 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
                      * caption. Single-page transcripts show statically
                      * (no timer re-sets, no flicker); only multi-page
                      * ones page (last page differing from the first). */
-                    if (muse_hatch_last_transcript(sent_full, sizeof(sent_full)) &&
+                    if (!sent_full) {
+                        sent_full = heap_caps_malloc_prefer(2048, 2,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);
+                    }
+                    if (sent_full &&
+                        muse_hatch_last_transcript(sent_full, 2048) &&
                         muse_hatch_caption_at(sent_full, 0, page, sizeof(page))) {
                         size_t tlen = strlen(sent_full);
                         bool multi = false;

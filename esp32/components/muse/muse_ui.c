@@ -991,7 +991,12 @@ static void dlg_copy_trunc(char *dst, size_t dst_n, const char *src)
  * LVGL calls here all run on the one UI task. */
 static char s_dlg_stripped[DLG_MSG_MAX];
 static char s_dlg_tmp[DLG_MSG_MAX];
-static char s_dlg_norm[MUSE_CAPTION_MAX];
+/* Normalized caption copy for the session-transcript guard. Must live
+ * in PSRAM, not BSS, for the same reason as sent_full in muse_voice.c:
+ * internal heap is critically tight, and even a 400-byte BSS buffer
+ * counts against the margin that Scribe TLS setup needs. Allocated
+ * once, never freed. */
+static char *s_dlg_norm = NULL;
 static char s_dlg_raw[DLG_MSG_MAX];
 static char s_dlg_line[DLG_MSG_MAX];
 static char s_dlg_block[DLG_MSG_MAX];
@@ -2102,7 +2107,14 @@ static bool dlg_is_session_transcript(const char *caption)
     if (dlg_strip_ws(s_dlg_tmp) == 0) {
         return false;
     }
-    snprintf(s_dlg_norm, sizeof(s_dlg_norm), "%s", caption);
+    if (!s_dlg_norm) {
+        s_dlg_norm = heap_caps_malloc_prefer(MUSE_CAPTION_MAX, 2,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);
+        if (!s_dlg_norm) {
+            return false;
+        }
+    }
+    snprintf(s_dlg_norm, MUSE_CAPTION_MAX, "%s", caption);
     size_t nlen = dlg_strip_ws(s_dlg_norm);
     if (nlen == 0) {
         return false;
