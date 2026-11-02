@@ -552,7 +552,18 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
             switch (ev) {
             case MUSE_HATCH_EV_HEARD:
                 if (!speaking && !replied) {
-                    muse_state_set_caption("\"%s\"", text);
+                    /* Scribe turns: the full sent transcript is already
+                     * in the session (Scribe commit precedes post_chat),
+                     * so a tail-only caption here would flash just the
+                     * last sentence briefly before SENT shows the full
+                     * passage. Skip it; SENT shows the full text.
+                     * Turns with no session transcript (non-Scribe) keep
+                     * the tail caption. The 1-byte probe only tests
+                     * existence; nothing is copied for display. */
+                    char probe[1];
+                    if (!muse_hatch_last_transcript(probe, sizeof(probe))) {
+                        muse_state_set_caption("\"%s\"", text);
+                    }
                 }
                 break;
             case MUSE_HATCH_EV_SENT:
