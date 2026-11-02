@@ -1012,16 +1012,6 @@ static void conv_timer_apply_flag(int flag)
     /* REPLY_NEEDED: do not touch the timer. */
 }
 
-extern "C" void muse_hatch_conv_timer_flag(int flag)
-{
-    conv_timer_apply_flag(flag);
-}
-
-extern "C" bool muse_hatch_conv_timer_active(void)
-{
-    return conv_timer_active();
-}
-
 static bool conv_timer_active(void)
 {
     if (!s_conv_us) {
@@ -1032,6 +1022,16 @@ static bool conv_timer_active(void)
         return false;
     }
     return true;
+}
+
+extern "C" void muse_hatch_conv_timer_flag(int flag)
+{
+    conv_timer_apply_flag(flag);
+}
+
+extern "C" bool muse_hatch_conv_timer_active(void)
+{
+    return conv_timer_active();
 }
 
 /* Push queue: pushes accepted while the voice task is busy playing
