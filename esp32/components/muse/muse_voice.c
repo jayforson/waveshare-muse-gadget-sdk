@@ -97,58 +97,6 @@ static volatile bool s_hangup_requested;
 static bool s_reply_failed;      /* last hatch_reply ended in an error */
 static char s_last_error[96];   /* error text from that failed reply */
 
-static char s_last_reply[128];   /* final page of the last reply, for closing detection */
-static char s_last_heard[96];    /* transcript of the utterance in progress */
-
-/* True when a (short) text is a closing exchange: it ends with a
- * closing phrase and is short enough that the phrase is the point,
- * not a passing word in a long reply. "Thanks for your support" does
- * not match (it ends with "support"); a long reply ending in "thanks"
- * is filtered out by the length cap. Bare acknowledgements like a
- * lone "好的" are deliberately NOT closings: they are too ambiguous
- * (they also answer commands), so those calls still open follow-up,
- * now only for the silence timeout (Settings, default 5 s)
- * instead of 30 s. */
-static bool reply_is_closing(const char *text)
-{
-    if (!text || !text[0]) {
-        return false;
-    }
-    size_t len = strlen(text);
-    while (len > 0) {
-        unsigned char c = (unsigned char)text[len - 1];
-        if (c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == '.' || c == '!' || c == '?' || c == ',') {
-            len--;
-            continue;
-        }
-        /* Trailing CJK punctuation is 3 bytes (E3 80 xx, EF BC xx,
-         * EF BD xx); Chinese characters start at E4, so stripping
-         * these cannot eat a character. */
-        if ((len >= 3 && (unsigned char)text[len - 3] == 0xE3 && (unsigned char)text[len - 2] == 0x80) ||
-            (len >= 3 && (unsigned char)text[len - 3] == 0xEF && (unsigned char)text[len - 2] == 0xBC) ||
-            (len >= 3 && (unsigned char)text[len - 3] == 0xEF && (unsigned char)text[len - 2] == 0xBD)) {
-            len -= 3;
-            continue;
-        }
-        break;
-    }
-    if (len == 0 || len > 36) {
-        return false;
-    }
-    static const char *const CLOSINGS[] = {
-        "再见", "拜拜", "晚安", "好梦", "不客气", "谢谢",
-        "就这样", "就这样吧", "先这样", "先这样吧", "没事了",
-        "下次见", "下次再聊", "回头见", "明天见",
-        "Good night", "Goodbye", "Bye", "bye", "See you",
-    };
-    for (size_t i = 0; i < sizeof(CLOSINGS) / sizeof(*CLOSINGS); i++) {
-        size_t cl = strlen(CLOSINGS[i]);
-        if (len >= cl && memcmp(text + len - cl, CLOSINGS[i], cl) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
 static volatile bool s_wake_armed;
 static volatile bool s_wake_fired;
 
@@ -698,9 +646,6 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
     muse_state_set_level(0);
     ESP_LOGI(TAG, "muse reply: %.2fs of audio, %.2fs total", (double)played / MUSE_AUDIO_RATE,
              (esp_timer_get_time() - t0) / 1e6);
-    /* page is static and now holds the final page; the closing
-     * check in call_run reads it from here. */
-    strlcpy(s_last_reply, page, sizeof(s_last_reply));
     if (!played) {
         /* No speech (TTS unavailable): leave the reply text up for a moment. */
         vTaskDelay(pdMS_TO_TICKS(2500));
@@ -1036,7 +981,6 @@ static bool finish_note(bool in_call, bool *replied_out)
 {
     bool delivered;
     s_reply_failed = false;
-    s_last_reply[0] = '\0';
 #if HOLD_NOTES
     if (s_rec) {
         bool fed = false, interrupted = false;
@@ -1115,7 +1059,6 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
     muse_state_set_progress(0);
     s_rec_n = s_sent = 0;
     s_cancel_requested = false;
-    s_last_heard[0] = '\0';
     s_live = s_tried = false;
     if (!s_rec) {
         s_rec = heap_caps_malloc(MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1170,7 +1113,6 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
         while (s_live && (ev = muse_hatch_turn_event(text, sizeof(text))) != MUSE_HATCH_EV_NONE) {
             if (ev == MUSE_HATCH_EV_HEARD && text[0]) {
                 heard = true;
-                strlcpy(s_last_heard, text, sizeof(s_last_heard));
                 muse_state_set_caption("%s", text);
             } else if (ev == MUSE_HATCH_EV_ERROR) {
                 ESP_LOGW(TAG, "muse: %s", text);
@@ -1287,6 +1229,34 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
  * on/off repeatedly on a dead connection. A reply interrupted by
  * BOOT still starts the next utterance at once.
  */
+/* v5 WORKING wait outcome. FINAL: a Muse message (a push, since no
+ * turn is waiting) arrived and was played, so its flag is the one to
+ * decide on. BOOT: the user pressed, left queued for the loop to
+ * record. TIMEOUT: the 10-minute task timer lapsed with no final
+ * message; the task is stale, so the call ends (no follow-up
+ * fallback: the user re-invokes if they still care). */
+typedef enum { WAIT_FINAL, WAIT_BOOT, WAIT_TIMEOUT } wait_res_t;
+
+static wait_res_t wait_for_final(void)
+{
+    while (true) {
+        if (press_waiting()) {
+            return WAIT_BOOT;
+        }
+        if (!muse_hatch_conv_timer_active()) {
+            return WAIT_TIMEOUT;
+        }
+        if (muse_hatch_push_take()) {
+            /* A push opened a turn: play it like a reply, so the
+             * flag the decision reads is this message's flag. */
+            bool delivered;
+            hatch_reply_as(&delivered, "");
+            return WAIT_FINAL;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
 static void call_run(void)
 {
     s_call = true;
@@ -1369,11 +1339,36 @@ static void call_run(void)
             }
             break;
         }
-        if (reply_is_closing(s_last_reply) || reply_is_closing(s_last_heard)) {
-            /* A closing exchange: the user said goodbye, or Muse
-             * answered with one. End the call instead of opening
-             * follow-up listening; saying Jarvis again, or BOOT,
-             * starts a new turn if the user wants to continue. */
+        /* v5: follow-up is decided by Muse's reply flag alone, for
+         * every wake method. No flag defaults to DONE (end). The
+         * closing-phrase guess is deleted: Muse says DONE when it
+         * is done, instead of the device guessing from "thanks". */
+        int reply_flag = muse_hatch_last_flag();
+        bool wait_boot = false;
+        while (reply_flag == MUSE_FLAG_WORKING) {
+            /* Still working: wait for Muse's final message instead
+             * of opening follow-up or ending. A further WORKING
+             * keeps waiting; only a final flag decides. */
+            wait_res_t wait = wait_for_final();
+            if (wait == WAIT_TIMEOUT) {
+                reply_flag = MUSE_FLAG_DONE;
+                break;
+            }
+            if (wait == WAIT_BOOT) {
+                wait_boot = true;
+                break;
+            }
+            reply_flag = muse_hatch_last_flag();
+        }
+        if (wait_boot) {
+            /* Press queued; the loop's next capture picks it up. */
+            silence_deadline = esp_timer_get_time() + silence_window_us();
+            pre_reset();
+            continue;
+        }
+        if (reply_flag != MUSE_FLAG_REPLY_NEEDED) {
+            /* DONE, no flag (default DONE), or WORKING timed out:
+             * end the call, no follow-up. */
             break;
         }
         /* Reply delivered: follow-up listening is enabled from here.
@@ -1622,8 +1617,38 @@ static void voice_task(void *arg)
             go_idle(why);   /* Hatch failed it while recording */
             continue;
         }
-        pending_down = finish_note(false, NULL);
+        bool replied = false;
+        pending_down = finish_note(false, &replied);
         pre_reset();
+        if (!pending_down && replied) {
+            /* v5: unified flag decision (same as wake-word calls).
+             * A press queued during the reply wins instead: the loop
+             * records it next, and that turn re-decides after its
+             * own reply. */
+            int flag = muse_hatch_last_flag();
+            bool wait_boot = false;
+            while (flag == MUSE_FLAG_WORKING) {
+                wait_res_t wait = wait_for_final();
+                if (wait == WAIT_TIMEOUT) {
+                    flag = MUSE_FLAG_DONE;
+                    break;
+                }
+                if (wait == WAIT_BOOT) {
+                    wait_boot = true;
+                    break;
+                }
+                flag = muse_hatch_last_flag();
+            }
+            if (wait_boot) {
+                continue;
+            }
+            if (flag == MUSE_FLAG_REPLY_NEEDED) {
+                /* Press call enters the same follow-up listening as
+                 * wake-word calls (fix31, now flag-gated). */
+                call_run();
+                pre_reset();
+            }
+        }
         if (!pending_down && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
             muse_state_make_happy();
             go_idle("");

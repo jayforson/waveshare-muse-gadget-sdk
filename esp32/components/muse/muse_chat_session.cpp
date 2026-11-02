@@ -204,6 +204,15 @@ struct msg_t {
     tts_t tts;
     uint32_t pcm_start;      /* where its speech starts in the reply audio */
     uint32_t pcm_frames;     /* how long it is; 0 until the MP3 has all arrived */
+    /* v5 reply flag (MUSE_FLAG_*): parsed from the message front on its
+     * first chunk and stripped before dialog/TTS see it. flag_done
+     * means the head is resolved (flag or NONE); head buffers a split
+     * flag across deltas (first chunk "[RE", next "PLY_NEEDED] ...").
+     * Zero-initialized by bind_msg's msg_t{} and turn_start's turn_t{}. */
+    int flag;
+    bool flag_done;
+    char head[32];
+    size_t head_len;
 };
 
 struct resampler_t {
@@ -967,20 +976,50 @@ static void turn_reset_streams(void)
 static void remember_shown(const char *id);
 static bool was_shown(const char *id);
 
-/* Conversation window: 10 minutes from the last outgoing message (or
- * from a turn that ended still owing a reply). While it runs, every
- * push reads aloud, as if Speak all were on; when it lapses, pushes go
- * back to being dropped with Speak all off. It is only ever (re)started
- * by outgoing sends and by qualifying turn ends, never by an incoming
- * push, so automatic pushes cannot keep it alive forever. A timestamp,
- * not a task: about 16 bytes, no allocation. Declared here, before
- * turn_finish and turn_fail use it. */
+/* Conversation window (v5): 10 minutes, driven ONLY by Muse reply
+ * flags, no longer by outgoing sends or turn ends. While it runs,
+ * every push reads aloud, as if Speak all were on; when it lapses,
+ * pushes go back to being dropped with Speak all off. WORKING opens
+ * or resets it (a task is pending, its result may arrive as a push);
+ * DONE (including no flag, the DONE default) closes it; REPLY_NEEDED
+ * and anything else leave it alone, so a clarifying question after a
+ * WORKING does not kill the window its task opened. Speak all on
+ * still bypasses it entirely. A timestamp, not a task: about 16
+ * bytes, no allocation. */
 static int64_t s_conv_us;  /* 0 = window inactive */
 static const int64_t CONV_WINDOW_US = 10 * 60 * 1000000LL;
 
 static void conv_timer_reset(void)
 {
     s_conv_us = now_us();
+}
+
+static void conv_timer_close(void)
+{
+    s_conv_us = 0;
+}
+
+/* v5: applies one parsed reply flag to the timer. Idempotent, so a
+ * message seen by both the live path and the link path touches it
+ * twice harmlessly. */
+static void conv_timer_apply_flag(int flag)
+{
+    if (flag == MUSE_FLAG_WORKING) {
+        conv_timer_reset();
+    } else if (flag == MUSE_FLAG_DONE || flag == MUSE_FLAG_NONE) {
+        conv_timer_close();
+    }
+    /* REPLY_NEEDED: do not touch the timer. */
+}
+
+extern "C" void muse_hatch_conv_timer_flag(int flag)
+{
+    conv_timer_apply_flag(flag);
+}
+
+extern "C" bool muse_hatch_conv_timer_active(void)
+{
+    return conv_timer_active();
 }
 
 static bool conv_timer_active(void)
@@ -1134,18 +1173,8 @@ static void turn_finish(void)
 static void turn_fail(const char *why)
 {
     ESP_LOGW(TAG, "turn failed: %s", why);
-    /* The conversation window restarts when a turn ends still owing its
-     * reply: the 1-minute timeout deferral, a lost connection, or a
-     * settings change. It does NOT restart on user ends (CANCELLED,
-     * INTERRUPTED) or on sends that never went out (CAN'T REACH,
-     * DIDN'T CATCH THAT), where no reply is coming. A cancel neither
-     * restarts nor clears it: it lapses on its own, and a new send
-     * restarts it anyway. */
-    if (!strcmp(why, "WAITING FOR MUSE RESPONSE") ||
-        !strcmp(why, "LOST CONNECTION TO MUSE") ||
-        !strcmp(why, "SETTINGS CHANGED")) {
-        conv_timer_reset();
-    }
+    /* v5: turn failures no longer touch the conversation window; it is
+     * driven only by reply flags (WORKING opens/resets, DONE closes). */
     if (s_turn.text) {
         muse_hatch_console("error", why, nullptr);
     }
@@ -1156,11 +1185,9 @@ static void turn_fail(const char *why)
 /* Ends the turn once its reply is in; `complete` is false when it was cut off. */
 static void turn_done(bool complete)
 {
-    if (!complete) {
-        /* Cut off with messages unfinished (the time cap): the full
-         * reply may still arrive as a push, so restart the window. */
-        conv_timer_reset();
-    }
+    /* v5: a cut-off turn no longer restarts the window on its own; a
+     * still-working Muse says so with a WORKING flag, which does. */
+    (void)complete;
     if (s_turn.text) {
         muse_hatch_console("done", nullptr, "\"messages\":%d,\"complete\":%s", s_turn.nmsgs,
                            complete ? "true" : "false");
@@ -1352,7 +1379,6 @@ bool record_note(void)
     s_turn.chat_posted = true;
     s_turn.chat_us = s_turn.last_event_us = now_us();
     s_turn.phase = P_WAIT_REPLY;
-    conv_timer_reset();  /* outgoing send: the window runs from here */
     return true;
 }
 
@@ -1386,7 +1412,6 @@ static void send_chat(const char *text, const char *modality)
     s_turn.body_sent = len;
     s_turn.chat_us = s_turn.last_event_us = now_us();
     s_turn.phase = P_WAIT_REPLY;
-    conv_timer_reset();  /* outgoing send: the window runs from here */
 }
 
 /* Gadget attribution: the protocol has no source-device field, so user
@@ -2067,7 +2092,104 @@ static int bind_msg(const char *id, cJSON *payload)
     return s_turn.nmsgs++;
 }
 
+static void append_text_inner(msg_t &m, const char *text);
+static void append_text(msg_t &m, const char *text);
+
+/* v5: strips the front flag from a message's first chunk(s) before
+ * dialog/TTS see the text, and drives the task timer at receipt.
+ * A split flag buffers in m.head until it resolves (or exceeds 32
+ * bytes, then it is body text). Once resolved, later chunks go
+ * straight to the inner append. */
 static void append_text(msg_t &m, const char *text)
+{
+    if (m.flag_done) {
+        append_text_inner(m, text);
+        return;
+    }
+    if (m.head_len == 0) {
+        if (text[0] != '[') {
+            m.flag = MUSE_FLAG_NONE;
+            m.flag_done = true;
+            muse_hatch_conv_timer_flag(m.flag);
+            append_text_inner(m, text);
+            return;
+        }
+        size_t strip = 0;
+        int flag = muse_hatch_flag_parse(text, &strip);
+        if (flag == MUSE_FLAG_NEED_MORE) {
+            size_t len = strlen(text);
+            if (len >= sizeof(m.head)) {
+                len = sizeof(m.head) - 1;
+            }
+            memcpy(m.head, text, len);
+            m.head[len] = '\0';
+            m.head_len = len;
+            return;
+        }
+        m.flag = flag > 0 ? flag : MUSE_FLAG_NONE;
+        m.flag_done = true;
+        muse_hatch_conv_timer_flag(m.flag);
+        append_text_inner(m, flag > 0 && strip > 0 ? text + strip : text);
+        return;
+    }
+    const char *close = strchr(text, ']');
+    size_t combined = m.head_len + strlen(text);
+    if (!close && combined < 32) {
+        size_t len = strlen(text);
+        if (m.head_len + len >= sizeof(m.head)) {
+            len = sizeof(m.head) - 1 - m.head_len;
+        }
+        memcpy(m.head + m.head_len, text, len);
+        m.head_len += len;
+        m.head[m.head_len] = '\0';
+        return;
+    }
+    if (!close || m.head_len + (size_t)(close - text) + 1 > 34) {
+        m.flag = MUSE_FLAG_NONE;
+        m.flag_done = true;
+        muse_hatch_conv_timer_flag(m.flag);
+        append_text_inner(m, m.head);
+        append_text_inner(m, text);
+        m.head_len = 0;
+        return;
+    }
+    char sep = text[(size_t)(close - text) + 1];
+    if (sep != '\0' && sep != ' ' && sep != '\n' && sep != '\r' && sep != '\t') {
+        m.flag = MUSE_FLAG_NONE;
+        m.flag_done = true;
+        muse_hatch_conv_timer_flag(m.flag);
+        append_text_inner(m, m.head);
+        append_text_inner(m, text);
+        m.head_len = 0;
+        return;
+    }
+    size_t token_end = (size_t)(close - text) + 1;
+    char combined_buf[64];
+    memcpy(combined_buf, m.head, m.head_len);
+    memcpy(combined_buf + m.head_len, text, token_end);
+    combined_buf[m.head_len + token_end] = '\0';
+    size_t strip = 0;
+    int flag = muse_hatch_flag_parse(combined_buf, &strip);
+    if (flag == MUSE_FLAG_NEED_MORE) {
+        flag = MUSE_FLAG_NONE;
+    }
+    m.flag = flag > 0 ? flag : MUSE_FLAG_NONE;
+    m.flag_done = true;
+    muse_hatch_conv_timer_flag(m.flag);
+    if (flag > 0) {
+        size_t off = token_end;
+        while (text[off] == ' ' || text[off] == '\n' || text[off] == '\r' || text[off] == '\t') {
+            off++;
+        }
+        append_text_inner(m, text + off);
+    } else {
+        append_text_inner(m, m.head);
+        append_text_inner(m, text);
+    }
+    m.head_len = 0;
+}
+
+static void append_text_inner(msg_t &m, const char *text)
 {
     size_t add = strlen(text);
     if (s_turn.texts) {

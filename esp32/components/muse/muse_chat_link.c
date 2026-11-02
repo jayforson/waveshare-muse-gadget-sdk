@@ -77,6 +77,7 @@ typedef struct {
     char msg[80];
     char reply_to[80];
     char text[TEXT_MAX];
+    int flag;           /* v5 reply flag (MUSE_FLAG_*), NONE when no flag */
 } row_t;
 
 enum { RX_NOTE, RX_SUB, RX_COUNT };
@@ -96,6 +97,10 @@ static QueueHandle_t s_events;
  * completed messages until the voice task drains them, including before ACK. */
 static row_t s_row, s_delta, s_pending[2];
 static unsigned s_pending_count;
+/* v5: flag of the message the voice task is currently playing (set by
+ * on_row when it starts a finalized assistant row); the voice task
+ * reads it after a reply to decide follow-up. */
+static volatile int s_last_flag = MUSE_FLAG_NONE;
 static uint64_t s_last_seq;
 static bool s_early_evicted, s_skipped_big;
 static char s_note_id[80], s_parent_id[80]; /* ACK IDs shared under s_rx_lock */
@@ -395,6 +400,25 @@ static void subscription_event(void)
     if (!related(&s_row) || !s_row.text[0]) return;
     if (!user) strlcpy(s_row.event, "message.assistant", sizeof(s_row.event));
     s_row.ready = true;
+    if (strcmp(s_row.event, "message.user")) {
+        /* v5: front flag, parsed and stripped here (full text is known),
+         * so the voice task's rows (dialog, face, TTS) never see it.
+         * A finalized incomplete token is NONE, not NEED_MORE: no more
+         * text is coming, so it stays as body text. The flag also
+         * drives the task timer at receipt. User rows are never flags. */
+        size_t strip = 0;
+        int flag = muse_hatch_flag_parse(s_row.text, &strip);
+        if (flag == MUSE_FLAG_NEED_MORE) {
+            flag = MUSE_FLAG_NONE;
+        }
+        if (flag > 0 && strip > 0) {
+            memmove(s_row.text, s_row.text + strip, strlen(s_row.text + strip) + 1);
+        }
+        s_row.flag = flag > 0 ? flag : MUSE_FLAG_NONE;
+        muse_hatch_conv_timer_flag(s_row.flag);
+    } else {
+        s_row.flag = MUSE_FLAG_NONE;
+    }
     /* Coalesce the done event and persisted full message, including before ACK. */
     for (unsigned i = 0; i < s_pending_count; i++) {
         if (!strcmp(s_pending[i].msg, s_row.msg)) { s_pending[i] = s_row; return; }
@@ -653,6 +677,9 @@ static void on_row(row_t *r)
     for (unsigned i = 0; i < s_turn.seen_count; i++) {
         if (!strcmp(r->msg, s_turn.seen[i])) return;
     }
+    /* v5: this row is now playing; its flag is the one the voice task's
+     * follow-up decision reads after the reply. */
+    s_last_flag = r->flag;
     if (r->text[0]) {
         if (s_turn.seen_count == 2) {
             memcpy(s_turn.seen[0], s_turn.seen[1], sizeof(s_turn.seen[0]));
@@ -882,6 +909,11 @@ void muse_hatch_turn_cancel(void)
 {
     end_turn();
     xQueueReset(s_events);
+}
+
+int muse_hatch_last_flag(void)
+{
+    return s_last_flag;
 }
 
 muse_hatch_ev_t muse_hatch_turn_event(char *text, size_t cap)

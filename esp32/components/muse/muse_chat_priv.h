@@ -88,6 +88,32 @@ bool muse_hatch_caption_at(const char *text, size_t at, char *out, size_t cap);
  * (same grid as above), or (size_t)-1 on the last page. */
 size_t muse_hatch_caption_next(const char *text, size_t at);
 
+/* v5 reply flags (muse_chat_text.c): the token at the very front of a
+ * Muse reply to WALL-E, deciding follow-up. NONE is also the default
+ * when no flag is present (treated as DONE: end the call). NEED_MORE
+ * means the head is still arriving (streaming split token). */
+enum {
+    MUSE_FLAG_NONE = 0,
+    MUSE_FLAG_REPLY_NEEDED = 1,
+    MUSE_FLAG_DONE = 2,
+    MUSE_FLAG_WORKING = 3,
+    MUSE_FLAG_NEED_MORE = -1,
+};
+/* Parses the front flag of `text`; on a flag, *strip_len is the bytes
+ * to drop (token plus following whitespace) to get the clean body. */
+int muse_hatch_flag_parse(const char *text, size_t *strip_len);
+/* Flag of the message currently playing (link.c, set when the voice
+ * task starts playing a finalized row); the voice task reads it after
+ * a reply to decide follow-up. */
+int muse_hatch_last_flag(void);
+/* Applies the flag to the 10-minute task timer (session.cpp):
+ * WORKING opens/resets it, DONE/NONE closes it, REPLY_NEEDED leaves
+ * it alone. Called at message receipt, so pushes arriving while a
+ * task is open stay spoken. */
+void muse_hatch_conv_timer_flag(int flag);
+/* Whether that timer is currently running (for the WORKING wait). */
+bool muse_hatch_conv_timer_active(void);
+
 #ifdef __cplusplus
 }
 #endif

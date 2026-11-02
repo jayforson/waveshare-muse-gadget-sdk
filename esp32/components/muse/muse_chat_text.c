@@ -220,6 +220,75 @@ size_t muse_hatch_caption_next(const char *text, size_t at)
     return (size_t)-1;
 }
 
+/* ---- v5 reply flags: Muse decides follow-up (front, space, English) ----
+ * A Muse reply to WALL-E starts with one flag token, a space, then the
+ * body, e.g. "[REPLY_NEEDED] ...". The flag is stripped before the text
+ * reaches TTS, the dialog, the face, or history, so no consumer ever
+ * sees it; the flag itself drives follow-up and the 10-minute task
+ * timer. Only the three exact tokens count (case and underscore/space
+ * insensitive, so "[reply_needed]" and "[REPLY NEEDED]" also match);
+ * any other bracketed opening (e.g. "[Note]") is body text, never a
+ * flag. A lone "[" with no "]" yet is NEED_MORE (streaming head still
+ * arriving); a complete message with an incomplete token is NONE. */
+int muse_hatch_flag_parse(const char *text, size_t *strip_len)
+{
+    if (strip_len) {
+        *strip_len = 0;
+    }
+    if (!text || text[0] != '[') {
+        return MUSE_FLAG_NONE;
+    }
+    const char *close = strchr(text, ']');
+    if (!close) {
+        /* No "]" yet: either a split flag still streaming (head under
+         * 32 bytes, wait for more) or a long bracketed opening that is
+         * not a flag (over 32 bytes, decide NONE now). */
+        return strlen(text) < 32 ? MUSE_FLAG_NEED_MORE : MUSE_FLAG_NONE;
+    }
+    size_t tok_len = (size_t)(close - text - 1);
+    if (tok_len == 0 || tok_len > 20) {
+        return MUSE_FLAG_NONE;
+    }
+    /* Normalize: lowercase, drop underscores and spaces, then compare. */
+    char norm[21];
+    size_t n = 0;
+    for (size_t i = 0; i < tok_len; i++) {
+        char c = text[1 + i];
+        if (c == '_' || c == ' ') {
+            continue;
+        }
+        if (c >= 'A' && c <= 'Z') {
+            c = (char)(c - 'A' + 'a');
+        }
+        norm[n++] = c;
+    }
+    norm[n] = '\0';
+    int flag = MUSE_FLAG_NONE;
+    if (!strcmp(norm, "replyneeded")) {
+        flag = MUSE_FLAG_REPLY_NEEDED;
+    } else if (!strcmp(norm, "done")) {
+        flag = MUSE_FLAG_DONE;
+    } else if (!strcmp(norm, "working")) {
+        flag = MUSE_FLAG_WORKING;
+    } else {
+        return MUSE_FLAG_NONE;
+    }
+    /* After "]" must come a space, a newline, or end of text (the
+     * prompt says space; newline is tolerated for robustness). */
+    char after = close[1];
+    if (after != '\0' && after != ' ' && after != '\n' && after != '\r' && after != '\t') {
+        return MUSE_FLAG_NONE;
+    }
+    if (strip_len) {
+        size_t strip = (size_t)(close + 1 - text);
+        while (text[strip] == ' ' || text[strip] == '\n' || text[strip] == '\r' || text[strip] == '\t') {
+            strip++;
+        }
+        *strip_len = strip;
+    }
+    return flag;
+}
+
 /* ---- Typed turns on the serial console ---- */
 
 /* JSON-escapes whole characters of *src into out, up to cap - 1 bytes; moves *src past them. */
