@@ -64,3 +64,9 @@ void muse_audio_chirp(int rising);
 /* Sent chirp: two beeps (low, then high) when a note actually reaches
  * the cloud. Held notes get none. */
 void muse_audio_chirp_sent(void);
+
+/* Follow-up chirp: two short beeps at the same pitch when follow-up
+ * listening opens, so the user knows to speak now. Same pitch sets
+ * it apart from the sent chirp (low, then high); two notes set it
+ * apart from the rising/falling sweeps. */
+void muse_audio_chirp_followup(void);

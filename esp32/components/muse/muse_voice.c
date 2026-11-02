@@ -1379,6 +1379,11 @@ static void call_run(void)
         muse_state_make_happy();
         muse_state_set_mode(MUSE_MODE_LISTENING);
         muse_state_poke();
+        /* Cue that follow-up is open (no cue existed, so the user
+         * could not tell listening had started): two short beeps,
+         * then the silence window starts, so the full window is
+         * left for the user to speak. */
+        muse_audio_chirp_followup();
         silence_deadline = esp_timer_get_time() + silence_window_us();
         pre_reset();
     }

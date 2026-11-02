@@ -358,3 +358,16 @@ void muse_audio_chirp_sent(void)
     }
     play_tone(1320.0f, 100);
 }
+
+/* Follow-up chirp: two short beeps at the same pitch, with a gap
+ * between them. Same loudness as the sent chirp (play_tone); the
+ * flat pitch is what tells it apart from the sent chirp's rise. */
+void muse_audio_chirp_followup(void)
+{
+    static const int16_t silence[MUSE_AUDIO_CHUNK];
+    play_tone(1100.0f, 60);
+    for (int i = 0; i < 3; i++) {
+        muse_audio_write(silence, MUSE_AUDIO_CHUNK);   /* 60 ms gap */
+    }
+    play_tone(1100.0f, 60);
+}
