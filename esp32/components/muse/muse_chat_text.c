@@ -183,6 +183,43 @@ bool muse_hatch_caption_at(const char *text, size_t at, char *out, size_t cap)
     return true;
 }
 
+/*
+ * Byte offset of the first line of the page after the page holding byte
+ * `at`, or (size_t)-1 when `at` is already on the last page. Callers step
+ * face paging by this offset, not by the displayed page length: the
+ * displayed text joins lines with "\n" and counts the overlap line in
+ * both pages, so stepping by its length overshoots by about a line per
+ * page and wraps before the tail page (or skips lines) on short tails.
+ * Uses the same line splitter and page grid as muse_hatch_caption_at,
+ * so the offset it returns is exactly a page start for that function.
+ */
+size_t muse_hatch_caption_next(const char *text, size_t at)
+{
+    int cols, lines;
+    muse_state_page(muse_text_has_cjk(text), &cols, &lines);
+    const char *p = text, *start;
+    size_t len;
+    int line = -1, n = 0;
+    while (next_line(&p, cols, &start, &len)) {
+        line = n++;
+        if ((size_t)(start + len - text) > at) {
+            break;
+        }
+    }
+    if (line < 0) {
+        return (size_t)-1;
+    }
+    int first = lines > 1 ? line / (lines - 1) * (lines - 1) : line;
+    int next_first = first + (lines > 1 ? lines - 1 : 1);
+    p = text;
+    for (n = 0; next_line(&p, cols, &start, &len); n++) {
+        if (n == next_first) {
+            return (size_t)(start - text);
+        }
+    }
+    return (size_t)-1;
+}
+
 /* ---- Typed turns on the serial console ---- */
 
 /* JSON-escapes whole characters of *src into out, up to cap - 1 bytes; moves *src past them. */

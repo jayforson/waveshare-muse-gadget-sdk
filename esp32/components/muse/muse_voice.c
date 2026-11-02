@@ -668,11 +668,16 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
             int64_t now = esp_timer_get_time();
             if (now - sent_page_t >= 2500 * 1000) {
                 sent_page_t = now;
-                size_t tlen = strlen(sent_full);
-                sent_at += strlen(page);
-                if (sent_at >= tlen) {
-                    sent_at = 0;
-                }
+                /* Step by the page grid, not by the displayed page
+                 * length: the displayed text joins lines with "\n" and
+                 * counts the overlap line twice, so stepping by its
+                 * length overshoots by about a line per page and wraps
+                 * before the tail page (or skips lines) on short tails.
+                 * The helper returns the next page's true first-line
+                 * offset, or (size_t)-1 on the last page, when paging
+                 * loops back to the first page after showing the tail. */
+                size_t next = muse_hatch_caption_next(sent_full, sent_at);
+                sent_at = next == (size_t)-1 ? 0 : next;
                 if (muse_hatch_caption_at(sent_full, sent_at, page, sizeof(page))) {
                     muse_state_set_caption("%s", page);
                 }
