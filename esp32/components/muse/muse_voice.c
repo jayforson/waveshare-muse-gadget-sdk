@@ -748,8 +748,9 @@ static void drop_rec(void)
     s_rec_n = 0;
 }
 
-#if HOLD_NOTES
-/* True if a press is queued, left there for the loop; releases ahead of it are dropped. */
+/* True if a press is queued, left there for the loop; releases ahead of it are dropped.
+ * Unconditional (not under HOLD_NOTES): v5's WORKING wait needs it to detect
+ * a BOOT break, and it only inspects the input queue, never saved-note state. */
 static bool press_waiting(void)
 {
     muse_input_event_t ev;
@@ -762,6 +763,7 @@ static bool press_waiting(void)
     return false;
 }
 
+#if HOLD_NOTES
 static void back_off(void)
 {
     s_next_send_us = esp_timer_get_time() + s_send_backoff_us;
