@@ -987,6 +987,7 @@ static bool was_shown(const char *id);
  * still bypasses it entirely. A timestamp, not a task: about 16
  * bytes, no allocation. */
 static int64_t s_conv_us;  /* 0 = window inactive */
+static volatile int s_last_flag = MUSE_FLAG_NONE;  /* flag of the most recently flag-resolved message, for the voice decision */
 static const int64_t CONV_WINDOW_US = 10 * 60 * 1000000LL;
 
 static void conv_timer_reset(void)
@@ -1032,6 +1033,22 @@ extern "C" void muse_hatch_conv_timer_flag(int flag)
 extern "C" bool muse_hatch_conv_timer_active(void)
 {
     return conv_timer_active();
+}
+
+/* Session counterpart of link.c's s_last_flag: the voice task reads
+ * this after playing a reply to decide follow-up. All 5 append_text
+ * flag-resolve sites go through note_flag, so flag and timer stay in
+ * sync. link.c keeps its own copy for non-Hatch builds; only one of
+ * the two files is compiled per build, so there is no duplicate. */
+static void note_flag(int flag)
+{
+    s_last_flag = flag;
+    muse_hatch_conv_timer_flag(flag);
+}
+
+extern "C" int muse_hatch_last_flag(void)
+{
+    return s_last_flag;
 }
 
 /* Push queue: pushes accepted while the voice task is busy playing
@@ -2110,7 +2127,7 @@ static void append_text(msg_t &m, const char *text)
         if (text[0] != '[') {
             m.flag = MUSE_FLAG_NONE;
             m.flag_done = true;
-            muse_hatch_conv_timer_flag(m.flag);
+            note_flag(m.flag);
             append_text_inner(m, text);
             return;
         }
@@ -2128,7 +2145,7 @@ static void append_text(msg_t &m, const char *text)
         }
         m.flag = flag > 0 ? flag : MUSE_FLAG_NONE;
         m.flag_done = true;
-        muse_hatch_conv_timer_flag(m.flag);
+        note_flag(m.flag);
         append_text_inner(m, flag > 0 && strip > 0 ? text + strip : text);
         return;
     }
@@ -2147,7 +2164,7 @@ static void append_text(msg_t &m, const char *text)
     if (!close || m.head_len + (size_t)(close - text) + 1 > 34) {
         m.flag = MUSE_FLAG_NONE;
         m.flag_done = true;
-        muse_hatch_conv_timer_flag(m.flag);
+        note_flag(m.flag);
         append_text_inner(m, m.head);
         append_text_inner(m, text);
         m.head_len = 0;
@@ -2157,7 +2174,7 @@ static void append_text(msg_t &m, const char *text)
     if (sep != '\0' && sep != ' ' && sep != '\n' && sep != '\r' && sep != '\t') {
         m.flag = MUSE_FLAG_NONE;
         m.flag_done = true;
-        muse_hatch_conv_timer_flag(m.flag);
+        note_flag(m.flag);
         append_text_inner(m, m.head);
         append_text_inner(m, text);
         m.head_len = 0;
@@ -2175,7 +2192,7 @@ static void append_text(msg_t &m, const char *text)
     }
     m.flag = flag > 0 ? flag : MUSE_FLAG_NONE;
     m.flag_done = true;
-    muse_hatch_conv_timer_flag(m.flag);
+    note_flag(m.flag);
     if (flag > 0) {
         size_t off = token_end;
         while (text[off] == ' ' || text[off] == '\n' || text[off] == '\r' || text[off] == '\t') {
