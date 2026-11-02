@@ -1005,12 +1005,15 @@ static void conv_timer_close(void)
  * twice harmlessly. */
 static void conv_timer_apply_flag(int flag)
 {
+    /* Turn window: WORKING renews it; anything final (DONE, no-flag
+     * default, or REPLY_NEEDED asking the user) closes it. REPLY_NEEDED
+     * is safe to close because the user's answer reopens the window
+     * via send_chat_marked. */
     if (flag == MUSE_FLAG_WORKING) {
         conv_timer_reset();
-    } else if (flag == MUSE_FLAG_DONE || flag == MUSE_FLAG_NONE) {
+    } else {
         conv_timer_close();
     }
-    /* REPLY_NEEDED: do not touch the timer. */
 }
 
 static bool conv_timer_active(void)
@@ -1440,6 +1443,11 @@ static void send_chat(const char *text, const char *modality)
  * unmarked transcript. */
 static void send_chat_marked(const char *text, const char *modality)
 {
+    /* The user's turn window starts here: every board-originated send
+     * (voice or typed) opens a fresh 10-minute window, so a slow reply
+     * is spoken even if no WORKING ever arrives. DONE / REPLY_NEEDED
+     * close it (conv_timer_apply_flag); the next send reopens it. */
+    conv_timer_reset();
     const char *marker = "[WALL-E] ";
     size_t mlen = strlen(marker);
     size_t tlen = strlen(text);
