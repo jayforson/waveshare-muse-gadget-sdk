@@ -1280,7 +1280,8 @@ static void call_run(void)
      * the same way a capture after an interrupted reply does, so
      * the chirp cannot false-trigger speech and cut a silent first
      * utterance short after the 1.5 s gap. Reset to false after
-     * the first capture, so follow-up captures are unaffected. */
+     * the first capture; the follow-up block sets it again, since
+     * follow-up captures follow the follow-up chirp. */
     bool barge_in = true;
     bool got_reply = false;
     const char *end_caption = "";
@@ -1384,6 +1385,12 @@ static void call_run(void)
          * then the silence window starts, so the full window is
          * left for the user to speak. */
         muse_audio_chirp_followup();
+        /* The chirp's tail is in the mic buffer: the next capture
+         * must drain it (as the first capture does for the wake
+         * chirp), or it false-triggers speech, drops as a
+         * cancelled blip after the 1.5 s gap, and restarts the
+         * ring – the 2 s + 3 s split of the 5 s window. */
+        barge_in = true;
         silence_deadline = esp_timer_get_time() + silence_window_us();
         pre_reset();
     }
