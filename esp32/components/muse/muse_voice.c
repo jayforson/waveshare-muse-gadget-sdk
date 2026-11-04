@@ -1231,35 +1231,36 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
  * on/off repeatedly on a dead connection. A reply interrupted by
  * BOOT still starts the next utterance at once.
  */
-/* v5 WORKING wait outcome. FINAL: a Muse message (a push, since no
- * turn is waiting) arrived and was played, so its flag is the one to
- * decide on. BOOT: the user pressed, left queued for the loop to
- * record. TIMEOUT: the 10-minute task timer lapsed with no final
- * message; the task is stale, so the call ends (no follow-up
- * fallback: the user re-invokes if they still care). */
-typedef enum { WAIT_FINAL, WAIT_BOOT, WAIT_TIMEOUT } wait_res_t;
-
-static wait_res_t wait_for_final(void)
-{
-    while (true) {
-        if (press_waiting()) {
-            return WAIT_BOOT;
-        }
-        if (!muse_hatch_conv_timer_active()) {
-            return WAIT_TIMEOUT;
-        }
-        if (muse_hatch_push_take()) {
-            /* A push opened a turn: play it like a reply, so the
-             * flag the decision reads is this message's flag. */
-            bool delivered;
-            hatch_reply_as(&delivered, "");
-            return WAIT_FINAL;
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-}
+/* WORKING handling, idle + timer model (2026-11-04, user-confirmed,
+ * replacing the v5 wait-in-call): a WORKING reply is already played
+ * when its flag is read, and the flag itself reset the 10-minute
+ * conversation timer, so the call ends here and the board goes idle.
+ * Later messages arrive as idle pushes while the timer is open
+ * (WORKING resets it, DONE and REPLY_NEEDED close it); a later
+ * WORKING stays idle, a DONE ends, a REPLY_NEEDED enters follow-up
+ * from the idle push path below. There is deliberately no wait
+ * loop here: the old wait only watched the direct push flag, while
+ * a message arriving while the board was still SPEAKING went to
+ * the push queue, which only drains when idle, so the final
+ * message sat queued, the screen stuck on SPEAKING, a short BOOT
+ * tap (hangup request, which the wait never read) did nothing,
+ * and the queued messages only played after the 10-minute
+ * timeout ended the call. */
+static void call_run_impl(bool followup);
 
 static void call_run(void)
+{
+    call_run_impl(false);
+}
+
+/* Follow-up entry from an idle push (REPLY_NEEDED): the same
+ * follow-up window as in-call follow-up, not a fresh wake call. */
+static void call_run_followup(void)
+{
+    call_run_impl(true);
+}
+
+static void call_run_impl(bool followup)
 {
     s_call = true;
     s_hangup_requested = false;
@@ -1272,18 +1273,36 @@ static void call_run(void)
     muse_state_set_asleep(false);
     muse_state_poke();
     muse_wifi_power(MUSE_WIFI_FULL);
-    muse_audio_chirp(1);
-    pre_reset();
-    ESP_LOGI(TAG, "call started");
-    int64_t silence_deadline = esp_timer_get_time() + silence_window_us();
-    /* First capture follows the rising chirp: skip its 200 ms tail
-     * the same way a capture after an interrupted reply does, so
-     * the chirp cannot false-trigger speech and cut a silent first
-     * utterance short after the 1.5 s gap. Reset to false after
-     * the first capture; the follow-up block sets it again, since
-     * follow-up captures follow the follow-up chirp. */
+    int64_t silence_deadline;
+    /* First capture follows a chirp in both modes: skip its 200 ms
+     * tail the same way a capture after an interrupted reply does,
+     * so the chirp cannot false-trigger speech and cut a silent
+     * first utterance short after the 1.5 s gap. Reset to false
+     * after the first capture; the follow-up block sets it again,
+     * since follow-up captures follow the follow-up chirp. */
     bool barge_in = true;
-    bool got_reply = false;
+    bool got_reply;
+    if (followup) {
+        /* Idle-push REPLY_NEEDED: the timer was already closed by
+         * the flag, and the follow-up window takes over. This is
+         * the in-call follow-up block, moved to the entry, so the
+         * chirp and its 200 ms tail drain are identical and the
+         * 2 s + 3 s ring split cannot regress. */
+        got_reply = true;
+        muse_state_make_happy();
+        muse_state_set_mode(MUSE_MODE_LISTENING);
+        muse_state_poke();
+        muse_audio_chirp_followup();
+        silence_deadline = esp_timer_get_time() + silence_window_us();
+        pre_reset();
+        ESP_LOGI(TAG, "call follow-up started");
+    } else {
+        muse_audio_chirp(1);
+        pre_reset();
+        ESP_LOGI(TAG, "call started");
+        silence_deadline = esp_timer_get_time() + silence_window_us();
+        got_reply = false;
+    }
     const char *end_caption = "";
     for (;;) {
         /* A dropped utterance must not extend the silence budget:
@@ -1342,36 +1361,21 @@ static void call_run(void)
             }
             break;
         }
-        /* v5: follow-up is decided by Muse's reply flag alone, for
+        /* Follow-up is decided by Muse's reply flag alone, for
          * every wake method. No flag defaults to DONE (end). The
          * closing-phrase guess is deleted: Muse says DONE when it
-         * is done, instead of the device guessing from "thanks". */
+         * is done, instead of the device guessing from "thanks".
+         * WORKING ends the call here (idle + timer model above):
+         * the reply is already played and the flag reset the
+         * timer, so later messages arrive as idle pushes; a
+         * further WORKING stays idle, it does not reopen a wait. */
         int reply_flag = muse_hatch_last_flag();
-        bool wait_boot = false;
-        while (reply_flag == MUSE_FLAG_WORKING) {
-            /* Still working: wait for Muse's final message instead
-             * of opening follow-up or ending. A further WORKING
-             * keeps waiting; only a final flag decides. */
-            wait_res_t wait = wait_for_final();
-            if (wait == WAIT_TIMEOUT) {
-                reply_flag = MUSE_FLAG_DONE;
-                break;
-            }
-            if (wait == WAIT_BOOT) {
-                wait_boot = true;
-                break;
-            }
-            reply_flag = muse_hatch_last_flag();
-        }
-        if (wait_boot) {
-            /* Press queued; the loop's next capture picks it up. */
-            silence_deadline = esp_timer_get_time() + silence_window_us();
-            pre_reset();
-            continue;
+        if (reply_flag == MUSE_FLAG_WORKING) {
+            break;
         }
         if (reply_flag != MUSE_FLAG_REPLY_NEEDED) {
-            /* DONE, no flag (default DONE), or WORKING timed out:
-             * end the call, no follow-up. */
+            /* DONE, or no flag (default DONE): end the call,
+             * no follow-up. */
             break;
         }
         /* Reply delivered: follow-up listening is enabled from here.
@@ -1589,6 +1593,19 @@ static void voice_task(void *arg)
                 if (muse_hatch_push_take()) {
                     pending_down = play_push();
                     pre_reset();
+                    if (!pending_down && muse_hatch_last_flag() == MUSE_FLAG_REPLY_NEEDED) {
+                        /* Idle-push REPLY_NEEDED: the flag closed
+                         * the timer, and the follow-up window
+                         * takes over (same chirp + 200 ms tail
+                         * drain as in-call follow-up, so the
+                         * 2 s + 3 s ring split cannot regress).
+                         * WORKING and DONE idle pushes need
+                         * nothing here: the flag already reset
+                         * or closed the timer, and the board
+                         * stays idle for the next push. */
+                        call_run_followup();
+                        pre_reset();
+                    }
                     if (!pending_down && muse_state_mode(NULL) != MUSE_MODE_IDLE) {
                         muse_state_make_happy();
                         go_idle("");
@@ -1635,27 +1652,14 @@ static void voice_task(void *arg)
         pending_down = finish_note(false, &replied);
         pre_reset();
         if (!pending_down && replied) {
-            /* v5: unified flag decision (same as wake-word calls).
+            /* Unified flag decision (same as wake-word calls).
              * A press queued during the reply wins instead: the loop
              * records it next, and that turn re-decides after its
-             * own reply. */
+             * own reply. WORKING ends here (idle + timer model):
+             * the reply is already played and the flag reset the
+             * timer, so later messages arrive as idle pushes and
+             * the fall-through below returns to idle. */
             int flag = muse_hatch_last_flag();
-            bool wait_boot = false;
-            while (flag == MUSE_FLAG_WORKING) {
-                wait_res_t wait = wait_for_final();
-                if (wait == WAIT_TIMEOUT) {
-                    flag = MUSE_FLAG_DONE;
-                    break;
-                }
-                if (wait == WAIT_BOOT) {
-                    wait_boot = true;
-                    break;
-                }
-                flag = muse_hatch_last_flag();
-            }
-            if (wait_boot) {
-                continue;
-            }
             if (flag == MUSE_FLAG_REPLY_NEEDED) {
                 /* Press call enters the same follow-up listening as
                  * wake-word calls (fix31, now flag-gated). */
