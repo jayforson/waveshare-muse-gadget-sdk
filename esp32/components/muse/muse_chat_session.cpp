@@ -3064,6 +3064,29 @@ static void check_turn(void)
             return;
         }
     }
+    /* WORKING early close (2026-11-04, idle + timer model): the last
+     * message is an intermediate WORKING segment, its text is done
+     * and its speech is decoded, so the turn ends here instead of
+     * waiting out the settle period and the busy hold below. The
+     * busy hold is meant for a final turn; while a task is still
+     * working the agent is busy by definition, so applying it to
+     * an intermediate segment is what left the board on SPEAKING
+     * for up to 20 s after the speech stopped. The voice task
+     * still drains the audio stream after EV_DONE before it
+     * leaves SPEAKING, so this cannot cut speech short, and the
+     * WORKING flag already reset the conversation timer, so a
+     * later final message still arrives as an idle push under
+     * that timer. If a final message arrived before this point
+     * it is the last message instead, so this branch does not
+     * fire and the two segments stay merged in one turn, as
+     * before. DONE and REPLY_NEEDED turns keep the settle and
+     * busy checks below, unchanged. */
+    if (s_turn.msgs[s_turn.nmsgs - 1].flag == MUSE_FLAG_WORKING) {
+        ESP_LOGI(TAG, "turn done: WORKING segment complete, %d message(s) in %.1fs", s_turn.nmsgs, (t - s_turn.start_us) / 1e6);
+        log_marks();
+        turn_done(true);
+        return;
+    }
     if (t - s_turn.last_event_us < SETTLE_US) {
         return;
     }
