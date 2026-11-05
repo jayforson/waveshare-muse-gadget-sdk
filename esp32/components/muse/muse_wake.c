@@ -37,11 +37,16 @@
  * its range, e.g. ..._0.608_0.615); 0.50 is a moderate step down,
  * inside the API's 0.4-0.9999 range. Lower catches more, at the
  * cost of more false triggers; 0.50 is the first step, not the
- * floor. (2) Noise suppression: ns_init = 1, retried with 0 if
- * the AFE will not create (no NS model in the model partition, or
- * the check clears it). NS is single-channel here ("MNR", se off),
- * so it is the stage that should apply; the boot log's pipeline
- * printout shows whether it really engaged. (3) Wake-path gain:
+ * floor. (2) Noise suppression: TRIED in v6 and REVERTED the same
+ * day. ns_init = 1 created fine (pipeline showed NS(WebRTC)
+ * engaged, threshold set rc=1), but the board then spammed
+ * "Ringbuffer of AFE is empty" and wake stopped working entirely;
+ * ESP-SR itself logs "Noise Suppression may reduce the accuracy of
+ * speech recognition. It is not recommended to turn it on." The NS
+ * stage starves the fetch path (fetch_with_delay(1) never sees
+ * output in time), so WakeNet never sees speech. ns_init is back
+ * to 0; do not re-enable without a fetch-delay rework first.
+ * (3) Wake-path gain:
  * the feed copy is multiplied x2 with saturation, WakeNet only;
  * the recorded speech (pre-roll ring, Scribe) is untouched, and
  * the user's stored mic/SW gain settings are untouched. Deliberately
@@ -92,51 +97,43 @@ bool muse_wake_init(void)
         heap_log("wake init done");
         return false;
     }
-    /* Wake tuning v6: try noise suppression on first, fall back to
-     * off if the AFE will not create with it (no NS model in the
-     * model partition, or the config check clears it). Either way
-     * the board keeps working; only the log line differs. */
-    int ns_applied = -1;
-    for (int attempt = 0; attempt < 2 && !s_afe_data; attempt++) {
-        int ns_try = attempt == 0 ? 1 : 0;
-        afe_config_t *cfg = afe_config_init("MNR", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
-        if (!cfg) {
-            ESP_LOGW(TAG, "AFE config failed (ns=%d); retrying", ns_try);
-            continue;
-        }
-        /* The speech-recognition pipeline: voice activity, wake word,
-         * neural noise suppression (v6). No echo cancellation, no
-         * blind source separation (single mic). Wake is armed only
-         * when idle, when the speaker is silent, so AEC has no echo
-         * to cancel; leaving it off also saves internal RAM for the
-         * voice task. */
-        cfg->aec_init = 0;
-        cfg->vad_init = 1;
-        cfg->wakenet_init = 1;
-        cfg->se_init = 0;
-        cfg->ns_init = ns_try;
-        /* The model itself is picked in menuconfig under ESP Speech
-         * Recognition and loaded from the model partition; this field is
-         * only logged here, not gated on, because the documented AFE flow
-         * sets no model name in code and the field may stay unset even
-         * with a model loaded. If the wake word never fires on the board,
-         * the menuconfig pick is the first thing to re-check. */
-        ESP_LOGI(TAG, "wake model: %s", cfg->wakenet_model_name ? cfg->wakenet_model_name : "(unset at init)");
-        s_afe_handle = esp_afe_handle_from_config(cfg);
-        s_afe_data = s_afe_handle ? s_afe_handle->create_from_config(cfg) : NULL;
-        afe_config_free(cfg);
-        if (s_afe_data) {
-            ns_applied = ns_try;
-        } else {
-            ESP_LOGW(TAG, "AFE create failed with ns=%d; retrying", ns_try);
-        }
+    afe_config_t *cfg = afe_config_init("MNR", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
+    if (!cfg) {
+        ESP_LOGW(TAG, "AFE config failed; waking off (BOOT still works)");
+        esp_srmodel_deinit(models);
+        heap_log("wake init done");
+        return false;
     }
+    /* The speech-recognition pipeline: voice activity, wake word. No
+     * echo cancellation, no blind source separation (single mic) and
+     * no noise suppression. Wake is armed only when idle, when the
+     * speaker is silent, so AEC has no echo to cancel; leaving it
+     * off also saves internal RAM for the voice task. NS stays off
+     * on purpose: v6 tried ns_init = 1, it created fine, but the
+     * board then spammed "Ringbuffer of AFE is empty" and wake
+     * stopped working (see the header comment). */
+    cfg->aec_init = 0;
+    cfg->vad_init = 1;
+    cfg->wakenet_init = 1;
+    cfg->se_init = 0;
+    cfg->ns_init = 0;
+    /* The model itself is picked in menuconfig under ESP Speech
+     * Recognition and loaded from the model partition; this field is
+     * only logged here, not gated on, because the documented AFE flow
+     * sets no model name in code and the field may stay unset even
+     * with a model loaded. If the wake word never fires on the board,
+     * the menuconfig pick is the first thing to re-check. */
+    ESP_LOGI(TAG, "wake model: %s", cfg->wakenet_model_name ? cfg->wakenet_model_name : "(unset at init)");
+    s_afe_handle = esp_afe_handle_from_config(cfg);
+    s_afe_data = s_afe_handle ? s_afe_handle->create_from_config(cfg) : NULL;
+    afe_config_free(cfg);
     if (!s_afe_data) {
         ESP_LOGW(TAG, "AFE create failed; waking off (BOOT still works)");
         esp_srmodel_deinit(models);
         heap_log("wake init done");
         return false;
     }
+    int ns_applied = 0;
     /* Wake tuning v6: lower the detection threshold from the model
      * default (~0.60-0.62) to 0.50. set_wakenet_threshold takes the
      * wakenet index (1: only model loaded) and a threshold in
