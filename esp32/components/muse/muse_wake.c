@@ -96,8 +96,9 @@ static size_t s_bargein_acc_len;
 
 static void heap_log(const char *what)
 {
-    ESP_LOGI(TAG, "%s: free internal %u, psram %u", what,
+    ESP_LOGI(TAG, "%s: free internal %u (largest %u), psram %u", what,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
@@ -132,9 +133,12 @@ static esp_afe_sr_data_t *create_afe(srmodel_list_t *models, int aec_init)
 }
 
 /* Scribe's TLS setup needs a 6K+ largest internal block (7K works,
- * 6K fails; see the v5 heap analysis). The AEC attempt is kept only
- * if at least this much headroom remains after it. */
-#define BARGEIN_MIN_LARGEST_INTERNAL 8192
+ * 6K fails; see the v5 heap analysis, fix17). The AEC attempt is
+ * kept only if at least the proven 7K line remains after it. The
+ * first trial set this to 8K and rejected an AEC that left 7680
+ * (7.5K, above the line); 7K is the threshold the evidence
+ * supports, so that is what is used now. */
+#define BARGEIN_MIN_LARGEST_INTERNAL 7168
 
 bool muse_wake_init(void)
 {
