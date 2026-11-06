@@ -975,6 +975,11 @@ static void turn_reset_streams(void)
 
 static void remember_shown(const char *id);
 static bool was_shown(const char *id);
+static void turn_finish(void);
+
+/* v6: lives up here, not with the other push state below, because
+ * note_flag (defined just below) releases it for a flagged push. */
+static std::atomic<bool> s_push_pending{false};
 
 /* v6: the 10-minute conversation timer is gone. Its only job was
  * deciding whether an idle push was for the board; the reply flag
@@ -1960,7 +1965,6 @@ static void on_dictation_end(bool ok)
  */
 #define SHOWN_IDS 8
 
-static std::atomic<bool> s_push_pending{false};
 static char s_shown_ids[SHOWN_IDS][sizeof(msg_t::id)];
 static int s_shown_next;
 
