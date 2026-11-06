@@ -404,8 +404,9 @@ static void subscription_event(void)
         /* v5: front flag, parsed and stripped here (full text is known),
          * so the voice task's rows (dialog, face, TTS) never see it.
          * A finalized incomplete token is NONE, not NEED_MORE: no more
-         * text is coming, so it stays as body text. The flag also
-         * drives the task timer at receipt. User rows are never flags. */
+         * text is coming, so it stays as body text. The flag drives
+         * follow-up; v6: it is also how a push is recognized as for
+         * the board. User rows are never flags. */
         size_t strip = 0;
         int flag = muse_hatch_flag_parse(s_row.text, &strip);
         if (flag == MUSE_FLAG_NEED_MORE) {
@@ -415,7 +416,6 @@ static void subscription_event(void)
             memmove(s_row.text, s_row.text + strip, strlen(s_row.text + strip) + 1);
         }
         s_row.flag = flag > 0 ? flag : MUSE_FLAG_NONE;
-        muse_hatch_conv_timer_flag(s_row.flag);
     } else {
         s_row.flag = MUSE_FLAG_NONE;
     }

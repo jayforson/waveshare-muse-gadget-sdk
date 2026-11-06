@@ -1231,21 +1231,20 @@ static call_outcome_t capture_call_utterance(bool barge_in, int64_t *silence_dea
  * on/off repeatedly on a dead connection. A reply interrupted by
  * BOOT still starts the next utterance at once.
  */
-/* WORKING handling, idle + timer model (2026-11-04, user-confirmed,
- * replacing the v5 wait-in-call): a WORKING reply is already played
- * when its flag is read, and the flag itself reset the 10-minute
- * conversation timer, so the call ends here and the board goes idle.
- * Later messages arrive as idle pushes while the timer is open
- * (WORKING resets it, DONE and REPLY_NEEDED close it); a later
- * WORKING stays idle, a DONE ends, a REPLY_NEEDED enters follow-up
- * from the idle push path below. There is deliberately no wait
- * loop here: the old wait only watched the direct push flag, while
- * a message arriving while the board was still SPEAKING went to
- * the push queue, which only drains when idle, so the final
- * message sat queued, the screen stuck on SPEAKING, a short BOOT
- * tap (hangup request, which the wait never read) did nothing,
- * and the queued messages only played after the 10-minute
- * timeout ended the call. */
+/* WORKING handling, idle model (2026-11-04, user-confirmed,
+ * replacing the v5 wait-in-call; v6 dropped the 10-minute timer):
+ * a WORKING reply is already played when its flag is read, so the
+ * call ends here and the board goes idle. Later messages arrive as
+ * idle pushes whenever they come (v6 flag gate: a push carrying a
+ * flag is for the board); a later WORKING stays idle, a DONE ends,
+ * a REPLY_NEEDED enters follow-up from the idle push path below.
+ * There is deliberately no wait loop here: the old wait only
+ * watched the direct push flag, while a message arriving while the
+ * board was still SPEAKING went to the push queue, which only
+ * drains when idle, so the final message sat queued, the screen
+ * stuck on SPEAKING, a short BOOT tap (hangup request, which the
+ * wait never read) did nothing, and the queued messages only
+ * played after the call timed out. */
 static void call_run_impl(bool followup);
 
 static void call_run(void)

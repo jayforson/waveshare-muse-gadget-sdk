@@ -976,77 +976,40 @@ static void turn_reset_streams(void)
 static void remember_shown(const char *id);
 static bool was_shown(const char *id);
 
-/* Conversation window (v5): 10 minutes, driven ONLY by Muse reply
- * flags, no longer by outgoing sends or turn ends. While it runs,
- * every push reads aloud, as if Speak all were on; when it lapses,
- * pushes go back to being dropped with Speak all off. WORKING opens
- * or resets it (a task is pending, its result may arrive as a push);
- * DONE (including no flag, the DONE default) closes it; REPLY_NEEDED
- * and anything else leave it alone, so a clarifying question after a
- * WORKING does not kill the window its task opened. Speak all on
- * still bypasses it entirely. A timestamp, not a task: about 16
- * bytes, no allocation. */
-static int64_t s_conv_us;  /* 0 = window inactive */
+/* v6: the 10-minute conversation timer is gone. Its only job was
+ * deciding whether an idle push was for the board; the reply flag
+ * does that now (see push_maybe_begin and note_flag): a push is for
+ * the board iff it carries [DONE], [WORKING] or [REPLY_NEEDED], or
+ * Speak all is on. A late final or progress update is still spoken
+ * whenever it arrives, because it carries a flag. */
 static volatile int s_last_flag = MUSE_FLAG_NONE;  /* flag of the most recently flag-resolved message, for the voice decision */
-static const int64_t CONV_WINDOW_US = 10 * 60 * 1000000LL;
-
-static void conv_timer_reset(void)
-{
-    s_conv_us = now_us();
-}
-
-static void conv_timer_close(void)
-{
-    s_conv_us = 0;
-}
-
-/* v5: applies one parsed reply flag to the timer. Idempotent, so a
- * message seen by both the live path and the link path touches it
- * twice harmlessly. */
-static void conv_timer_apply_flag(int flag)
-{
-    /* Turn window: WORKING renews it; anything final (DONE, no-flag
-     * default, or REPLY_NEEDED asking the user) closes it. REPLY_NEEDED
-     * is safe to close because the user's answer reopens the window
-     * via send_chat_marked. */
-    if (flag == MUSE_FLAG_WORKING) {
-        conv_timer_reset();
-    } else {
-        conv_timer_close();
-    }
-}
-
-static bool conv_timer_active(void)
-{
-    if (!s_conv_us) {
-        return false;
-    }
-    if (now_us() - s_conv_us > CONV_WINDOW_US) {
-        s_conv_us = 0;  /* lapse lazily, so it stops logging as active */
-        return false;
-    }
-    return true;
-}
-
-extern "C" void muse_hatch_conv_timer_flag(int flag)
-{
-    conv_timer_apply_flag(flag);
-}
-
-extern "C" bool muse_hatch_conv_timer_active(void)
-{
-    return conv_timer_active();
-}
 
 /* Session counterpart of link.c's s_last_flag: the voice task reads
  * this after playing a reply to decide follow-up. All 5 append_text
- * flag-resolve sites go through note_flag, so flag and timer stay in
- * sync. link.c keeps its own copy for non-Hatch builds; only one of
- * the two files is compiled per build, so there is no duplicate. */
-static void note_flag(int flag)
+ * flag-resolve sites go through note_flag. link.c keeps its own copy
+ * for non-Hatch builds; only one of the two files is compiled per
+ * build, so there is no duplicate.
+ * v6: a push turn's flag is also its admission ticket. With Speak all
+ * off, only flagged pushes are for the board; an unflagged one is
+ * dropped here, before any text is appended (no dialog row, no TTS)
+ * and before the voice task is told (a streaming push was admitted
+ * provisionally with pending held back, so playback never starts).
+ * A flagged push releases the pending push. Returns false when the
+ * caller must return without appending anything. */
+static bool note_flag(int flag)
 {
     s_last_flag = flag;
-    muse_hatch_conv_timer_flag(flag);
+    if (!s_turn.push_turn) {
+        return true;
+    }
+    if (flag > 0 || muse_settings_speak_all()) {
+        /* Flagged (or Speak all on): this push is for the board. */
+        s_push_pending = true;
+        return true;
+    }
+    ESP_LOGI(TAG, "push: unflagged, Speak all off, dropping");
+    turn_finish();
+    return false;
 }
 
 extern "C" int muse_hatch_last_flag(void)
@@ -1107,6 +1070,22 @@ static int push_queue_find(const char *id)
 static bool push_queue_has(const char *id)
 {
     return push_queue_find(id) >= 0;
+}
+
+/* v6: whether a late message may enter the push queue. Speak all on
+ * admits everything. Otherwise a text is admitted iff it carries a
+ * reply flag; NEED_MORE admits provisionally (the flag may complete
+ * in the next chunk; the drain-time check decides). No text yet
+ * (message_start) is admitted provisionally for the same reason. */
+static bool push_queue_admit(const char *text)
+{
+    if (muse_settings_speak_all()) {
+        return true;
+    }
+    if (!text) {
+        return true;
+    }
+    return muse_hatch_flag_parse(text, nullptr) != MUSE_FLAG_NONE;
 }
 
 /* Enqueue a push. text may be null (streaming: not arrived yet).
@@ -1193,8 +1172,8 @@ static void turn_finish(void)
 static void turn_fail(const char *why)
 {
     ESP_LOGW(TAG, "turn failed: %s", why);
-    /* v5: turn failures no longer touch the conversation window; it is
-     * driven only by reply flags (WORKING opens/resets, DONE closes). */
+    /* v6: the conversation timer is gone; turn failures touch no
+     * routing state. Reply flags drive follow-up only. */
     if (s_turn.text) {
         muse_hatch_console("error", why, nullptr);
     }
@@ -1443,11 +1422,6 @@ static void send_chat(const char *text, const char *modality)
  * unmarked transcript. */
 static void send_chat_marked(const char *text, const char *modality)
 {
-    /* The user's turn window starts here: every board-originated send
-     * (voice or typed) opens a fresh 10-minute window, so a slow reply
-     * is spoken even if no WORKING ever arrives. DONE / REPLY_NEEDED
-     * close it (conv_timer_apply_flag); the next send reopens it. */
-    conv_timer_reset();
     const char *marker = "[WALL-E] ";
     size_t mlen = strlen(marker);
     size_t tlen = strlen(text);
@@ -2030,7 +2004,15 @@ static void push_begin(const char *id, const char *text, bool done)
     s_turn.phase = P_WAIT_REPLY;
     s_turn.chat_us = s_turn.last_event_us = now_us();
     s_turn.push_turn = true;
-    s_push_pending = true;
+    /* v6: a streaming push is admitted provisionally; its flag is not
+     * known until the first text resolves it. Hold pending back until
+     * then (note_flag releases it) so the voice task never starts
+     * playback for a push that turns out not to be for the board. A
+     * complete push was already flag-checked by the caller; Speak all
+     * on bypasses the gate entirely. */
+    if (text || muse_settings_speak_all()) {
+        s_push_pending = true;
+    }
     ESP_LOGI(TAG, "push: message %s with no turn waiting, playing it", id);
 }
 
@@ -2047,25 +2029,25 @@ static void push_maybe_begin(const char *event, cJSON *payload, cJSON *line)
     if (!id || was_shown(id) || push_queue_has(id)) {
         return;  /* already shown, or already queued */
     }
-    bool conv = conv_timer_active();
-    if (s_conv_us) {
-        ESP_LOGI(TAG, "push: conversation window active, id %s", id);
-    }
-    if (!conv && !muse_settings_speak_all()) {
-        /* Automatic push with Speak all off and no window: drop it at
-         * the door. No turn, no TTS, no decode, so it can neither wake
-         * the screen nor wedge the speech worker. Left for the app. */
-        ESP_LOGI(TAG, "push: automatic, Speak all off, dropping %s", id);
-        return;
-    }
-    /* A complete push carries its text; a streaming push starts empty
-     * and fills via deltas (into the turn, or into its queue slot). */
+    /* v6: a push is for the board iff it carries a reply flag ([DONE],
+     * [WORKING] or [REPLY_NEEDED]); anything else is a reply to the
+     * app on the phone. Speak all on bypasses the gate entirely. A
+     * complete push carries its text, so the flag is checked here and
+     * an unflagged one is dropped at the door: no turn, no TTS, no
+     * decode, so it can neither wake the screen nor wedge the speech
+     * worker. Left for the app. A streaming push starts empty and is
+     * admitted provisionally; the flag gate runs when its first text
+     * resolves (note_flag), before anything is spoken or shown. */
     bool full = !strcmp(event, "message.assistant");
     const char *text = nullptr;
     if (full) {
         text = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "display_text"));
         if (!text) {
             text = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "content"));
+        }
+        if (!muse_settings_speak_all() && (!text || muse_hatch_flag_parse(text, nullptr) <= 0)) {
+            ESP_LOGI(TAG, "push: unflagged, Speak all off, dropping %s", id);
+            return;
         }
     }
     push_begin(id, text, full);
@@ -2121,10 +2103,11 @@ static void append_text_inner(msg_t &m, const char *text);
 static void append_text(msg_t &m, const char *text);
 
 /* v5: strips the front flag from a message's first chunk(s) before
- * dialog/TTS see the text, and drives the task timer at receipt.
- * A split flag buffers in m.head until it resolves (or exceeds 32
- * bytes, then it is body text). Once resolved, later chunks go
- * straight to the inner append. */
+ * dialog/TTS see the text. A split flag buffers in m.head until it
+ * resolves (or exceeds 32 bytes, then it is body text). Once
+ * resolved, later chunks go straight to the inner append. v6: when
+ * note_flag drops an unflagged push, append_text returns here
+ * without appending anything (no dialog row, no TTS text). */
 static void append_text(msg_t &m, const char *text)
 {
     if (m.flag_done) {
@@ -2135,7 +2118,9 @@ static void append_text(msg_t &m, const char *text)
         if (text[0] != '[') {
             m.flag = MUSE_FLAG_NONE;
             m.flag_done = true;
-            note_flag(m.flag);
+            if (!note_flag(m.flag)) {
+                return;  /* unflagged push dropped */
+            }
             append_text_inner(m, text);
             return;
         }
@@ -2153,7 +2138,9 @@ static void append_text(msg_t &m, const char *text)
         }
         m.flag = flag > 0 ? flag : MUSE_FLAG_NONE;
         m.flag_done = true;
-        note_flag(m.flag);
+        if (!note_flag(m.flag)) {
+            return;  /* unflagged push dropped */
+        }
         append_text_inner(m, flag > 0 && strip > 0 ? text + strip : text);
         return;
     }
@@ -2172,7 +2159,9 @@ static void append_text(msg_t &m, const char *text)
     if (!close || m.head_len + (size_t)(close - text) + 1 > 34) {
         m.flag = MUSE_FLAG_NONE;
         m.flag_done = true;
-        note_flag(m.flag);
+        if (!note_flag(m.flag)) {
+            return;  /* unflagged push dropped */
+        }
         append_text_inner(m, m.head);
         append_text_inner(m, text);
         m.head_len = 0;
@@ -2182,7 +2171,9 @@ static void append_text(msg_t &m, const char *text)
     if (sep != '\0' && sep != ' ' && sep != '\n' && sep != '\r' && sep != '\t') {
         m.flag = MUSE_FLAG_NONE;
         m.flag_done = true;
-        note_flag(m.flag);
+        if (!note_flag(m.flag)) {
+            return;  /* unflagged push dropped */
+        }
         append_text_inner(m, m.head);
         append_text_inner(m, text);
         m.head_len = 0;
@@ -2200,7 +2191,9 @@ static void append_text(msg_t &m, const char *text)
     }
     m.flag = flag > 0 ? flag : MUSE_FLAG_NONE;
     m.flag_done = true;
-    note_flag(m.flag);
+    if (!note_flag(m.flag)) {
+        return;  /* unflagged push dropped */
+    }
     if (flag > 0) {
         size_t off = token_end;
         while (text[off] == ' ' || text[off] == '\n' || text[off] == '\r' || text[off] == '\t') {
@@ -2324,9 +2317,9 @@ static const char *msg_id(cJSON *payload, cJSON *event)
 
 /* Start the oldest queued push as its own push turn, pre-filled with
  * the text it arrived with. Called from the session loop when the
- * voice task is idle and no push is pending. A slot accepted while
- * the window was active plays even if the window has since lapsed:
- * it was accepted, so it drains. */
+ * voice task is idle and no push is pending. A slot admitted by the
+ * flag gate drains even if it was accepted a while ago: it was
+ * accepted, so it plays. */
 static void push_begin_queued(void)
 {
     if (!s_push_queue || s_push_queue_count <= 0) {
@@ -2348,6 +2341,9 @@ static void push_begin_queued(void)
     strlcpy(m.id, slot.id, sizeof(m.id));
     if (slot.len) {
         append_text(m, slot.text);
+        if (s_turn.phase == P_IDLE) {
+            return;  /* unflagged push dropped at the flag gate */
+        }
     }
     m.done = slot.done;
     if (slot.done && m.len && m.tts == TTS_NONE) {
@@ -2355,7 +2351,13 @@ static void push_begin_queued(void)
     }
     s_turn.nmsgs = 1;
     show_reply_start(m);  /* emits EV_REPLY so the voice task starts playback */
-    s_push_pending = true;
+    /* v6: pending is released only once the flag is known. A slot with
+     * text resolved it in append_text above (or Speak all bypassed the
+     * gate); an empty slot still streaming holds pending back until its
+     * first text resolves (note_flag), unless Speak all is on. */
+    if (slot.len || muse_settings_speak_all()) {
+        s_push_pending = true;
+    }
     ESP_LOGI(TAG, "push: playing queued message %s", slot.id);
 }
 
@@ -2435,14 +2437,16 @@ static void on_event(cJSON *line)
     if (i < 0) {
         /* Not part of this turn: a late reply to an earlier message
          * arriving during a new turn, or a turn that overflowed. Queue
-         * it for after the turn when the conversation window is active
-         * or Speak all is on, instead of losing it. */
-        if (id && !was_shown(id) && (conv_timer_active() || muse_settings_speak_all())) {
+         * it for after the turn when it carries a reply flag (or Speak
+         * all is on), instead of losing it. A message_start has no
+         * text yet, so it is admitted provisionally; the drain-time
+         * flag check decides. */
+        if (id && !was_shown(id)) {
             if (start) {
                 push_queue_push(id, nullptr, false);
             } else if (append) {
                 const char *t = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "text"));
-                if (t && !push_queue_append(id, t)) {
+                if (t && !push_queue_append(id, t) && push_queue_admit(t)) {
                     push_queue_push(id, t, false);
                 }
             } else if (done) {
@@ -2451,7 +2455,7 @@ static void on_event(cJSON *line)
                     if (!t) {
                         t = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "content"));
                     }
-                    if (t) {
+                    if (t && push_queue_admit(t)) {
                         push_queue_push(id, t, true);
                     }
                 }
@@ -2460,7 +2464,9 @@ static void on_event(cJSON *line)
                 if (!t) {
                     t = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "content"));
                 }
-                push_queue_push(id, t, true);
+                if (push_queue_admit(t)) {
+                    push_queue_push(id, t, true);
+                }
             }
         }
         return;
@@ -2476,7 +2482,12 @@ static void on_event(cJSON *line)
         } else if (text && text[0]) {
             mark(M_TEXT);
             append_text(m, text);
-            show_reply_start(m);   /* ignored once the speech starts */
+            /* v6: append_text may have dropped an unflagged push (the
+             * turn is finished, phase back to idle); then there is
+             * nothing to show. */
+            if (s_turn.phase != P_IDLE) {
+                show_reply_start(m);   /* ignored once the speech starts */
+            }
         }
     } else if (done || full) {
         const char *text = cJSON_GetStringValue(cJSON_GetObjectItem(payload, "display_text"));
@@ -3073,13 +3084,13 @@ static void check_turn(void)
      * an intermediate segment is what left the board on SPEAKING
      * for up to 20 s after the speech stopped. The voice task
      * still drains the audio stream after EV_DONE before it
-     * leaves SPEAKING, so this cannot cut speech short, and the
-     * WORKING flag already reset the conversation timer, so a
-     * later final message still arrives as an idle push under
-     * that timer. If a final message arrived before this point
-     * it is the last message instead, so this branch does not
-     * fire and the two segments stay merged in one turn, as
-     * before. DONE and REPLY_NEEDED turns keep the settle and
+     * leaves SPEAKING, so this cannot cut speech short, and a
+     * later final message still arrives as an idle push: it
+     * carries a flag, so the v6 flag gate admits it (the
+     * 10-minute timer is gone). If a final message arrived before
+     * this point it is the last message instead, so this branch
+     * does not fire and the two segments stay merged in one turn,
+     * as before. DONE and REPLY_NEEDED turns keep the settle and
      * busy checks below, unchanged. */
     if (s_turn.msgs[s_turn.nmsgs - 1].flag == MUSE_FLAG_WORKING) {
         ESP_LOGI(TAG, "turn done: WORKING segment complete, %d message(s) in %.1fs", s_turn.nmsgs, (t - s_turn.start_us) / 1e6);

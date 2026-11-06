@@ -224,8 +224,9 @@ size_t muse_hatch_caption_next(const char *text, size_t at)
  * A Muse reply to WALL-E starts with one flag token, a space, then the
  * body, e.g. "[REPLY_NEEDED] ...". The flag is stripped before the text
  * reaches TTS, the dialog, the face, or history, so no consumer ever
- * sees it; the flag itself drives follow-up and the 10-minute task
- * timer. Only the three exact tokens count (case and underscore/space
+ * sees it; the flag itself drives follow-up, and v6: it is also how a
+ * push is recognized as for the board (Speak-all-off gate). Only the
+ * three exact tokens count (case and underscore/space
  * insensitive, so "[reply_needed]" and "[REPLY NEEDED]" also match);
  * any other bracketed opening (e.g. "[Note]") is body text, never a
  * flag. A lone "[" with no "]" yet is NEED_MORE (streaming head still

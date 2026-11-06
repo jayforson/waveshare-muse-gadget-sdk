@@ -106,13 +106,6 @@ int muse_hatch_flag_parse(const char *text, size_t *strip_len);
  * task starts playing a finalized row); the voice task reads it after
  * a reply to decide follow-up. */
 int muse_hatch_last_flag(void);
-/* Applies the flag to the 10-minute task timer (session.cpp):
- * WORKING opens/resets it, DONE/NONE closes it, REPLY_NEEDED leaves
- * it alone. Called at message receipt, so pushes arriving while a
- * task is open stay spoken. */
-void muse_hatch_conv_timer_flag(int flag);
-/* Whether that timer is currently running (for the WORKING wait). */
-bool muse_hatch_conv_timer_active(void);
 
 #ifdef __cplusplus
 }

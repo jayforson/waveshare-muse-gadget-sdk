@@ -53,8 +53,10 @@ static struct {
 } s = {
     .volume = CONFIG_MUSE_DEFAULT_VOLUME,
     .speaker_on = true,
-    /* speak_all defaults off: only current-conversation content is spoken,
-     * automatic pushes are dropped before any TTS or decode. */
+    /* speak_all defaults off: only flagged replies are spoken (v6: the
+     * flag is how a push is recognized as for the board); unflagged
+     * pushes are dropped before any TTS or decode. Speak all on also
+     * speaks unflagged pushes (replies to the app on the phone). */
     .mic_gain = 30,
     .sw_gain = 2,
     .silence_s = MUSE_SILENCE_S_DEFAULT,
