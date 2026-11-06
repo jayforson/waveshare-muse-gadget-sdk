@@ -2295,6 +2295,13 @@ static void message_done(int i, const char *final_text)
     }
     if (!m.len && final_text && final_text[0]) {
         append_text(m, final_text);
+        if (s_turn.phase == P_IDLE) {
+            /* v6: unflagged push dropped at the flag gate. Its done
+             * must not run dialog_reply_done: the staging still holds
+             * the previous reply, and done would save that text to
+             * NVS a second time (a duplicate row in dialog history). */
+            return;
+        }
     }
     if (m.len && m.tts == TTS_NONE) {
         m.tts = TTS_QUEUED;
@@ -3063,9 +3070,10 @@ static void check_turn(void)
         /* A typed turn waits as long as the agent says it's working. */
         if (t - s_turn.chat_us > (text ? TEXT_REPLY_TIMEOUT_US : REPLY_TIMEOUT_US) && !(text && s_turn.agent_busy)) {
             /* The turn ends after a minute, but the wait continues in the
-             * background: the conversation timer below keeps pushes
-             * aloud, and the device is idle again, so the user can wake
-             * it for a new conversation while the reply is still owed. */
+             * background: a late reply still arrives as an idle push
+             * (v6 flag gate), and the device is idle again, so the user
+             * can wake it for a new conversation while the reply is
+             * still owed. */
             turn_fail("WAITING FOR MUSE RESPONSE");
         }
         return;
