@@ -24,11 +24,15 @@
  *
  * Only the voice task calls into this file. The wake-word AFE is fed
  * only while idle (the voice task arms it); during a call or a reply
- * it gets nothing, so it cannot fire on Muse's own voice. There is
- * no voice barge-in: only a BOOT hold interrupts a reply, so no
- * standalone echo canceller and no voice-vs-speaker judgment exist
- * in this file. (The wake AFE's own internal AEC, cfg->aec_init,
- * belongs to WakeNet's idle pipeline and is untouched.)
+ * it gets nothing, so it cannot fire on Muse's own voice.
+ *
+ * Voice barge-in (v6 trial, AEC+VAD): the same AFE is created with
+ * AEC on when it fits (see muse_wake_init), and while a reply plays
+ * the voice task feeds mic + just-played PCM (reference) through
+ * muse_wake_bargein_feed; the AFE's VAD then reports speech on the
+ * echo-cancelled signal, and sustained speech interrupts the reply
+ * like a BOOT hold. If AEC does not fit, the AFE is recreated
+ * without it, barge-in is off, and waking works as before.
  *
  * Wake tuning, v6 experimental (2026-11-05, user report: "Hi, Wall E"
  * sometimes needs several shouts): three levers, all in this file.
@@ -81,6 +85,13 @@ static int s_feed_nch;         /* channels per AFE frame (3 for "MNR") */
 static int16_t *s_feed_buff;   /* one interleaved AFE frame */
 static int16_t *s_feed_acc;    /* mic samples waiting for a full AFE frame */
 static size_t s_feed_acc_len;
+/* Voice barge-in (v6 trial): true when the AFE was created with AEC.
+ * The barge-in feed has its own accumulators, separate from the idle
+ * wake feed's, so the two paths never mix gains or partial frames. */
+static bool s_bargein_available;
+static int16_t *s_bargein_acc;      /* mic samples waiting for a full AFE frame */
+static int16_t *s_bargein_ref_acc;  /* reference samples, paired with s_bargein_acc */
+static size_t s_bargein_acc_len;
 
 
 static void heap_log(const char *what)
@@ -90,32 +101,19 @@ static void heap_log(const char *what)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
-bool muse_wake_init(void)
+/* Builds the AFE with the given AEC setting, or NULL. The pipeline
+ * is otherwise fixed: voice activity + wake word, no blind source
+ * separation (single mic), no noise suppression. NS stays off on
+ * purpose: v6 tried ns_init = 1, it created fine, but the board
+ * then spammed "Ringbuffer of AFE is empty" and wake stopped
+ * working (see the header comment). */
+static esp_afe_sr_data_t *create_afe(srmodel_list_t *models, int aec_init)
 {
-    /* Wake word: models come from the "model" flash partition, picked in
-     * menuconfig under ESP Speech Recognition. */
-    srmodel_list_t *models = esp_srmodel_init("model");
-    if (!models) {
-        ESP_LOGW(TAG, "no models in the model partition; waking off (BOOT still works)");
-        heap_log("wake init done");
-        return false;
-    }
     afe_config_t *cfg = afe_config_init("MNR", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
     if (!cfg) {
-        ESP_LOGW(TAG, "AFE config failed; waking off (BOOT still works)");
-        esp_srmodel_deinit(models);
-        heap_log("wake init done");
-        return false;
+        return NULL;
     }
-    /* The speech-recognition pipeline: voice activity, wake word. No
-     * echo cancellation, no blind source separation (single mic) and
-     * no noise suppression. Wake is armed only when idle, when the
-     * speaker is silent, so AEC has no echo to cancel; leaving it
-     * off also saves internal RAM for the voice task. NS stays off
-     * on purpose: v6 tried ns_init = 1, it created fine, but the
-     * board then spammed "Ringbuffer of AFE is empty" and wake
-     * stopped working (see the header comment). */
-    cfg->aec_init = 0;
+    cfg->aec_init = aec_init;
     cfg->vad_init = 1;
     cfg->wakenet_init = 1;
     cfg->se_init = 0;
@@ -128,8 +126,47 @@ bool muse_wake_init(void)
      * the menuconfig pick is the first thing to re-check. */
     ESP_LOGI(TAG, "wake model: %s", cfg->wakenet_model_name ? cfg->wakenet_model_name : "(unset at init)");
     s_afe_handle = esp_afe_handle_from_config(cfg);
-    s_afe_data = s_afe_handle ? s_afe_handle->create_from_config(cfg) : NULL;
+    esp_afe_sr_data_t *data = s_afe_handle ? s_afe_handle->create_from_config(cfg) : NULL;
     afe_config_free(cfg);
+    return data;
+}
+
+/* Scribe's TLS setup needs a 6K+ largest internal block (7K works,
+ * 6K fails; see the v5 heap analysis). The AEC attempt is kept only
+ * if at least this much headroom remains after it. */
+#define BARGEIN_MIN_LARGEST_INTERNAL 8192
+
+bool muse_wake_init(void)
+{
+    /* Wake word: models come from the "model" flash partition, picked in
+     * menuconfig under ESP Speech Recognition. */
+    srmodel_list_t *models = esp_srmodel_init("model");
+    if (!models) {
+        ESP_LOGW(TAG, "no models in the model partition; waking off (BOOT still works)");
+        heap_log("wake init done");
+        return false;
+    }
+    /* Voice barge-in (v6 trial): try the AFE with AEC first. If it
+     * does not fit (creation fails, or too little internal RAM is
+     * left for the call-time Scribe TLS), destroy it and recreate
+     * without AEC: barge-in is off, waking works as before. */
+    s_afe_data = create_afe(models, 1);
+    if (s_afe_data) {
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        if (largest < BARGEIN_MIN_LARGEST_INTERNAL) {
+            ESP_LOGW(TAG, "AEC leaves only %u largest internal block; barge-in off",
+                     (unsigned)largest);
+            s_afe_handle->destroy(s_afe_data);
+            s_afe_data = NULL;
+        } else {
+            s_bargein_available = true;
+            ESP_LOGI(TAG, "AEC on for barge-in (largest internal %u)", (unsigned)largest);
+        }
+    }
+    if (!s_afe_data) {
+        s_afe_data = create_afe(models, 0);
+        s_bargein_available = false;
+    }
     if (!s_afe_data) {
         ESP_LOGW(TAG, "AFE create failed; waking off (BOOT still works)");
         esp_srmodel_deinit(models);
@@ -150,7 +187,9 @@ bool muse_wake_init(void)
     if (s_afe_handle && s_afe_handle->set_wakenet_threshold) {
         thr_rc = s_afe_handle->set_wakenet_threshold(s_afe_data, 1, 0.55f);
     }
-    ESP_LOGI(TAG, "wake tune v6: threshold 0.55 (set rc=%d), ns=%d, wake gain x2", thr_rc, ns_applied);
+    ESP_LOGI(TAG, "wake tune v6: threshold 0.55 (set rc=%d), ns=%d, wake gain x2, aec=%d (barge-in %s)",
+             thr_rc, ns_applied, s_bargein_available ? 1 : 0,
+             s_bargein_available ? "on" : "off");
     if (thr_rc != 1) {
         ESP_LOGW(TAG, "set_wakenet_threshold failed (rc=%d); model default threshold in force", thr_rc);
     }
@@ -173,6 +212,16 @@ bool muse_wake_init(void)
         esp_srmodel_deinit(models);
         heap_log("wake init done");
         return false;
+    }
+    /* Barge-in accumulators (mic + reference, paired). If these fail,
+     * only barge-in is off; waking keeps working. */
+    s_bargein_acc = heap_caps_malloc((size_t)s_feed_chunksize * sizeof(int16_t),
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_bargein_ref_acc = heap_caps_malloc((size_t)s_feed_chunksize * sizeof(int16_t),
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_bargein_acc || !s_bargein_ref_acc) {
+        ESP_LOGW(TAG, "barge-in buffers failed; barge-in off");
+        s_bargein_available = false;
     }
     /* Models stay loaded for the AFE's lifetime (never deinitialized). */
     ESP_LOGI(TAG, "wake ready: feed %d x %d channels", s_feed_chunksize, s_feed_nch);
@@ -222,6 +271,58 @@ bool muse_wake_feed(const int16_t *pcm, size_t frames)
         }
     }
     return false;
+}
+
+bool muse_wake_bargein_ready(void)
+{
+    return s_bargein_available && s_afe_data != NULL && s_bargein_acc != NULL && s_bargein_ref_acc != NULL;
+}
+
+/* Voice barge-in (v6 trial): feeds mic + just-played PCM to the
+ * AEC-enabled AFE and reports the VAD state of the echo-cancelled
+ * signal. The caller counts sustained speech. Only the voice task
+ * calls this, only while a reply plays, so it never runs at the
+ * same time as the idle wake feed; the accumulators are separate
+ * anyway. No wake gain here: the caller already applied the SW
+ * gain, and the AEC wants the mic as recorded. The reference is
+ * the played PCM as written, unscaled; the AEC adapts to the
+ * codec/volume gain. "MNR": channel 0 mic, channel 1 unused,
+ * last channel playback reference. */
+bool muse_wake_bargein_feed(const int16_t *mic, const int16_t *ref, size_t frames)
+{
+    if (!muse_wake_bargein_ready() || !s_feed_buff || s_feed_chunksize <= 0) {
+        return false;
+    }
+    size_t in = 0;
+    bool speech = false;
+    while (in < frames) {
+        size_t room = (size_t)s_feed_chunksize - s_bargein_acc_len;
+        size_t take = frames - in < room ? frames - in : room;
+        for (size_t i = 0; i < take; i++) {
+            s_bargein_acc[s_bargein_acc_len + i] = mic[in + i];
+            s_bargein_ref_acc[s_bargein_acc_len + i] = ref[in + i];
+        }
+        s_bargein_acc_len += take;
+        in += take;
+        if (s_bargein_acc_len < (size_t)s_feed_chunksize) {
+            break;
+        }
+        for (int i = 0; i < s_feed_chunksize; i++) {
+            for (int ch = 0; ch < s_feed_nch; ch++) {
+                s_feed_buff[i * s_feed_nch + ch] = 0;
+            }
+            s_feed_buff[i * s_feed_nch] = s_bargein_acc[i];
+            s_feed_buff[i * s_feed_nch + (s_feed_nch - 1)] = s_bargein_ref_acc[i];
+        }
+        s_bargein_acc_len = 0;
+        s_afe_handle->feed(s_afe_data, s_feed_buff);
+        /* One tick of patience, as in the wake feed. */
+        afe_fetch_result_t *res = s_afe_handle->fetch_with_delay(s_afe_data, 1);
+        if (res && res->vad_state == VAD_SPEECH) {
+            speech = true;
+        }
+    }
+    return speech;
 }
 
 

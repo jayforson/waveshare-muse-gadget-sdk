@@ -107,6 +107,11 @@ static volatile bool s_wake_fired;
 #define CALL_SPEECH_DB (-45.0f)    /* speech starts above this */
 #define CALL_SILENCE_DB (-50.0f)   /* an utterance ends below this */
 #define CALL_GAP_CHUNKS 75         /* 1.5 s of silence ends an utterance */
+/* Voice barge-in (v6 trial, AEC+VAD): sustained VAD speech that
+ * interrupts a reply, and the grace after speech starts for the
+ * AEC to converge, so the reply's own onset cannot false-trigger. */
+#define BARGEIN_VAD_CHUNKS 15              /* 15 x 20 ms = 0.3 s of speech */
+#define BARGEIN_GRACE_FRAMES (MUSE_AUDIO_RATE / 2)   /* 0.5 s */
 /* No-speech hangup window, from Settings (default 5 s, 3..30 s);
  * polled live, so a change applies to the next window. */
 static int64_t silence_window_us(void)
@@ -491,6 +496,8 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
     size_t sent_at = 0;
     int64_t sent_page_t = 0;
     size_t played = 0;
+    int vad_speech = 0;   /* consecutive VAD-speech chunks (barge-in) */
+    const bool bargein = muse_wake_bargein_ready();   /* AEC fit at boot; fixed for this reply */
     int64_t t0 = esp_timer_get_time();
     *delivered = false;
     s_reply_failed = false;
@@ -602,16 +609,40 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
             muse_state_set_level(muse_audio_level(buf, n));
             muse_audio_write(buf, n);
             played += n;
+            /* Voice barge-in (v6 trial, AEC+VAD): while the reply
+             * plays, read the mic and feed mic + just-played PCM
+             * (reference) to the wake AFE's AEC; sustained VAD
+             * speech interrupts like a BOOT hold. The mic read
+             * paces this loop at real time (one 20 ms chunk per
+             * played chunk). Gated on a 0.5 s grace after speech
+             * starts, so the AEC can converge and the reply's own
+             * onset cannot false-trigger. */
+            if (bargein && muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) == ESP_OK) {
+                sw_gain(s_chunk, MUSE_AUDIO_CHUNK);
+                bool speech = muse_wake_bargein_feed(s_chunk, buf, n);
+                if (played >= BARGEIN_GRACE_FRAMES && speech) {
+                    if (++vad_speech >= BARGEIN_VAD_CHUNKS) {
+                        ESP_LOGI(TAG, "reply interrupted by voice (%d VAD chunks)", vad_speech);
+                        muse_hatch_turn_cancel();
+                        muse_state_set_level(0);
+                        return true;
+                    }
+                } else if (!speech) {
+                    vad_speech = 0;
+                }
+            }
         } else if (done) {
             break;
         } else if (speaking) {
+            vad_speech = 0;
             /* Between messages: keep the speaker fed so it doesn't replay stale DMA. */
             muse_state_set_level(0);
             muse_audio_write(silence, MUSE_AUDIO_CHUNK);
         }
-        /* No voice barge-in: only a BOOT hold (PTT_DOWN, checked above)
-         * interrupts a reply. The mic is not read during playback, so
-         * there is no voice-vs-speaker judgment to run. */
+        /* Voice barge-in runs in the audio block above (mic + played
+         * PCM through the AEC, VAD speech interrupts like a BOOT
+         * hold); a BOOT hold (PTT_DOWN, checked above) still works
+         * alongside it. */
         /* The page being said, or before the speech the reply's opening page. */
         if ((speaking || replied) && muse_hatch_turn_caption(played, page, sizeof(page))) {
             muse_state_set_caption("%s", page);

@@ -26,9 +26,15 @@
  * WakeNet detections. It needs the wake word model in the "model"
  * flash partition, picked in menuconfig under ESP Speech Recognition
  * (Jarvis first). With no model picked, waking never fires and the
- * voice task still works from BOOT. There is no voice barge-in: only
- * a BOOT hold interrupts a reply, so this file has no echo canceller
- * and no voice-vs-speaker judgment.
+ * voice task still works from BOOT.
+ *
+ * Voice barge-in (v6 trial, AEC+VAD): the same AFE is created with
+ * AEC on when it fits, and while a reply plays the voice task feeds
+ * mic + just-played PCM (reference) through muse_wake_bargein_feed;
+ * the AFE's VAD then reports speech on the echo-cancelled signal.
+ * If AEC does not fit (creation fails, or too little internal RAM
+ * is left for the call-time Scribe TLS), the AFE is recreated
+ * without AEC, barge-in is off, and waking works as before.
  *
  * When CONFIG_MUSE_WAKE is off (every board but the s185b overlay), the
  * inline fallbacks below keep the voice task compiling with waking
@@ -51,6 +57,19 @@ bool muse_wake_init(void);
  * moment the wake word is detected. False when the AFE is not ready. */
 bool muse_wake_feed(const int16_t *pcm, size_t frames);
 
+/* Voice barge-in: true when the AFE was created with AEC and is
+ * ready to judge speech during playback. False when AEC did not
+ * fit (barge-in off, waking unaffected). */
+bool muse_wake_bargein_ready(void);
+
+/* Feeds one paired chunk to the AFE during playback: mic audio and
+ * the PCM just played (reference), same length, 16 kHz mono.
+ * Returns true when the AFE's VAD reports speech on the
+ * echo-cancelled signal for the latest processed frame. False when
+ * barge-in is not ready, or the latest frame is silence. The
+ * caller counts sustained speech and decides when to interrupt. */
+bool muse_wake_bargein_feed(const int16_t *mic, const int16_t *ref, size_t frames);
+
 #else
 
 static inline bool muse_wake_init(void)
@@ -61,6 +80,19 @@ static inline bool muse_wake_init(void)
 static inline bool muse_wake_feed(const int16_t *pcm, size_t frames)
 {
     (void)pcm;
+    (void)frames;
+    return false;
+}
+
+static inline bool muse_wake_bargein_ready(void)
+{
+    return false;
+}
+
+static inline bool muse_wake_bargein_feed(const int16_t *mic, const int16_t *ref, size_t frames)
+{
+    (void)mic;
+    (void)ref;
     (void)frames;
     return false;
 }
