@@ -32,12 +32,15 @@
  *
  * Wake tuning, v6 experimental (2026-11-05, user report: "Hi, Wall E"
  * sometimes needs several shouts): three levers, all in this file.
- * (1) Threshold: set_wakenet_threshold(..., 1, 0.50) after create.
+ * (1) Threshold: set_wakenet_threshold(..., 1, 0.55) after create.
  * The wn9 model default is about 0.60-0.62 (the model name encodes
- * its range, e.g. ..._0.608_0.615); 0.50 is a moderate step down,
+ * its range, e.g. ..._0.608_0.615); 0.55 is a moderate step down,
  * inside the API's 0.4-0.9999 range. Lower catches more, at the
- * cost of more false triggers; 0.50 is the first step, not the
- * floor. (2) Noise suppression: TRIED in v6 and REVERTED the same
+ * cost of more false triggers. History: 0.50 (first step) caught
+ * the wake word but false-triggered constantly in the evening of
+ * 2026-11-05, so 0.55 is the middle ground; if it still
+ * false-triggers, the next lever is the wake gain, not a lower
+ * threshold. (2) Noise suppression: TRIED in v6 and REVERTED the same
  * day. ns_init = 1 created fine (pipeline showed NS(WebRTC)
  * engaged, threshold set rc=1), but the board then spammed
  * "Ringbuffer of AFE is empty" and wake stopped working entirely;
@@ -135,7 +138,7 @@ bool muse_wake_init(void)
     }
     int ns_applied = 0;
     /* Wake tuning v6: lower the detection threshold from the model
-     * default (~0.60-0.62) to 0.50. set_wakenet_threshold takes the
+     * default (~0.60-0.62) to 0.55. set_wakenet_threshold takes the
      * wakenet index (1: only model loaded) and a threshold in
      * 0.4-0.9999; it returns 1 on success, -1 on failure. A failure
      * here is not fatal: the model default stays in force and wake
@@ -145,9 +148,9 @@ bool muse_wake_init(void)
      * here and this call is the thing to drop. */
     int thr_rc = -1;
     if (s_afe_handle && s_afe_handle->set_wakenet_threshold) {
-        thr_rc = s_afe_handle->set_wakenet_threshold(s_afe_data, 1, 0.50f);
+        thr_rc = s_afe_handle->set_wakenet_threshold(s_afe_data, 1, 0.55f);
     }
-    ESP_LOGI(TAG, "wake tune v6: threshold 0.50 (set rc=%d), ns=%d, wake gain x2", thr_rc, ns_applied);
+    ESP_LOGI(TAG, "wake tune v6: threshold 0.55 (set rc=%d), ns=%d, wake gain x2", thr_rc, ns_applied);
     if (thr_rc != 1) {
         ESP_LOGW(TAG, "set_wakenet_threshold failed (rc=%d); model default threshold in force", thr_rc);
     }
