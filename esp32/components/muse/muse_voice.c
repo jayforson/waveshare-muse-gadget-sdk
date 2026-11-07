@@ -110,7 +110,7 @@ static volatile bool s_wake_fired;
 /* Voice barge-in (v6 trial, AEC+VAD): sustained VAD speech that
  * interrupts a reply, and the grace after speech starts for the
  * AEC to converge, so the reply's own onset cannot false-trigger. */
-#define BARGEIN_VAD_CHUNKS 15   /* 15 x 20 ms = 0.3 s of speech */
+#define BARGEIN_VAD_CHUNKS 50   /* 50 x 20 ms = 1.0 s of speech: the reply's own echo leaks through the AEC (the speaker's distortion is non-linear, so a linear canceller cannot remove it fully) and trips the VAD, so only a full second of sustained speech counts as an interruption; a short word alone no longer triggers it */
 #define BARGEIN_GRACE_US 500000   /* 0.5 s */
 
 /* Barge-in monitor (v6 trial, fix 2): the mic read + AFE feed run
@@ -495,14 +495,16 @@ static bool bargein_available(void)
 
 /* The barge-in monitor task: while the voice task is playing a reply
  * (s_bargein_active), reads the mic at its own pace and feeds mic +
- * the previously played chunk (reference) to the AEC; sustained VAD
+ * the latest played chunk (reference) to the AEC; sustained VAD
  * speech raises s_bargein_detected and the playback loop interrupts.
  * Runs only while active, so it never steals mic chunks from
  * idle_capture or record (it may hold one in-flight read when the
  * voice task stops playback, which lands inside the 200 ms drain
  * after an interrupt, or in the pre-roll, both harmless). The
- * reference is the previous chunk (1-chunk delay): the mic chunk
- * read now holds echo of audio played about a chunk ago. */
+ * reference is the latest chunk the voice task wrote: the echo in
+ * the mic chunk read now is of audio played over the last ~20 ms,
+ * so the latest chunk is roughly aligned with it (the AEC tolerates
+ * the sub-chunk lag). */
 static void bargein_task(void *arg)
 {
     (void)arg;
@@ -725,7 +727,7 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
             played += n;
             if (bargein) {
                 /* Hand the played chunk to the monitor as the AEC
-                 * reference (previous chunk, 1-chunk delay).
+                 * reference (latest chunk; see bargein_task).
                  * Zero-pad a partial chunk so its tail is not a
                  * stale reference. */
                 uint32_t slot = s_bargein_ref_seq % 2;
