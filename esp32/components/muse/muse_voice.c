@@ -462,6 +462,7 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
 }
 
 static void go_idle(const char *caption);
+static const char *not_ready_reason(void);
 
 /*
  * Plays Hatch's reply as it arrives, with its text as the caption. Returns
@@ -492,6 +493,10 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
     int64_t sent_page_t = 0;
     size_t played = 0;
     int64_t t0 = esp_timer_get_time();
+    /* Send-confirm cap, read once per wait: the server ACK (EV_SENT) must
+     * arrive within the setting, or the note never reached Muse. A change
+     * applies to the next turn. */
+    int64_t send_cap_us = (int64_t)muse_settings_send_timeout_s() * 1000000LL;
     *delivered = false;
     s_reply_failed = false;
     for (;;) {
@@ -591,6 +596,25 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
             muse_hatch_turn_cancel();
             muse_state_set_level(0);
             return true;
+        }
+        /* Send-confirm cap (voice turns only): the server ACK (EV_SENT)
+         * must arrive within the setting, or the note never reached Muse
+         * and the board would sit on SENDING VOICE NOTE forever. A push
+         * (waiting == "") has no send to confirm, so it never times out
+         * here. The reply wait after EV_SENT has no voice-task cap: a
+         * late reply still arrives as a flagged idle push. On timeout
+         * the message is not shown (no ACK, so no sent transcript) and
+         * the cause is the link state at the moment it gave up, not a
+         * generic failure. */
+        if (waiting[0] != '\0' && !*delivered &&
+            esp_timer_get_time() - t0 > send_cap_us) {
+            ESP_LOGW(TAG, "send not confirmed after %ds",
+                     muse_settings_send_timeout_s());
+            muse_hatch_turn_cancel();
+            muse_state_set_level(0);
+            s_reply_failed = true;
+            go_idle(muse_hatch_ready() ? "MUSE DIDN'T RESPOND" : not_ready_reason());
+            return false;
         }
         size_t n = muse_hatch_turn_read(buf, MUSE_AUDIO_CHUNK, speaking || done ? 0 : 20);
         if (n) {

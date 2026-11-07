@@ -45,6 +45,9 @@
 #define MUSE_WAKE_GAIN_MIN 10          /* tenths, x1.0 */
 #define MUSE_WAKE_GAIN_MAX 30          /* tenths, x3.0 */
 #define MUSE_WAKE_GAIN_DEFAULT 20      /* tenths, x2.0 (v6 wake tune) */
+#define MUSE_SEND_TIMEOUT_S_MIN 10     /* send-confirm wait, seconds */
+#define MUSE_SEND_TIMEOUT_S_MAX 60
+#define MUSE_SEND_TIMEOUT_S_DEFAULT 15
 
 typedef enum {
     MUSE_SETTING_VOLUME,
@@ -93,6 +96,7 @@ int muse_settings_wake_gain(void);       /* tenths, 10..30 (x1.0..x3.0) */
 int muse_settings_mic_gain(void);       /* dB, 0..MUSE_MIC_GAIN_MAX */
 int muse_settings_sw_gain(void);        /* multiplier, 1..MUSE_SW_GAIN_MAX */
 int muse_settings_silence_s(void);      /* no-speech hangup window, seconds */
+int muse_settings_send_timeout_s(void);  /* send-confirm wait, seconds */
 int muse_settings_brightness(void);     /* 10..100 */
 int muse_settings_sleep_s(void);        /* 0 = never */
 bool muse_settings_wifi_on(void);
@@ -114,6 +118,7 @@ void muse_settings_set_wake_gain(int tenths);
 void muse_settings_set_mic_gain(int db);
 void muse_settings_set_sw_gain(int mul);
 void muse_settings_set_silence_s(int secs);
+void muse_settings_set_send_timeout_s(int secs);
 void muse_settings_set_brightness(int pct);
 void muse_settings_set_sleep_s(int secs);
 void muse_settings_set_wifi_on(bool on);

@@ -98,7 +98,7 @@ static lv_obj_t *s_ble_sw, *s_ble_status;
 static lv_obj_t *s_spk_sw, *s_vol_val, *s_vol_sl, *s_speakall_sw, *s_speech_err;
 
 /* Mic page. */
-static lv_obj_t *s_gain_val, *s_gain_sl, *s_sw_val, *s_sw_sl, *s_wthr_val, *s_wthr_sl, *s_wgain_val, *s_wgain_sl, *s_wakebatt_sw, *s_sil_val, *s_sil_sl, *s_mic_bar, *s_mic_val;
+static lv_obj_t *s_gain_val, *s_gain_sl, *s_sw_val, *s_sw_sl, *s_wthr_val, *s_wthr_sl, *s_wgain_val, *s_wgain_sl, *s_wakebatt_sw, *s_sil_val, *s_sil_sl, *s_sendto_val, *s_sendto_sl, *s_mic_bar, *s_mic_val;
 
 /* Display page (brightness + auto-sleep). */
 static lv_obj_t *s_bright_val, *s_bright_sl;
@@ -1034,6 +1034,15 @@ static void on_silence(lv_event_t *e)
     }
 }
 
+static void on_send_timeout(lv_event_t *e)
+{
+    int secs = lv_slider_get_value(s_sendto_sl);
+    set_val(s_sendto_val, "%ds", secs);
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+        muse_settings_set_send_timeout_s(secs);
+    }
+}
+
 static void on_bright(lv_event_t *e)
 {
     int v = lv_slider_get_value(s_bright_sl);
@@ -1130,6 +1139,7 @@ static void build_mic_page(lv_obj_t *tile)
     s_wgain_sl = slider(list, "Wake gain", MUSE_WAKE_GAIN_MIN, MUSE_WAKE_GAIN_MAX, muse_settings_wake_gain(), &s_wgain_val, on_wake_gain);
     s_wakebatt_sw = switch_row(list, "Wake on battery", muse_settings_wake_on_battery(), on_wakebatt_sw);
     s_sil_sl = slider(list, "Silence timeout", MUSE_SILENCE_S_MIN, MUSE_SILENCE_S_MAX, muse_settings_silence_s(), &s_sil_val, on_silence);
+    s_sendto_sl = slider(list, "Send timeout", MUSE_SEND_TIMEOUT_S_MIN, MUSE_SEND_TIMEOUT_S_MAX, muse_settings_send_timeout_s(), &s_sendto_val, on_send_timeout);
 
     lv_obj_t *meter = lv_obj_create(list);
     lv_obj_remove_style_all(meter);
@@ -1157,6 +1167,7 @@ static void build_mic_page(lv_obj_t *tile)
         set_text(s_wgain_val, buf);
     }
     set_val(s_sil_val, "%ds", muse_settings_silence_s());
+    set_val(s_sendto_val, "%ds", muse_settings_send_timeout_s());
 }
 
 static void tick_mic(void)
