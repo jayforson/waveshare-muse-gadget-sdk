@@ -93,6 +93,7 @@ static int16_t *s_bargein_acc;      /* mic samples waiting for a full AFE frame 
 static int16_t *s_bargein_ref_acc;  /* reference samples, paired with s_bargein_acc */
 static size_t s_bargein_acc_len;
 static bool s_bargein_vad_speech;   /* VAD state of the last completed AFE frame (sticky) */
+static bool s_bargein_wake_detected;   /* wake word heard during playback (sticky; see below) */
 
 
 static void heap_log(const char *what)
@@ -327,18 +328,37 @@ bool muse_wake_bargein_feed(const int16_t *mic, const int16_t *ref, size_t frame
         afe_fetch_result_t *res = s_afe_handle->fetch_with_delay(s_afe_data, 1);
         if (res) {
             s_bargein_vad_speech = (res->vad_state == VAD_SPEECH);
+            /* The wake word is the barge-in trigger (see the monitor
+             * task): the reply's own echo trips the VAD continuously,
+             * so VAD speech cannot be the trigger, but the keyword
+             * spotter only fires on "Hi Wall E" and ignores the TTS
+             * echo. Sticky: once heard it stays up until the next
+             * reset, so a poll every 20 ms cannot miss it. */
+            if (res->wakeup_state == WAKENET_DETECTED) {
+                s_bargein_wake_detected = true;
+            }
         }
     }
     return s_bargein_vad_speech;
 }
 
-/* Clears the barge-in feed state for a new reply: the partial frame
- * and the sticky VAD, so a previous reply's tail cannot trigger the
- * next one. */
+/* True when the wake word was heard during the current reply. The
+ * VAD state is still returned by the feed (and still sticky), but
+ * nothing counts it any more: it cannot tell the user's voice from
+ * the reply's echo. */
+bool muse_wake_bargein_wake_detected(void)
+{
+    return s_bargein_wake_detected;
+}
+
+/* Clears the barge-in feed state for a new reply: the partial frame,
+ * the sticky VAD and the sticky wake-word flag, so a previous
+ * reply's tail cannot trigger the next one. */
 void muse_wake_bargein_reset(void)
 {
     s_bargein_acc_len = 0;
     s_bargein_vad_speech = false;
+    s_bargein_wake_detected = false;
 }
 
 

@@ -67,17 +67,25 @@ bool muse_wake_bargein_ready(void);
  * Returns the AFE's VAD state for the latest processed frame:
  * true when it reports speech on the echo-cancelled signal, false
  * when it reports silence. The state is sticky across calls: a
- * feed that does not complete a frame leaves it unchanged, so the
- * caller can count wall-clock speech instead of completed frames
- * (a 320-sample feed completes a frame only every ~1.6 calls, and
- * treating the in-between calls as silence resets the count every
- * other call, so it can never reach the threshold). The caller
- * counts sustained speech and decides when to interrupt. */
+ * feed that does not complete a frame leaves it unchanged. The
+ * return value is kept for diagnosis only; nothing interrupts on
+ * it any more, because the reply's own echo (distorted by the
+ * speaker, so the linear AEC cannot remove it fully) trips the
+ * VAD continuously, and the echo is louder than the user's voice
+ * at the mic, so no VAD threshold or level gate can separate the
+ * two. The trigger is the wake word instead (see below): the
+ * keyword spotter only fires on "Hi Wall E" and ignores the TTS
+ * echo. */
 bool muse_wake_bargein_feed(const int16_t *mic, const int16_t *ref, size_t frames);
 
-/* Clears the barge-in feed state for a new reply: the partial frame
- * and the sticky VAD, so a previous reply's tail cannot trigger the
- * next one. */
+/* True when the wake word was heard during the current reply
+ * (sticky until the next reset). This is the barge-in trigger:
+ * say "Hi Wall E" to interrupt a reply. */
+bool muse_wake_bargein_wake_detected(void);
+
+/* Clears the barge-in feed state for a new reply: the partial frame,
+ * the sticky VAD and the sticky wake-word flag, so a previous
+ * reply's tail cannot trigger the next one. */
 void muse_wake_bargein_reset(void);
 
 #else
@@ -104,6 +112,11 @@ static inline bool muse_wake_bargein_feed(const int16_t *mic, const int16_t *ref
     (void)mic;
     (void)ref;
     (void)frames;
+    return false;
+}
+
+static inline bool muse_wake_bargein_wake_detected(void)
+{
     return false;
 }
 

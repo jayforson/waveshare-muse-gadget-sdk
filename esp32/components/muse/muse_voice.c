@@ -107,11 +107,12 @@ static volatile bool s_wake_fired;
 #define CALL_SPEECH_DB (-45.0f)    /* speech starts above this */
 #define CALL_SILENCE_DB (-50.0f)   /* an utterance ends below this */
 #define CALL_GAP_CHUNKS 75         /* 1.5 s of silence ends an utterance */
-/* Voice barge-in (v6 trial, AEC+VAD): sustained VAD speech that
- * interrupts a reply, and the grace after speech starts for the
- * AEC to converge, so the reply's own onset cannot false-trigger. */
-#define BARGEIN_VAD_CHUNKS 50   /* 50 x 20 ms = 1.0 s of speech: the reply's own echo leaks through the AEC (the speaker's distortion is non-linear, so a linear canceller cannot remove it fully) and trips the VAD, so only a full second of sustained speech counts as an interruption; a short word alone no longer triggers it */
-#define BARGEIN_GRACE_US 500000   /* 0.5 s */
+/* Voice barge-in (v6 trial, AEC + wake word): the wake word heard
+ * during a reply interrupts it, and the grace after speech starts
+ * lets the AEC settle before listening. (Earlier VAD-based tries
+ * self-interrupted on the reply's own echo; see the monitor
+ * task.) */
+#define BARGEIN_GRACE_US 500000   /* 0.5 s, let the AEC settle before listening for the wake word */
 
 /* Barge-in monitor (v6 trial, fix 2): the mic read + AFE feed run
  * on their own task, not in the playback loop. Reading the mic
@@ -121,8 +122,8 @@ static volatile bool s_wake_fired;
  * reset on every feed that did not complete an AFE frame, so it
  * could never reach the threshold. The monitor task reads the mic
  * at its own 20 ms pace, feeds mic + the last played chunk
- * (reference) to the AEC, and raises s_bargein_detected on
- * sustained VAD speech; the playback loop only checks that flag.
+ * (reference) to the AEC, and raises s_bargein_detected when the
+ * wake word is heard; the playback loop only checks that flag.
  * The reference ring and the monitor stack live in PSRAM, so this
  * costs no internal RAM. */
 static volatile bool s_bargein_active;     /* voice task sets, monitor reads */
@@ -495,38 +496,45 @@ static bool bargein_available(void)
 
 /* The barge-in monitor task: while the voice task is playing a reply
  * (s_bargein_active), reads the mic at its own pace and feeds mic +
- * the latest played chunk (reference) to the AEC; sustained VAD
- * speech raises s_bargein_detected and the playback loop interrupts.
- * Runs only while active, so it never steals mic chunks from
- * idle_capture or record (it may hold one in-flight read when the
- * voice task stops playback, which lands inside the 200 ms drain
- * after an interrupt, or in the pre-roll, both harmless). The
- * reference is the latest chunk the voice task wrote: the echo in
- * the mic chunk read now is of audio played over the last ~20 ms,
- * so the latest chunk is roughly aligned with it (the AEC tolerates
- * the sub-chunk lag). */
+ * the latest played chunk (reference) to the AEC; a detected wake
+ * word ("Hi Wall E") raises s_bargein_detected and the playback
+ * loop interrupts. The trigger is the wake word, NOT any VAD
+ * speech: three VAD-based tries (in-loop counting, monitor task,
+ * 1 s threshold) all self-interrupted, because the reply's own
+ * echo leaks through the AEC and trips the VAD continuously - the
+ * speaker's distortion is non-linear, so a linear canceller cannot
+ * remove it, and the echo is louder than the user's voice at the
+ * mic, so no threshold or level gate can separate the two. The
+ * keyword spotter only fires on the wake word itself and ignores
+ * the TTS echo, so it is the reliable trigger. Runs only while
+ * active, so it never steals mic chunks from idle_capture or
+ * record (it may hold one in-flight read when the voice task stops
+ * playback, which lands inside the 200 ms drain after an
+ * interrupt, or in the pre-roll, both harmless). The reference is
+ * the latest chunk the voice task wrote: the echo in the mic chunk
+ * read now is of audio played over the last ~20 ms, so the latest
+ * chunk is roughly aligned with it (the AEC tolerates the
+ * sub-chunk lag). */
 static void bargein_task(void *arg)
 {
     (void)arg;
     uint32_t last_seq = 0;
-    int vad_speech = 0;
     int64_t active_since = 0;
     for (;;) {
         if (!s_bargein_active) {
             last_seq = s_bargein_ref_seq;
-            vad_speech = 0;
             active_since = 0;
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
         if (active_since == 0) {
             /* Fresh activation: clear the AFE's partial frame and
-             * sticky VAD, so the previous reply cannot trigger this
-             * one; the 0.5 s grace lets the AEC converge. */
+             * sticky wake-word flag, so the previous reply cannot
+             * trigger this one; the 0.5 s grace lets the AEC
+             * converge before listening for the wake word. */
             muse_wake_bargein_reset();
             active_since = esp_timer_get_time();
             last_seq = s_bargein_ref_seq;
-            vad_speech = 0;
         }
         if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(20));
@@ -545,22 +553,18 @@ static void bargein_task(void *arg)
          * torn by a concurrent write. */
         const int16_t *ref = s_bargein_ref[(seq - 1) % 2];
         last_seq = seq;
-        bool speech = muse_wake_bargein_feed(s_chunk, ref, MUSE_AUDIO_CHUNK);
-        if (esp_timer_get_time() - active_since >= BARGEIN_GRACE_US) {
-            if (speech) {
-                if (++vad_speech >= BARGEIN_VAD_CHUNKS) {
-                    s_bargein_detected = true;
-                    /* Wait here until the voice task stops playback;
-                     * do not re-arm or feed while the flag is up. */
-                    while (s_bargein_active) {
-                        vTaskDelay(pdMS_TO_TICKS(20));
-                    }
-                    vad_speech = 0;
-                    active_since = 0;
-                }
-            } else {
-                vad_speech = 0;
+        /* Feed mic + reference so the AFE (AEC + WakeNet) hears the
+         * room; the VAD return is ignored (see above). */
+        muse_wake_bargein_feed(s_chunk, ref, MUSE_AUDIO_CHUNK);
+        if (esp_timer_get_time() - active_since >= BARGEIN_GRACE_US
+            && muse_wake_bargein_wake_detected()) {
+            s_bargein_detected = true;
+            /* Wait here until the voice task stops playback;
+             * do not re-arm or feed while the flag is up. */
+            while (s_bargein_active) {
+                vTaskDelay(pdMS_TO_TICKS(20));
             }
+            active_since = 0;
         }
     }
 }
@@ -699,9 +703,9 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
             s_bargein_active = false;
             return true;
         }
-        /* Voice barge-in: the monitor task raised this on sustained
-         * VAD speech while the reply plays; interrupt like a BOOT
-         * hold. The call loop then re-listens at once. */
+        /* Voice barge-in: the monitor task heard the wake word
+         * while the reply plays; interrupt like a BOOT hold. The
+         * call loop then re-listens at once. */
         if (s_bargein_detected) {
             ESP_LOGI(TAG, "reply interrupted by voice");
             s_bargein_detected = false;
