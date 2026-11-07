@@ -39,6 +39,12 @@
 #define MUSE_SILENCE_S_MIN 3      /* no-speech hangup window, seconds */
 #define MUSE_SILENCE_S_MAX 30
 #define MUSE_SILENCE_S_DEFAULT 5
+#define MUSE_WAKE_THRESHOLD_MIN 40      /* hundredths, 0.40 */
+#define MUSE_WAKE_THRESHOLD_MAX 90      /* hundredths, 0.90 */
+#define MUSE_WAKE_THRESHOLD_DEFAULT 55  /* hundredths, 0.55 (v6 wake tune) */
+#define MUSE_WAKE_GAIN_MIN 10          /* tenths, x1.0 */
+#define MUSE_WAKE_GAIN_MAX 30          /* tenths, x3.0 */
+#define MUSE_WAKE_GAIN_DEFAULT 20      /* tenths, x2.0 (v6 wake tune) */
 
 typedef enum {
     MUSE_SETTING_VOLUME,
@@ -52,6 +58,8 @@ typedef enum {
     MUSE_SETTING_HATCH,
     MUSE_SETTING_SPEAK_ALL,
     MUSE_SETTING_WAKE_BATTERY,
+    MUSE_SETTING_WAKE_THRESHOLD,
+    MUSE_SETTING_WAKE_GAIN,
 } muse_setting_t;
 
 /* Last speech (TTS) failure, for diagnosis without a serial log. Saved in
@@ -80,6 +88,8 @@ int muse_settings_tts_fail_reason(void);  /* TTS_FAIL_* above, 0 = none */
 int muse_settings_tts_fail_status(void);  /* HTTP status for TTS_FAIL_STATUS, else 0 */
 void muse_settings_tts_fail_text(char *buf, size_t cap);  /* "—" when none */
 bool muse_settings_wake_on_battery(void);  /* on: Jarvis wake arms even when the board reports battery */
+int muse_settings_wake_threshold(void);  /* hundredths, 40..90 (0.40..0.90) */
+int muse_settings_wake_gain(void);       /* tenths, 10..30 (x1.0..x3.0) */
 int muse_settings_mic_gain(void);       /* dB, 0..MUSE_MIC_GAIN_MAX */
 int muse_settings_sw_gain(void);        /* multiplier, 1..MUSE_SW_GAIN_MAX */
 int muse_settings_silence_s(void);      /* no-speech hangup window, seconds */
@@ -99,6 +109,8 @@ void muse_settings_set_speaker_on(bool on);
 void muse_settings_set_speak_all(bool on);
 void muse_settings_set_tts_fail(int reason, int status);  /* diagnostic only, no notify */
 void muse_settings_set_wake_on_battery(bool on);
+void muse_settings_set_wake_threshold(int hundredths);
+void muse_settings_set_wake_gain(int tenths);
 void muse_settings_set_mic_gain(int db);
 void muse_settings_set_sw_gain(int mul);
 void muse_settings_set_silence_s(int secs);

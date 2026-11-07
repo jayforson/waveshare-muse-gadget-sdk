@@ -30,6 +30,7 @@
 #include "muse_state.h"
 #include "muse_ui.h"
 #include "muse_voice.h"
+#include "muse_wake.h"
 #include "muse_wifi.h"
 
 static const char *TAG = "muse";
@@ -53,8 +54,13 @@ static void on_setting(muse_setting_t what)
     case MUSE_SETTING_HATCH:
         muse_hatch_config_changed();
         break;
+    case MUSE_SETTING_WAKE_THRESHOLD:
+        muse_wake_apply_threshold();
+        break;
     default:
-        break;   /* brightness, sleep and the speaker are polled where they're used */
+        break;   /* brightness, sleep, the speaker and the wake gain are
+                  * polled where they're used (the wake gain is read live
+                  * in the wake feed) */
     }
 }
 

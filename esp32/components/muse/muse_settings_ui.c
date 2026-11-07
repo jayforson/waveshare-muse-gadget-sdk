@@ -60,7 +60,7 @@ typedef void (*text_done_cb_t)(const char *text);
 static int s_text_scale = 466;
 static lv_obj_t *s_tile;
 static lv_obj_t *s_current;
-static lv_obj_t *s_home, *s_wifi, *s_hatch, *s_ble, *s_sound, *s_sleep, *s_battery, *s_power, *s_text;
+static lv_obj_t *s_home, *s_wifi, *s_hatch, *s_ble, *s_speaker, *s_mic, *s_display, *s_battery, *s_power, *s_text;
 
 /*
  * Only home is kept. A sub-page is built when it opens and deleted on the way
@@ -73,7 +73,7 @@ typedef struct {
 } page_t;
 
 /* Home values. */
-static lv_obj_t *s_home_wifi, *s_home_hatch, *s_home_speakall, *s_home_wakebatt, *s_home_ble, *s_home_sound, *s_home_sleep, *s_home_battery, *s_about;
+static lv_obj_t *s_home_wifi, *s_home_hatch, *s_home_ble, *s_home_speaker, *s_home_mic, *s_home_display, *s_home_battery, *s_about;
 
 /* Wi-Fi page. */
 static lv_obj_t *s_wifi_sw, *s_wifi_status, *s_wifi_saved, *s_wifi_scan_btn, *s_wifi_scan_lbl, *s_wifi_list;
@@ -94,10 +94,14 @@ static int64_t s_link_reset_armed_us;
 /* Bluetooth page. */
 static lv_obj_t *s_ble_sw, *s_ble_status;
 
-/* Sound page. */
-static lv_obj_t *s_spk_sw, *s_vol_val, *s_vol_sl, *s_gain_val, *s_gain_sl, *s_sw_val, *s_sw_sl, *s_sil_val, *s_sil_sl, *s_bright_val, *s_bright_sl, *s_mic_bar, *s_mic_val, *s_speech_err;
+/* Speaker page. */
+static lv_obj_t *s_spk_sw, *s_vol_val, *s_vol_sl, *s_speakall_sw, *s_speech_err;
 
-/* Sleep page. */
+/* Mic page. */
+static lv_obj_t *s_gain_val, *s_gain_sl, *s_sw_val, *s_sw_sl, *s_wthr_val, *s_wthr_sl, *s_wgain_val, *s_wgain_sl, *s_wakebatt_sw, *s_sil_val, *s_sil_sl, *s_mic_bar, *s_mic_val;
+
+/* Display page (brightness + auto-sleep). */
+static lv_obj_t *s_bright_val, *s_bright_sl;
 static const int SLEEP_CHOICES[] = { 0, 30, 60, 120, 300, 600 };
 static const char *const SLEEP_NAMES[] = { "Never", "30 seconds", "1 minute", "2 minutes", "5 minutes", "10 minutes" };
 #define SLEEP_COUNT (int)(sizeof(SLEEP_CHOICES) / sizeof(SLEEP_CHOICES[0]))
@@ -366,7 +370,7 @@ static lv_obj_t *info_row(lv_obj_t *list, const char *text)
 
 static void drop(lv_obj_t *p)
 {
-    lv_obj_t **const pages[] = { &s_wifi, &s_hatch, &s_ble, &s_sound, &s_sleep, &s_battery, &s_power, &s_text };
+    lv_obj_t **const pages[] = { &s_wifi, &s_hatch, &s_ble, &s_speaker, &s_mic, &s_display, &s_battery, &s_power, &s_text };
     for (size_t i = 0; i < sizeof(pages) / sizeof(pages[0]); i++) {
         if (*pages[i] == p) {
             *pages[i] = NULL;
@@ -384,12 +388,12 @@ static void show(lv_obj_t *p)
     if (prev) {
         lv_obj_add_flag(prev, LV_OBJ_FLAG_HIDDEN);
     }
-    if (prev == s_sound) {
+    if (prev == s_mic) {
         muse_voice_set_monitor(false);
     }
     lv_obj_remove_flag(p, LV_OBJ_FLAG_HIDDEN);
     s_current = p;
-    if (p == s_sound) {
+    if (p == s_mic) {
         muse_voice_set_monitor(true);
     }
     muse_ui_set_swipe_enabled(p == s_home);
@@ -1041,14 +1045,90 @@ static void on_bright(lv_event_t *e)
     }
 }
 
-static void build_sound_page(lv_obj_t *tile)
+/* Wake threshold, hundredths (40..90 = 0.40..0.90). set_val is int-only,
+ * so the value is formatted here. */
+static void on_wake_threshold(lv_event_t *e)
+{
+    int v = lv_slider_get_value(s_wthr_sl);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.2f", v / 100.0f);
+    set_text(s_wthr_val, buf);
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+        muse_settings_set_wake_threshold(v);
+    }
+}
+
+/* Wake gain, tenths (10..30 = x1.0..x3.0). */
+static void on_wake_gain(lv_event_t *e)
+{
+    int v = lv_slider_get_value(s_wgain_sl);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "x%.1f", v / 10.0f);
+    set_text(s_wgain_val, buf);
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+        muse_settings_set_wake_gain(v);
+    }
+}
+
+/* On: every push is spoken. Off (the default): only current-conversation
+ * content is spoken (a reply, or a late reply to a dead turn); automatic
+ * pushes are dropped before any TTS or decode, so they can neither wake
+ * the screen nor wedge the speech worker. The connection stays up either
+ * way, since late replies arrive over it. */
+static void on_speakall_sw(lv_event_t *e)
+{
+    muse_settings_set_speak_all(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
+static void on_wakebatt_sw(lv_event_t *e)
+{
+    muse_settings_set_wake_on_battery(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
+static void build_speaker_page(lv_obj_t *tile)
 {
     lv_obj_t *list;
-    s_sound = page(tile, "SOUND", true, &list);
+    s_speaker = page(tile, "SPEAKER", true, &list);
     s_spk_sw = switch_row(list, "Speaker", muse_settings_speaker_on(), on_speaker_sw);
     s_vol_sl = slider(list, "Volume", 0, 100, muse_settings_volume(), &s_vol_val, on_volume);
+    s_speakall_sw = switch_row(list, "Speak all pushes", muse_settings_speak_all(), on_speakall_sw);
+
+    set_val(s_vol_val, "%d%%", muse_settings_volume());
+
+    /* Last speech failure, if any: "—" means speech last worked. Cleared by
+     * the next successful speech fetch. */
+    s_speech_err = info_row(list, "Speech error");
+}
+
+static void tick_speaker(void)
+{
+    bool on = muse_settings_speaker_on();   /* also toggled from the face */
+    if (on != lv_obj_has_state(s_spk_sw, LV_STATE_CHECKED)) {
+        lv_obj_set_state(s_spk_sw, LV_STATE_CHECKED, on);
+    }
+    int vol = muse_settings_volume();   /* also dragged on the face, or set from the phone */
+    if (vol != lv_slider_get_value(s_vol_sl) && !lv_obj_has_state(s_vol_sl, LV_STATE_PRESSED)) {
+        lv_slider_set_value(s_vol_sl, vol, LV_ANIM_OFF);
+        set_val(s_vol_val, "%d%%", vol);
+    }
+    bool speak_all = muse_settings_speak_all();
+    if (speak_all != lv_obj_has_state(s_speakall_sw, LV_STATE_CHECKED)) {
+        lv_obj_set_state(s_speakall_sw, LV_STATE_CHECKED, speak_all);
+    }
+    char fail[32];
+    muse_settings_tts_fail_text(fail, sizeof(fail));
+    set_text(s_speech_err, fail);
+}
+
+static void build_mic_page(lv_obj_t *tile)
+{
+    lv_obj_t *list;
+    s_mic = page(tile, "MIC", true, &list);
     s_gain_sl = slider(list, "Mic gain", 0, MUSE_MIC_GAIN_MAX / 3, muse_settings_mic_gain() / 3, &s_gain_val, on_gain);
     s_sw_sl = slider(list, "SW gain", 1, MUSE_SW_GAIN_MAX, muse_settings_sw_gain(), &s_sw_val, on_sw_gain);
+    s_wthr_sl = slider(list, "Wake threshold", MUSE_WAKE_THRESHOLD_MIN, MUSE_WAKE_THRESHOLD_MAX, muse_settings_wake_threshold(), &s_wthr_val, on_wake_threshold);
+    s_wgain_sl = slider(list, "Wake gain", MUSE_WAKE_GAIN_MIN, MUSE_WAKE_GAIN_MAX, muse_settings_wake_gain(), &s_wgain_val, on_wake_gain);
+    s_wakebatt_sw = switch_row(list, "Wake on battery", muse_settings_wake_on_battery(), on_wakebatt_sw);
     s_sil_sl = slider(list, "Silence timeout", MUSE_SILENCE_S_MIN, MUSE_SILENCE_S_MAX, muse_settings_silence_s(), &s_sil_val, on_silence);
 
     lv_obj_t *meter = lv_obj_create(list);
@@ -1067,29 +1147,23 @@ static void build_sound_page(lv_obj_t *tile)
     lv_obj_set_style_anim_duration(s_mic_bar, 80, 0);
     note(list, "Talk at arm's length: the bar should reach green (-30 to -15 dBFS) without going orange.");
 
-    s_bright_sl = slider(list, "Brightness", 10, 100, muse_settings_brightness(), &s_bright_val, on_bright);
-
-    set_val(s_vol_val, "%d%%", muse_settings_volume());
     set_val(s_gain_val, "%d dB", muse_settings_mic_gain() / 3 * 3);
     set_val(s_sw_val, "x%d", muse_settings_sw_gain());
+    {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%.2f", muse_settings_wake_threshold() / 100.0f);
+        set_text(s_wthr_val, buf);
+        snprintf(buf, sizeof(buf), "x%.1f", muse_settings_wake_gain() / 10.0f);
+        set_text(s_wgain_val, buf);
+    }
     set_val(s_sil_val, "%ds", muse_settings_silence_s());
-    set_val(s_bright_val, "%d%%", muse_settings_brightness());
-
-    /* Last speech failure, if any: "—" means speech last worked. Cleared by
-     * the next successful speech fetch. */
-    s_speech_err = info_row(list, "Speech error");
 }
 
-static void tick_sound(void)
+static void tick_mic(void)
 {
-    bool on = muse_settings_speaker_on();   /* also toggled from the face */
-    if (on != lv_obj_has_state(s_spk_sw, LV_STATE_CHECKED)) {
-        lv_obj_set_state(s_spk_sw, LV_STATE_CHECKED, on);
-    }
-    int vol = muse_settings_volume();   /* also dragged on the face, or set from the phone */
-    if (vol != lv_slider_get_value(s_vol_sl) && !lv_obj_has_state(s_vol_sl, LV_STATE_PRESSED)) {
-        lv_slider_set_value(s_vol_sl, vol, LV_ANIM_OFF);
-        set_val(s_vol_val, "%d%%", vol);
+    bool wakebatt = muse_settings_wake_on_battery();
+    if (wakebatt != lv_obj_has_state(s_wakebatt_sw, LV_STATE_CHECKED)) {
+        lv_obj_set_state(s_wakebatt_sw, LV_STATE_CHECKED, wakebatt);
     }
     float db = muse_voice_monitor_db();
     int v = (int)(db + 70.0f);
@@ -1098,12 +1172,9 @@ static void tick_sound(void)
     uint32_t color = db > -12.0f ? COLOR_WARN : (db > -30.0f ? COLOR_OK : COLOR_ACCENT);
     lv_obj_set_style_bg_color(s_mic_bar, lv_color_hex(color), LV_PART_INDICATOR);
     set_val(s_mic_val, "%d dBFS", (int)db);
-    char fail[32];
-    muse_settings_tts_fail_text(fail, sizeof(fail));
-    set_text(s_speech_err, fail);
 }
 
-/* ---------- Sleep ---------- */
+/* ---------- Display ---------- */
 
 static void on_sleep_choice(lv_event_t *e)
 {
@@ -1116,10 +1187,12 @@ static void on_sleep_now(lv_event_t *e)
     muse_state_set_asleep(true);
 }
 
-static void build_sleep_page(lv_obj_t *tile)
+static void build_display_page(lv_obj_t *tile)
 {
     lv_obj_t *list;
-    s_sleep = page(tile, "AUTO-SLEEP", true, &list);
+    s_display = page(tile, "DISPLAY", true, &list);
+    s_bright_sl = slider(list, "Brightness", 10, 100, muse_settings_brightness(), &s_bright_val, on_bright);
+    set_val(s_bright_val, "%d%%", muse_settings_brightness());
     note(list, "Turn the screen off after Muse has been idle for:");
     for (int i = 0; i < SLEEP_COUNT; i++) {
         row(list, NULL, SLEEP_NAMES[i], &s_sleep_checks[i], on_sleep_choice, (void *)(intptr_t)i);
@@ -1139,7 +1212,7 @@ static const char *sleep_name(int secs)
     return "Custom";
 }
 
-static void tick_sleep(void)
+static void tick_display(void)
 {
     int cur = muse_settings_sleep_s();
     for (int i = 0; i < SLEEP_COUNT; i++) {
@@ -1236,25 +1309,11 @@ static void build_power_page(lv_obj_t *tile)
 static const page_t WIFI = { &s_wifi, build_wifi_page };
 static const page_t HATCH = { &s_hatch, build_hatch_page };
 static const page_t BLE = { &s_ble, build_ble_page };
-static const page_t SOUND = { &s_sound, build_sound_page };
-static const page_t SLEEP = { &s_sleep, build_sleep_page };
+static const page_t SPEAKER = { &s_speaker, build_speaker_page };
+static const page_t MIC = { &s_mic, build_mic_page };
+static const page_t DISPLAY = { &s_display, build_display_page };
 static const page_t BATTERY = { &s_battery, build_battery_page };
 static const page_t POWER = { &s_power, build_power_page };
-
-/* On: every push is spoken. Off (the default): only current-conversation
- * content is spoken (a reply, or a late reply to a dead turn); automatic
- * pushes are dropped before any TTS or decode, so they can neither wake
- * the screen nor wedge the speech worker. The connection stays up either
- * way, since late replies arrive over it. */
-static void on_speakall_sw(lv_event_t *e)
-{
-    muse_settings_set_speak_all(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
-}
-
-static void on_wakebatt_sw(lv_event_t *e)
-{
-    muse_settings_set_wake_on_battery(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
-}
 
 static void build_home(lv_obj_t *tile)
 {
@@ -1262,11 +1321,10 @@ static void build_home(lv_obj_t *tile)
     s_home = page(tile, "SETTINGS", false, &list);
     row(list, LV_SYMBOL_WIFI, "Wi-Fi", &s_home_wifi, on_nav, (void *)&WIFI);
     row(list, LV_SYMBOL_HOME, "Muse", &s_home_hatch, on_nav, (void *)&HATCH);
-    s_home_speakall = switch_row_icon(list, LV_SYMBOL_VOLUME_MID, "Speak all pushes", muse_settings_speak_all(), on_speakall_sw);
-    s_home_wakebatt = switch_row_icon(list, LV_SYMBOL_AUDIO, "Wake on battery", muse_settings_wake_on_battery(), on_wakebatt_sw);
     row(list, LV_SYMBOL_BLUETOOTH, "Bluetooth", &s_home_ble, on_nav, (void *)&BLE);
-    row(list, LV_SYMBOL_VOLUME_MAX, "Sound", &s_home_sound, on_nav, (void *)&SOUND);
-    row(list, LV_SYMBOL_EYE_CLOSE, "Sleep", &s_home_sleep, on_nav, (void *)&SLEEP);
+    row(list, LV_SYMBOL_VOLUME_MAX, "Speaker", &s_home_speaker, on_nav, (void *)&SPEAKER);
+    row(list, LV_SYMBOL_AUDIO, "Mic", &s_home_mic, on_nav, (void *)&MIC);
+    row(list, LV_SYMBOL_EYE_CLOSE, "Display", &s_home_display, on_nav, (void *)&DISPLAY);
     row(list, LV_SYMBOL_BATTERY_FULL, "Battery", &s_home_battery, on_nav, (void *)&BATTERY);
     row(list, LV_SYMBOL_POWER, "Power off", NULL, on_nav, (void *)&POWER);
     s_about = note(list, "");
@@ -1288,19 +1346,12 @@ static void tick_home(void)
     set_text(s_home_ble, b.state == MUSE_BLE_OFF ? "Off" : (b.state == MUSE_BLE_CONNECTED ? "Connected" : "On"));
 
     if (muse_settings_speaker_on()) {
-        set_val(s_home_sound, "Vol %d%%", muse_settings_volume());
+        set_val(s_home_speaker, "Vol %d%%", muse_settings_volume());
     } else {
-        set_text(s_home_sound, "Muted");
+        set_text(s_home_speaker, "Muted");
     }
-    set_text(s_home_sleep, sleep_name(muse_settings_sleep_s()));
-    bool speak_all = muse_settings_speak_all();
-    if (speak_all != lv_obj_has_state(s_home_speakall, LV_STATE_CHECKED)) {
-        lv_obj_set_state(s_home_speakall, LV_STATE_CHECKED, speak_all);
-    }
-    bool wakebatt = muse_settings_wake_on_battery();
-    if (wakebatt != lv_obj_has_state(s_home_wakebatt, LV_STATE_CHECKED)) {
-        lv_obj_set_state(s_home_wakebatt, LV_STATE_CHECKED, wakebatt);
-    }
+    set_val(s_home_mic, "Mic %d dB", muse_settings_mic_gain());
+    set_text(s_home_display, sleep_name(muse_settings_sleep_s()));
 
     muse_power_t p = muse_state_power();
     char buf[96];
@@ -1340,8 +1391,8 @@ void muse_settings_ui_tick(bool visible)
     static bool was_visible;
     if (visible != was_visible) {
         was_visible = visible;
-        /* Only listen to the mic while the Sound page is actually on screen. */
-        muse_voice_set_monitor(visible && s_current == s_sound);
+        /* Only listen to the mic while the Mic page is actually on screen. */
+        muse_voice_set_monitor(visible && s_current == s_mic);
     }
     if (!visible) {
         return;
@@ -1354,10 +1405,12 @@ void muse_settings_ui_tick(bool visible)
         tick_hatch();
     } else if (s_current == s_ble) {
         tick_ble();
-    } else if (s_current == s_sound) {
-        tick_sound();
-    } else if (s_current == s_sleep) {
-        tick_sleep();
+    } else if (s_current == s_speaker) {
+        tick_speaker();
+    } else if (s_current == s_mic) {
+        tick_mic();
+    } else if (s_current == s_display) {
+        tick_display();
     } else if (s_current == s_battery) {
         tick_battery();
     }

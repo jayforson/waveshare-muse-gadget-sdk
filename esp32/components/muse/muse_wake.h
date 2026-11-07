@@ -51,6 +51,11 @@ bool muse_wake_init(void);
  * moment the wake word is detected. False when the AFE is not ready. */
 bool muse_wake_feed(const int16_t *pcm, size_t frames);
 
+/* Applies the wake threshold setting to the AFE. Called at init and
+ * whenever the setting changes, so tuning takes effect without a
+ * reboot. No-op before init or when the AFE is not ready. */
+void muse_wake_apply_threshold(void);
+
 #else
 
 static inline bool muse_wake_init(void)
@@ -63,6 +68,10 @@ static inline bool muse_wake_feed(const int16_t *pcm, size_t frames)
     (void)pcm;
     (void)frames;
     return false;
+}
+
+static inline void muse_wake_apply_threshold(void)
+{
 }
 
 #endif

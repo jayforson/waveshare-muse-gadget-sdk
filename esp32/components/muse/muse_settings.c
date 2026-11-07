@@ -38,6 +38,8 @@ static struct {
     int tts_fail_reason;
     int tts_fail_status;
     bool wake_on_battery;
+    uint8_t wake_threshold;   /* hundredths, 40..90 */
+    uint8_t wake_gain;        /* tenths, 10..30 */
     uint8_t mic_gain;
     uint8_t sw_gain;
     uint8_t silence_s;
@@ -57,6 +59,8 @@ static struct {
      * flag is how a push is recognized as for the board); unflagged
      * pushes are dropped before any TTS or decode. Speak all on also
      * speaks unflagged pushes (replies to the app on the phone). */
+    .wake_threshold = MUSE_WAKE_THRESHOLD_DEFAULT,
+    .wake_gain = MUSE_WAKE_GAIN_DEFAULT,
     .mic_gain = 30,
     .sw_gain = 2,
     .silence_s = MUSE_SILENCE_S_DEFAULT,
@@ -143,6 +147,8 @@ esp_err_t muse_settings_init(void)
     if (nvs_get_u8(s_nvs, "wake_batt", &b) == ESP_OK) {
         s.wake_on_battery = b;
     }
+    load_u8("wake_thr", &s.wake_threshold);
+    load_u8("wake_gain", &s.wake_gain);
     load_u8("mic_gain", &s.mic_gain);
     load_u8("sw_gain", &s.sw_gain);
     load_u8("silence_s", &s.silence_s);
@@ -161,6 +167,8 @@ esp_err_t muse_settings_init(void)
     load_str("token", s.token, sizeof(s.token));
 
     s.volume = clampi(s.volume, 0, 100);
+    s.wake_threshold = clampi(s.wake_threshold, MUSE_WAKE_THRESHOLD_MIN, MUSE_WAKE_THRESHOLD_MAX);
+    s.wake_gain = clampi(s.wake_gain, MUSE_WAKE_GAIN_MIN, MUSE_WAKE_GAIN_MAX);
     s.mic_gain = clampi(s.mic_gain, 0, MUSE_MIC_GAIN_MAX);
     s.sw_gain = clampi(s.sw_gain, 1, MUSE_SW_GAIN_MAX);
     s.silence_s = clampi(s.silence_s, MUSE_SILENCE_S_MIN, MUSE_SILENCE_S_MAX);
@@ -203,6 +211,8 @@ void muse_settings_tts_fail_text(char *buf, size_t cap)
     snprintf(buf, cap, "%s", t);
 }
 bool muse_settings_wake_on_battery(void) { return s.wake_on_battery; }
+int muse_settings_wake_threshold(void) { return s.wake_threshold; }
+int muse_settings_wake_gain(void) { return s.wake_gain; }
 int muse_settings_mic_gain(void) { return s.mic_gain; }
 int muse_settings_sw_gain(void) { return s.sw_gain; }
 int muse_settings_silence_s(void) { return s.silence_s; }
@@ -283,6 +293,20 @@ void muse_settings_set_wake_on_battery(bool on)
     s.wake_on_battery = on;
     save_u8("wake_batt", on);
     notify(MUSE_SETTING_WAKE_BATTERY);
+}
+
+void muse_settings_set_wake_threshold(int hundredths)
+{
+    s.wake_threshold = clampi(hundredths, MUSE_WAKE_THRESHOLD_MIN, MUSE_WAKE_THRESHOLD_MAX);
+    save_u8("wake_thr", s.wake_threshold);
+    notify(MUSE_SETTING_WAKE_THRESHOLD);
+}
+
+void muse_settings_set_wake_gain(int tenths)
+{
+    s.wake_gain = clampi(tenths, MUSE_WAKE_GAIN_MIN, MUSE_WAKE_GAIN_MAX);
+    save_u8("wake_gain", s.wake_gain);
+    notify(MUSE_SETTING_WAKE_GAIN);
 }
 
 void muse_settings_set_mic_gain(int db)

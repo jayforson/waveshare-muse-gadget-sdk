@@ -31,32 +31,35 @@
  * belongs to WakeNet's idle pipeline and is untouched.)
  *
  * Wake tuning, v6 experimental (2026-11-05, user report: "Hi, Wall E"
- * sometimes needs several shouts): three levers, all in this file.
- * (1) Threshold: set_wakenet_threshold(..., 1, 0.55) after create.
- * The wn9 model default is about 0.60-0.62 (the model name encodes
- * its range, e.g. ..._0.608_0.615); 0.55 is a moderate step down,
- * inside the API's 0.4-0.9999 range. Lower catches more, at the
- * cost of more false triggers. History: 0.50 (first step) caught
- * the wake word but false-triggered constantly in the evening of
- * 2026-11-05, so 0.55 is the middle ground; if it still
- * false-triggers, the next lever is the wake gain, not a lower
- * threshold. (2) Noise suppression: TRIED in v6 and REVERTED the same
- * day. ns_init = 1 created fine (pipeline showed NS(WebRTC)
- * engaged, threshold set rc=1), but the board then spammed
- * "Ringbuffer of AFE is empty" and wake stopped working entirely;
- * ESP-SR itself logs "Noise Suppression may reduce the accuracy of
- * speech recognition. It is not recommended to turn it on." The NS
- * stage starves the fetch path (fetch_with_delay(1) never sees
- * output in time), so WakeNet never sees speech. ns_init is back
- * to 0; do not re-enable without a fetch-delay rework first.
- * (3) Wake-path gain:
- * the feed copy is multiplied x2 with saturation, WakeNet only;
- * the recorded speech (pre-roll ring, Scribe) is untouched, and
- * the user's stored mic/SW gain settings are untouched. Deliberately
- * NOT changed here: AFE_MODE stays LOW_COST. HIGH_PERF costs
- * internal RAM this board does not have to spare (wake init leaves
- * ~100-200 bytes free internal; see muse_voice.c), so it is a later
- * lever only if this tune proves the pipeline but not the pickup.
+ * sometimes needs several shouts): three levers.
+ * (1) Threshold: a setting now (MIC page, "Wake threshold",
+ * 0.40-0.90, default 0.55), applied to the AFE after create and
+ * re-applied live on change. The wn9 model default is about
+ * 0.60-0.62 (the model name encodes its range, e.g.
+ * ..._0.608_0.615); 0.55 is a moderate step down, inside the API's
+ * 0.4-0.9999 range. Lower catches more, at the cost of more false
+ * triggers. History: 0.50 (first step) caught the wake word but
+ * false-triggered constantly in the evening of 2026-11-05, so 0.55
+ * is the middle ground; if it still false-triggers, the next lever
+ * is the wake gain, not a lower threshold. (2) Noise suppression:
+ * TRIED in v6 and REVERTED the same day. ns_init = 1 created fine
+ * (pipeline showed NS(WebRTC) engaged, threshold set rc=1), but
+ * the board then spammed "Ringbuffer of AFE is empty" and wake
+ * stopped working entirely; ESP-SR itself logs "Noise Suppression
+ * may reduce the accuracy of speech recognition. It is not
+ * recommended to turn it on." The NS stage starves the fetch path
+ * (fetch_with_delay(1) never sees output in time), so WakeNet
+ * never sees speech. ns_init is back to 0; do not re-enable
+ * without a fetch-delay rework first.
+ * (3) Wake-path gain: a setting now (MIC page, "Wake gain",
+ * x1.0-x3.0, default x2.0). The feed copy is multiplied by it
+ * with saturation, WakeNet only; the recorded speech (pre-roll
+ * ring, Scribe) is untouched, and the user's stored mic/SW gain
+ * settings are untouched. Deliberately NOT changed here: AFE_MODE
+ * stays LOW_COST. HIGH_PERF costs internal RAM this board does not
+ * have to spare (wake init leaves ~100-200 bytes free internal;
+ * see muse_voice.c), so it is a later lever only if this tune
+ * proves the pipeline but not the pickup.
  */
 
 #include "muse_wake.h"
@@ -70,6 +73,7 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "muse_settings.h"
 
 static const char *TAG = "muse_wake";
 
@@ -88,6 +92,29 @@ static void heap_log(const char *what)
     ESP_LOGI(TAG, "%s: free internal %u, psram %u", what,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+/* Applies the wake threshold setting to the AFE. Called at init and
+ * whenever the setting changes (via the settings listener), so tuning
+ * takes effect without a reboot. set_wakenet_threshold takes the
+ * wakenet index (1: only model loaded) and a threshold in 0.4-0.9999;
+ * it returns 1 on success, -1 on failure. A failure here is not
+ * fatal: the model default stays in force and wake keeps working,
+ * only less sensitive than the setting intends. The Mac build is the
+ * check that this API exists under the pinned esp-sr ^2.0.0; if it
+ * does not, the build fails loudly here and this call is the thing
+ * to drop. */
+void muse_wake_apply_threshold(void)
+{
+    if (!s_afe_data || !s_afe_handle || !s_afe_handle->set_wakenet_threshold) {
+        return;
+    }
+    float thr = muse_settings_wake_threshold() / 100.0f;
+    int rc = s_afe_handle->set_wakenet_threshold(s_afe_data, 1, thr);
+    ESP_LOGI(TAG, "wake threshold %.2f (set rc=%d)", thr, rc);
+    if (rc != 1) {
+        ESP_LOGW(TAG, "set_wakenet_threshold failed (rc=%d); model default threshold in force", rc);
+    }
 }
 
 bool muse_wake_init(void)
@@ -137,23 +164,8 @@ bool muse_wake_init(void)
         return false;
     }
     int ns_applied = 0;
-    /* Wake tuning v6: lower the detection threshold from the model
-     * default (~0.60-0.62) to 0.55. set_wakenet_threshold takes the
-     * wakenet index (1: only model loaded) and a threshold in
-     * 0.4-0.9999; it returns 1 on success, -1 on failure. A failure
-     * here is not fatal: the model default stays in force and wake
-     * keeps working, only less sensitive than this tune intends.
-     * The Mac build is the check that this API exists under the
-     * pinned esp-sr ^2.0.0; if it does not, the build fails loudly
-     * here and this call is the thing to drop. */
-    int thr_rc = -1;
-    if (s_afe_handle && s_afe_handle->set_wakenet_threshold) {
-        thr_rc = s_afe_handle->set_wakenet_threshold(s_afe_data, 1, 0.55f);
-    }
-    ESP_LOGI(TAG, "wake tune v6: threshold 0.55 (set rc=%d), ns=%d, wake gain x2", thr_rc, ns_applied);
-    if (thr_rc != 1) {
-        ESP_LOGW(TAG, "set_wakenet_threshold failed (rc=%d); model default threshold in force", thr_rc);
-    }
+    muse_wake_apply_threshold();
+    ESP_LOGI(TAG, "wake tune v6: ns=%d, wake gain x%.1f", ns_applied, muse_settings_wake_gain() / 10.0f);
     /* Log the effective pipeline, so the boot log shows whether NS
      * really engaged, e.g. [input] -> |NS| -> |VAD| ->
      * |WakeNet(wn9_hiwalle_tts2)| -> [output]. */
@@ -185,11 +197,14 @@ bool muse_wake_feed(const int16_t *pcm, size_t frames)
     if (!s_afe_data || !s_feed_buff || !s_feed_acc || s_feed_chunksize <= 0) {
         return false;
     }
+    /* Wake gain, read live from the MIC page setting (tenths, 10..30),
+     * so a change applies to the next feed without a reboot. */
+    int gain = muse_settings_wake_gain();
     size_t in = 0;
     while (in < frames) {
         size_t room = (size_t)s_feed_chunksize - s_feed_acc_len;
         size_t take = frames - in < room ? frames - in : room;
-        /* Wake tuning v6: wake-path gain x2, WakeNet only. The input
+        /* Wake tuning v6: wake-path gain, WakeNet only. The input
          * chunk is shared with the pre-roll ring and the record path,
          * so the gain is applied on the copy into the AFE accumulator,
          * with saturation, never in place; recorded speech keeps the
@@ -197,7 +212,7 @@ bool muse_wake_feed(const int16_t *pcm, size_t frames)
          * detector; close loud speech may clip in this copy, which
          * WakeNet tolerates better than a miss at distance. */
         for (size_t i = 0; i < take; i++) {
-            int x = (int)pcm[in + i] * 2;
+            int x = (int)pcm[in + i] * gain / 10;
             s_feed_acc[s_feed_acc_len + i] = x > 32767 ? 32767 : x < -32768 ? -32768 : (int16_t)x;
         }
         s_feed_acc_len += take;
