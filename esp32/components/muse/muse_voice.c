@@ -110,8 +110,26 @@ static volatile bool s_wake_fired;
 /* Voice barge-in (v6 trial, AEC+VAD): sustained VAD speech that
  * interrupts a reply, and the grace after speech starts for the
  * AEC to converge, so the reply's own onset cannot false-trigger. */
-#define BARGEIN_VAD_CHUNKS 15              /* 15 x 20 ms = 0.3 s of speech */
-#define BARGEIN_GRACE_FRAMES (MUSE_AUDIO_RATE / 2)   /* 0.5 s */
+#define BARGEIN_VAD_CHUNKS 15   /* 15 x 20 ms = 0.3 s of speech */
+#define BARGEIN_GRACE_US 500000   /* 0.5 s */
+
+/* Barge-in monitor (v6 trial, fix 2): the mic read + AFE feed run
+ * on their own task, not in the playback loop. Reading the mic
+ * inside the loop paced playback at half speed (the read waits
+ * ~20 ms for a chunk and the write waits ~20 ms for the speaker,
+ * back to back, so 8 s of audio took 16.6 s), and the VAD count
+ * reset on every feed that did not complete an AFE frame, so it
+ * could never reach the threshold. The monitor task reads the mic
+ * at its own 20 ms pace, feeds mic + the last played chunk
+ * (reference) to the AEC, and raises s_bargein_detected on
+ * sustained VAD speech; the playback loop only checks that flag.
+ * The reference ring and the monitor stack live in PSRAM, so this
+ * costs no internal RAM. */
+static volatile bool s_bargein_active;     /* voice task sets, monitor reads */
+static volatile bool s_bargein_detected;   /* monitor sets, voice task reads */
+static int16_t (*s_bargein_ref)[MUSE_AUDIO_CHUNK];   /* 2 slots, PSRAM */
+static volatile uint32_t s_bargein_ref_seq;   /* played chunks written by the voice task */
+static TaskHandle_t s_bargein_task;
 /* No-speech hangup window, from Settings (default 5 s, 3..30 s);
  * polled live, so a change applies to the next window. */
 static int64_t silence_window_us(void)
@@ -468,6 +486,83 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
 
 static void go_idle(const char *caption);
 
+/* True when the monitor task can run: AEC fit at boot and the task
+ * + reference ring are up. */
+static bool bargein_available(void)
+{
+    return muse_wake_bargein_ready() && s_bargein_ref != NULL && s_bargein_task != NULL;
+}
+
+/* The barge-in monitor task: while the voice task is playing a reply
+ * (s_bargein_active), reads the mic at its own pace and feeds mic +
+ * the previously played chunk (reference) to the AEC; sustained VAD
+ * speech raises s_bargein_detected and the playback loop interrupts.
+ * Runs only while active, so it never steals mic chunks from
+ * idle_capture or record (it may hold one in-flight read when the
+ * voice task stops playback, which lands inside the 200 ms drain
+ * after an interrupt, or in the pre-roll, both harmless). The
+ * reference is the previous chunk (1-chunk delay): the mic chunk
+ * read now holds echo of audio played about a chunk ago. */
+static void bargein_task(void *arg)
+{
+    (void)arg;
+    uint32_t last_seq = 0;
+    int vad_speech = 0;
+    int64_t active_since = 0;
+    for (;;) {
+        if (!s_bargein_active) {
+            last_seq = s_bargein_ref_seq;
+            vad_speech = 0;
+            active_since = 0;
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if (active_since == 0) {
+            /* Fresh activation: clear the AFE's partial frame and
+             * sticky VAD, so the previous reply cannot trigger this
+             * one; the 0.5 s grace lets the AEC converge. */
+            muse_wake_bargein_reset();
+            active_since = esp_timer_get_time();
+            last_seq = s_bargein_ref_seq;
+            vad_speech = 0;
+        }
+        if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        sw_gain(s_chunk, MUSE_AUDIO_CHUNK);
+        uint32_t seq = s_bargein_ref_seq;
+        if (seq == last_seq) {
+            /* No new played chunk since the last feed: nothing to
+             * use as a reference, so this mic chunk is discarded
+             * rather than fed with a stale reference. */
+            continue;
+        }
+        /* The previously played chunk: slot (seq-1)%2 was finished
+         * by the voice task before it bumped seq, so it is never
+         * torn by a concurrent write. */
+        const int16_t *ref = s_bargein_ref[(seq - 1) % 2];
+        last_seq = seq;
+        bool speech = muse_wake_bargein_feed(s_chunk, ref, MUSE_AUDIO_CHUNK);
+        if (esp_timer_get_time() - active_since >= BARGEIN_GRACE_US) {
+            if (speech) {
+                if (++vad_speech >= BARGEIN_VAD_CHUNKS) {
+                    s_bargein_detected = true;
+                    /* Wait here until the voice task stops playback;
+                     * do not re-arm or feed while the flag is up. */
+                    while (s_bargein_active) {
+                        vTaskDelay(pdMS_TO_TICKS(20));
+                    }
+                    vad_speech = 0;
+                    active_since = 0;
+                }
+            } else {
+                vad_speech = 0;
+            }
+        }
+    }
+}
+
 /*
  * Plays Hatch's reply as it arrives, with its text as the caption. Returns
  * true if interrupted by a new press. *delivered: the VM has the note.
@@ -496,11 +591,11 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
     size_t sent_at = 0;
     int64_t sent_page_t = 0;
     size_t played = 0;
-    int vad_speech = 0;   /* consecutive VAD-speech chunks (barge-in) */
-    const bool bargein = muse_wake_bargein_ready();   /* AEC fit at boot; fixed for this reply */
+    const bool bargein = bargein_available();   /* AEC fit at boot and the monitor task is up; fixed for this reply */
     int64_t t0 = esp_timer_get_time();
     *delivered = false;
     s_reply_failed = false;
+    s_bargein_detected = false;   /* a stale flag must not interrupt the next reply */
     for (;;) {
         muse_hatch_ev_t ev;
         while ((ev = muse_hatch_turn_event(text, sizeof(text))) != MUSE_HATCH_EV_NONE) {
@@ -582,6 +677,7 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
                 strlcpy(s_last_error, text, sizeof(s_last_error));
                 muse_state_set_level(0);
                 go_idle(text);
+                s_bargein_active = false;
                 return false;
             default:
                 break;
@@ -591,10 +687,23 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
             ESP_LOGI(TAG, "reply hung up");
             muse_hatch_turn_cancel();
             muse_state_set_level(0);
+            s_bargein_active = false;
             return true;
         }
         if (got_event(MUSE_PTT_DOWN)) {
             ESP_LOGI(TAG, "reply interrupted");
+            muse_hatch_turn_cancel();
+            muse_state_set_level(0);
+            s_bargein_active = false;
+            return true;
+        }
+        /* Voice barge-in: the monitor task raised this on sustained
+         * VAD speech while the reply plays; interrupt like a BOOT
+         * hold. The call loop then re-listens at once. */
+        if (s_bargein_detected) {
+            ESP_LOGI(TAG, "reply interrupted by voice");
+            s_bargein_detected = false;
+            s_bargein_active = false;
             muse_hatch_turn_cancel();
             muse_state_set_level(0);
             return true;
@@ -605,44 +714,47 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
                 speaking = true;
                 muse_state_set_mode(MUSE_MODE_SPEAKING);
                 ESP_LOGI(TAG, "reply audio after %.2fs", (esp_timer_get_time() - t0) / 1e6);
+                /* Voice barge-in: start the monitor now that audio
+                 * is actually playing (not during the THINKING
+                 * wait, when speech would cancel a reply that has
+                 * not arrived). */
+                s_bargein_active = bargein;
             }
             muse_state_set_level(muse_audio_level(buf, n));
             muse_audio_write(buf, n);
             played += n;
-            /* Voice barge-in (v6 trial, AEC+VAD): while the reply
-             * plays, read the mic and feed mic + just-played PCM
-             * (reference) to the wake AFE's AEC; sustained VAD
-             * speech interrupts like a BOOT hold. The mic read
-             * paces this loop at real time (one 20 ms chunk per
-             * played chunk). Gated on a 0.5 s grace after speech
-             * starts, so the AEC can converge and the reply's own
-             * onset cannot false-trigger. */
-            if (bargein && muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) == ESP_OK) {
-                sw_gain(s_chunk, MUSE_AUDIO_CHUNK);
-                bool speech = muse_wake_bargein_feed(s_chunk, buf, n);
-                if (played >= BARGEIN_GRACE_FRAMES && speech) {
-                    if (++vad_speech >= BARGEIN_VAD_CHUNKS) {
-                        ESP_LOGI(TAG, "reply interrupted by voice (%d VAD chunks)", vad_speech);
-                        muse_hatch_turn_cancel();
-                        muse_state_set_level(0);
-                        return true;
-                    }
-                } else if (!speech) {
-                    vad_speech = 0;
+            if (bargein) {
+                /* Hand the played chunk to the monitor as the AEC
+                 * reference (previous chunk, 1-chunk delay).
+                 * Zero-pad a partial chunk so its tail is not a
+                 * stale reference. */
+                uint32_t slot = s_bargein_ref_seq % 2;
+                memcpy(s_bargein_ref[slot], buf, n * sizeof(int16_t));
+                if (n < MUSE_AUDIO_CHUNK) {
+                    memset(s_bargein_ref[slot] + n, 0, (MUSE_AUDIO_CHUNK - n) * sizeof(int16_t));
                 }
+                s_bargein_ref_seq++;
             }
         } else if (done) {
             break;
         } else if (speaking) {
-            vad_speech = 0;
             /* Between messages: keep the speaker fed so it doesn't replay stale DMA. */
             muse_state_set_level(0);
             muse_audio_write(silence, MUSE_AUDIO_CHUNK);
+            if (bargein) {
+                /* The speaker is playing silence: hand zeros as the
+                 * reference, so the monitor does not keep feeding
+                 * the last real chunk as a stale reference. */
+                uint32_t slot = s_bargein_ref_seq % 2;
+                memset(s_bargein_ref[slot], 0, MUSE_AUDIO_CHUNK * sizeof(int16_t));
+                s_bargein_ref_seq++;
+            }
         }
-        /* Voice barge-in runs in the audio block above (mic + played
-         * PCM through the AEC, VAD speech interrupts like a BOOT
-         * hold); a BOOT hold (PTT_DOWN, checked above) still works
-         * alongside it. */
+        /* Voice barge-in runs on its own task (mic + played PCM
+         * through the AEC; sustained VAD speech raises
+         * s_bargein_detected, checked above, and interrupts like a
+         * BOOT hold); a BOOT hold (PTT_DOWN, checked above) still
+         * works alongside it. */
         /* The page being said, or before the speech the reply's opening page. */
         if ((speaking || replied) && muse_hatch_turn_caption(played, page, sizeof(page))) {
             muse_state_set_caption("%s", page);
@@ -681,6 +793,7 @@ static bool hatch_reply_as(bool *delivered, const char *waiting)
         /* No speech (TTS unavailable): leave the reply text up for a moment. */
         vTaskDelay(pdMS_TO_TICKS(2500));
     }
+    s_bargein_active = false;
     return false;
 }
 
@@ -1750,6 +1863,24 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
     if (xTaskCreatePinnedToCoreWithCaps(voice_task, "muse_voice", 6144, NULL, 6, NULL, MUSE_AUDIO_CORE,
                                         MUSE_BIG_CAPS) != pdPASS) {
         return ESP_ERR_NO_MEM;
+    }
+    /* Barge-in monitor (v6 trial, fix 2): its own task, so the mic
+     * read never paces playback. Created here, before wake init,
+     * while internal heap is still clean (same reason as the voice
+     * task); its stack and reference ring are in PSRAM, so it costs
+     * no internal RAM. If either fails, barge-in is simply off
+     * (the voice task never activates it); waking and BOOT still
+     * work. */
+    s_bargein_ref = heap_caps_malloc(2 * sizeof(*s_bargein_ref), MUSE_BIG_CAPS);
+    if (s_bargein_ref) {
+        memset(s_bargein_ref, 0, 2 * sizeof(*s_bargein_ref));
+        if (xTaskCreatePinnedToCoreWithCaps(bargein_task, "muse_bargein", 4096, NULL, 5, &s_bargein_task,
+                                            MUSE_AUDIO_CORE, MUSE_BIG_CAPS) != pdPASS) {
+            ESP_LOGW(TAG, "barge-in task not started; barge-in off");
+            s_bargein_task = NULL;
+        }
+    } else {
+        ESP_LOGW(TAG, "barge-in reference ring not allocated; barge-in off");
     }
     /* Waking is optional: without it (no model picked, no partition, or
      * the feature off) BOOT still works, so its failure never fails boot.

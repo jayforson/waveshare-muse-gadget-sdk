@@ -92,6 +92,7 @@ static bool s_bargein_available;
 static int16_t *s_bargein_acc;      /* mic samples waiting for a full AFE frame */
 static int16_t *s_bargein_ref_acc;  /* reference samples, paired with s_bargein_acc */
 static size_t s_bargein_acc_len;
+static bool s_bargein_vad_speech;   /* VAD state of the last completed AFE frame (sticky) */
 
 
 static void heap_log(const char *what)
@@ -295,10 +296,9 @@ bool muse_wake_bargein_ready(void)
 bool muse_wake_bargein_feed(const int16_t *mic, const int16_t *ref, size_t frames)
 {
     if (!muse_wake_bargein_ready() || !s_feed_buff || s_feed_chunksize <= 0) {
-        return false;
+        return s_bargein_vad_speech;
     }
     size_t in = 0;
-    bool speech = false;
     while (in < frames) {
         size_t room = (size_t)s_feed_chunksize - s_bargein_acc_len;
         size_t take = frames - in < room ? frames - in : room;
@@ -320,13 +320,25 @@ bool muse_wake_bargein_feed(const int16_t *mic, const int16_t *ref, size_t frame
         }
         s_bargein_acc_len = 0;
         s_afe_handle->feed(s_afe_data, s_feed_buff);
-        /* One tick of patience, as in the wake feed. */
+        /* One tick of patience, as in the wake feed. The VAD state
+         * is sticky: a feed that completes no frame leaves it
+         * unchanged, so the caller counts wall-clock speech instead
+         * of completed frames. */
         afe_fetch_result_t *res = s_afe_handle->fetch_with_delay(s_afe_data, 1);
-        if (res && res->vad_state == VAD_SPEECH) {
-            speech = true;
+        if (res) {
+            s_bargein_vad_speech = (res->vad_state == VAD_SPEECH);
         }
     }
-    return speech;
+    return s_bargein_vad_speech;
+}
+
+/* Clears the barge-in feed state for a new reply: the partial frame
+ * and the sticky VAD, so a previous reply's tail cannot trigger the
+ * next one. */
+void muse_wake_bargein_reset(void)
+{
+    s_bargein_acc_len = 0;
+    s_bargein_vad_speech = false;
 }
 
 

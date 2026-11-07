@@ -64,11 +64,21 @@ bool muse_wake_bargein_ready(void);
 
 /* Feeds one paired chunk to the AFE during playback: mic audio and
  * the PCM just played (reference), same length, 16 kHz mono.
- * Returns true when the AFE's VAD reports speech on the
- * echo-cancelled signal for the latest processed frame. False when
- * barge-in is not ready, or the latest frame is silence. The
- * caller counts sustained speech and decides when to interrupt. */
+ * Returns the AFE's VAD state for the latest processed frame:
+ * true when it reports speech on the echo-cancelled signal, false
+ * when it reports silence. The state is sticky across calls: a
+ * feed that does not complete a frame leaves it unchanged, so the
+ * caller can count wall-clock speech instead of completed frames
+ * (a 320-sample feed completes a frame only every ~1.6 calls, and
+ * treating the in-between calls as silence resets the count every
+ * other call, so it can never reach the threshold). The caller
+ * counts sustained speech and decides when to interrupt. */
 bool muse_wake_bargein_feed(const int16_t *mic, const int16_t *ref, size_t frames);
+
+/* Clears the barge-in feed state for a new reply: the partial frame
+ * and the sticky VAD, so a previous reply's tail cannot trigger the
+ * next one. */
+void muse_wake_bargein_reset(void);
 
 #else
 
@@ -95,6 +105,10 @@ static inline bool muse_wake_bargein_feed(const int16_t *mic, const int16_t *ref
     (void)ref;
     (void)frames;
     return false;
+}
+
+static inline void muse_wake_bargein_reset(void)
+{
 }
 
 #endif
