@@ -1688,11 +1688,20 @@ static bool scribe_realtime_start(void)
     s_scribe_msg[0] = '\0';
     s_scribe_transcript[0] = '\0';
     s_scribe_start_us = now_us();
-    s_scribe_pre_buf = static_cast<uint8_t *>(psram_alloc(SCRIBE_RT_PRE_BYTES));
+    /* The pre-buffer is allocated once and kept for the life of the app
+     * (never freed), like the msg/transcript/json buffers above: it is
+     * 160 KB, and allocating it fresh every turn fragments PSRAM until
+     * no contiguous block fits (the "no room for session buffer" that
+     * kills a call after the board has been used for a while). */
+    if (!s_scribe_pre_buf) {
+        s_scribe_pre_buf = static_cast<uint8_t *>(psram_alloc(SCRIBE_RT_PRE_BYTES));
+    }
     s_scribe_pre_len = 0;
     s_scribe_pre_sent = false;
     if (!s_scribe_pre_buf) {
-        ESP_LOGW(TAG, "scribe: no room for session buffer");
+        ESP_LOGW(TAG, "scribe: no room for session buffer (psram free %u, largest %u)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
         return false;
     }
         /* ESP-IDF requires each config header item terminated with CRLF;
@@ -1704,8 +1713,6 @@ static bool scribe_realtime_start(void)
         /* A truncated header would fail auth silently (same symptom as
          * the missing-CRLF handshake failure), so fail loudly instead. */
         ESP_LOGW(TAG, "scribe: api key header too long");
-        heap_caps_free(s_scribe_pre_buf);
-        s_scribe_pre_buf = nullptr;
         return false;
     }
     esp_websocket_client_config_t cfg = {};
@@ -1720,8 +1727,6 @@ static bool scribe_realtime_start(void)
     s_scribe_ws = esp_websocket_client_init(&cfg);
     if (!s_scribe_ws) {
         ESP_LOGW(TAG, "scribe: websocket init failed");
-        heap_caps_free(s_scribe_pre_buf);
-        s_scribe_pre_buf = nullptr;
         return false;
     }
     esp_websocket_register_events(s_scribe_ws, WEBSOCKET_EVENT_ANY, scribe_ws_handler, nullptr);
@@ -1729,8 +1734,6 @@ static bool scribe_realtime_start(void)
         ESP_LOGW(TAG, "scribe: websocket start failed");
         esp_websocket_client_destroy(s_scribe_ws);
         s_scribe_ws = nullptr;
-        heap_caps_free(s_scribe_pre_buf);
-        s_scribe_pre_buf = nullptr;
         return false;
     }
     return true;
@@ -1743,12 +1746,10 @@ static void scribe_realtime_cleanup(void)
         esp_websocket_client_destroy(s_scribe_ws);
         s_scribe_ws = nullptr;
     }
-    if (s_scribe_pre_buf) {
-        heap_caps_free(s_scribe_pre_buf);
-        s_scribe_pre_buf = nullptr;
-        s_scribe_pre_len = 0;
-        s_scribe_pre_sent = false;
-    }
+    /* The pre-buffer stays allocated for the next turn (see
+     * scribe_realtime_start); only its state is reset here. */
+    s_scribe_pre_len = 0;
+    s_scribe_pre_sent = false;
     s_scribe_session_ready.store(false);
     s_scribe_committed.store(false);
     s_scribe_error.store(0);
@@ -1805,8 +1806,8 @@ static bool scribe_send_prebuffer(void)
         }
         off += chunk;
     }
-    heap_caps_free(s_scribe_pre_buf);
-    s_scribe_pre_buf = nullptr;
+    /* The pre-buffer stays allocated for the next turn; only its state
+     * is reset here. */
     s_scribe_pre_len = 0;
     s_scribe_pre_sent = true;
     return true;
